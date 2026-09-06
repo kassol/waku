@@ -53,7 +53,7 @@ mod protocol;
 
 pub use driver_wire::{decode_enum, encode_enum, event_from_wire, event_to_wire};
 pub use protocol::{
-    APP_EXECUTABLE_ENV, ChildSessionSummary, ChildTurnSummary, ChildWaitingReason, ClientMessage,
+    APP_EXECUTABLE_ENV, ChildBatchResult, ChildResultReceipt, ChildSessionSummary, ChildTurnSummary, ChildWaitingReason, ClientMessage,
     Command, CreationStage, CreationWorkspace, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady, MAX_WIRE_MESSAGE_BYTES,
     PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome, ResponsePayload, RpcError,
     SequencedEvent, ServerMessage, StewardQuery, WireComputerToolRequest, WireDriverEvent,

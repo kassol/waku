@@ -94,6 +94,12 @@ pub struct ReplayCursor {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum StewardQuery {
     ListSessions {},
+    Results {
+        session_ids: Vec<Uuid>,
+        #[serde(default)]
+        handled: Vec<ChildResultReceipt>,
+        max_chars: Option<usize>,
+    },
     Result {
         session_id: Uuid,
         #[serde(default)]
@@ -105,6 +111,25 @@ pub enum StewardQuery {
         #[serde(default)]
         wait_ms: u64,
     },
+}
+
+/// A caller's explicit receipt for one complete actionable snapshot. Reading does not handle it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct ChildResultReceipt {
+    pub session_id: Uuid,
+    pub turn_id: Option<Uuid>,
+    pub snapshot: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+pub struct ChildBatchResult {
+    pub session: ChildSessionSummary,
+    pub receipt: Option<ChildResultReceipt>,
+    pub handled: bool,
+    pub reply: Option<String>,
+    pub reply_truncated: bool,
+    pub workspace: Option<crate::model::ManagedWorkspace>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -532,6 +557,7 @@ pub enum ResponsePayload {
         accepted: bool,
         stopped: bool,
     },
+    ChildResults { results: Vec<ChildBatchResult> },
     ChildSessions {
         sessions: Vec<ChildSessionSummary>,
     },

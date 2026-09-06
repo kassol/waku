@@ -166,7 +166,7 @@ fn mcp_stdio_creates_real_child_and_rejects_spoofed_arguments() {
             .collect();
         assert_eq!(replies.len(), 6);
         assert_eq!(replies[5]["error"]["code"], -32600);
-        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 10);
         assert_eq!(replies[2]["error"]["code"], -32602);
         assert_eq!(replies[3]["result"]["isError"], true);
         assert_eq!(replies[4]["result"]["isError"], false);
@@ -711,6 +711,65 @@ fn mcp_status_waits_for_changes_and_distinguishes_no_turn() {
                 .unwrap();
         },
     );
+}
+
+#[test]
+fn mcp_results_batch_requires_explicit_handled_receipts() {
+    with_creation_daemon_seed(seed_query_sessions,
+        |client, _, root, project_path, address, (project, parent, children)| {
+            let (parent, _, config, runtime) = start_steward_saved(&client, root, project_path, parent, project);
+            let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"].as_str().unwrap();
+            let args = json!({"session_ids":[children[0].id,children[1].id]});
+            let first = mcp_tool(address, token, parent.id, runtime, "waku_results", args.clone());
+            let rows = first["results"].as_array().unwrap();
+            assert_eq!(rows.len(), 2);
+            let ready = rows.iter().find(|r| r["session"]["session_id"] == children[0].id.to_string()).unwrap();
+            assert_eq!(ready["reply"], "前段\n\n后段🌍");
+            assert_eq!(ready["handled"], false);
+            assert_eq!(ready["receipt"]["turn_id"], children[0].turns.last().unwrap().id.to_string());
+            let pending = rows.iter().find(|r| r["session"]["session_id"] == children[1].id.to_string()).unwrap();
+            assert!(pending["receipt"].is_null());
+            assert!(pending["reply"].is_null());
+            // Reading alone never acknowledges work, even through a new MCP connection.
+            assert_eq!(first, mcp_tool(address, token, parent.id, runtime, "waku_results", args));
+            let handled = mcp_tool(address, token, parent.id, runtime, "waku_results",
+                json!({"session_ids":[children[0].id],"handled":[ready["receipt"].clone()]}));
+            assert_eq!(handled["results"][0]["handled"], true);
+            assert!(handled["results"][0]["reply"].is_null());
+            // A late result on the same completed turn must invalidate the receipt,
+            // even when max_chars hides the changed suffix.
+            let mut changed = children[0].clone();
+            changed.messages.last_mut().unwrap().content.push_str(" late failure detail");
+            client.request(parent.id, runtime, Command::SaveTaskState {
+                projects: vec![], sessions: vec![changed], live_session_ids: vec![],
+            }).unwrap();
+            let fresh = mcp_tool(address, token, parent.id, runtime, "waku_results",
+                json!({"session_ids":[children[0].id],"handled":[ready["receipt"].clone()],"max_chars":1}));
+            assert_eq!(fresh["results"][0]["handled"], false);
+            assert_eq!(fresh["results"][0]["reply_truncated"], true);
+            assert_ne!(fresh["results"][0]["receipt"], ready["receipt"]);
+            let mut blocked = children[1].clone();
+            blocked.begin_turn("Need a decision");
+            blocked.pending_user_input = Some(crate::model::UserInputRequest { request_id:"question-1".into(), questions:vec![] });
+            client.request(parent.id, runtime, Command::SaveTaskState { projects:vec![], sessions:vec![blocked.clone()], live_session_ids:vec![] }).unwrap();
+            let question = mcp_tool(address, token, parent.id, runtime, "waku_results", json!({"session_ids":[blocked.id]}));
+            assert_eq!(question["results"][0]["session"]["waiting_for"], json!(["userInput"]));
+            blocked.pending_user_input.as_mut().unwrap().request_id = "question-2".into();
+            client.request(parent.id, runtime, Command::SaveTaskState { projects:vec![], sessions:vec![blocked.clone()], live_session_ids:vec![] }).unwrap();
+            let changed_question = mcp_tool(address, token, parent.id, runtime, "waku_results", json!({"session_ids":[blocked.id],"handled":[question["results"][0]["receipt"].clone()]}));
+            assert_eq!(changed_question["results"][0]["handled"], false);
+            blocked.pending_user_input = None;
+            blocked.finish_active_turn(crate::model::TurnStatus::Failed);
+            blocked.last_driver_error = Some("Validation failed".into());
+            client.request(parent.id, runtime, Command::SaveTaskState { projects:vec![], sessions:vec![blocked.clone()], live_session_ids:vec![] }).unwrap();
+            let failed = mcp_tool(address, token, parent.id, runtime, "waku_results", json!({"session_ids":[blocked.id],"handled":[changed_question["results"][0]["receipt"].clone()]}));
+            assert_eq!(failed["results"][0]["session"]["error"], "Validation failed");
+            assert_eq!(failed["results"][0]["handled"], false);
+            let denied = mcp_response(address, token, parent.id, runtime, "waku_results",
+                json!({"session_ids":[children[0].id,children[2].id]}));
+            assert_eq!(denied["result"]["isError"], true);
+            client.request(parent.id, runtime, Command::CloseSession).unwrap();
+        });
 }
 
 #[test]

@@ -102,7 +102,7 @@ pub fn run_stdio(
         } else if method == "initialize" {
             initialized = true;
             Ok(
-                json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"waku","version":env!("CARGO_PKG_VERSION")},"instructions":"After delegating, do independent work if available. When only child work remains, call waku_wait. If waiting=true, end your current turn immediately; do not poll or keep calling tools. Waku will automatically resume you in a new turn when a watched child finishes or needs user attention. If waiting=false, handle the returned states now. Never approve permissions or answer questions on the user's behalf."}),
+                json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"waku","version":env!("CARGO_PKG_VERSION")},"instructions":include_str!("steward_guidance.txt")}),
             )
         } else if !initialized {
             Err((-32000, "Initialize the MCP session first".into()))
@@ -232,6 +232,19 @@ pub fn run_stdio(
                         }
                     },
                     {
+                        "name": "waku_results",
+                        "description": "Read a batch of direct child results after a meaningful event. max_chars is a shared Unicode reply budget for the batch. Running children return only status. Actionable results include an opaque snapshot receipt; pass a receipt in handled only after you have handled that exact result. Matching handled results omit reply and workspace. Reading never marks work handled or cancels waiting. Changed output, errors, questions or evidence invalidate old receipts. Keep receipts in the coordination handoff. Use waku_result for a truncated result's full transcript.",
+                        "inputSchema": {
+                            "type":"object",
+                            "properties": {
+                                "session_ids":{"type":"array","items":{"type":"string","format":"uuid"},"minItems":1,"maxItems":128},
+                                "handled":{"type":"array","maxItems":128,"items":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"turn_id":{"type":["string","null"]},"snapshot":{"type":"string"}},"required":["session_id","turn_id","snapshot"],"additionalProperties":false}},
+                                "max_chars":{"type":"integer","minimum":1,"maximum":100000,"default":20000}
+                            },
+                            "required":["session_ids"],"additionalProperties":false
+                        }
+                    },
+                    {
                         "name": "waku_result",
                         "description": "Read current/latest turn reply in native text order. Turn status reports running/completed/failed/interrupted; null means no turn. Normal completion does not verify task correctness. Optional transcript includes prior turns. Text limits count Unicode characters independently for reply and transcript and report truncation.",
                         "inputSchema": {
@@ -292,6 +305,7 @@ pub fn run_stdio(
                             let (text,failed) = match outcome {
                                 ResponseOutcome::Ok { payload:ResponsePayload::SessionCreated {session,workspace_path,branch,..} } => (json!({"session_id":session.id,"workspace_path":workspace_path,"branch":branch}).to_string(),false),
                                 ResponseOutcome::Ok { payload: failure @ ResponsePayload::SessionCreationFailed { .. } } => (serde_json::to_string(&failure)?, true),
+                                ResponseOutcome::Ok { payload:ResponsePayload::ChildResults {results} } => (json!({"results":results}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildSessions {sessions} } => (json!({"sessions":sessions}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildStatus {sessions,timed_out} } => (json!({"sessions":sessions,"timed_out":timed_out}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildResult {session,reply,reply_truncated,transcript,transcript_truncated} } => (json!({"session":session,"reply":reply,"reply_truncated":reply_truncated,"transcript":transcript,"transcript_truncated":transcript_truncated}).to_string(),false),
@@ -408,7 +422,7 @@ fn tool_command(name: &str, arguments: Value) -> Result<Command, String> {
             workspace: args.workspace,
             dependencies: args.dependencies,
         })
-    } else if name == "waku_list_sessions" || name == "waku_status" || name == "waku_result" {
+    } else if name == "waku_list_sessions" || name == "waku_status" || name == "waku_result" || name == "waku_results" {
         let mut arguments = arguments
             .as_object()
             .cloned()
@@ -417,6 +431,8 @@ fn tool_command(name: &str, arguments: Value) -> Result<Command, String> {
             ("listSessions", &[])
         } else if name == "waku_status" {
             ("status", &["session_ids", "wait_ms"])
+        } else if name == "waku_results" {
+            ("results", &["session_ids", "handled", "max_chars"])
         } else {
             ("result", &["session_id", "include_transcript", "max_chars"])
         };

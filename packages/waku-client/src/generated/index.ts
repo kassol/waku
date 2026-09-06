@@ -14,6 +14,8 @@ export type { BranchSnapshot } from "./BranchSnapshot";
 export type { Checkpoint } from "./Checkpoint";
 export type { CheckpointFile } from "./CheckpointFile";
 export type { CheckpointStatus } from "./CheckpointStatus";
+export type { ChildBatchResult } from "./ChildBatchResult";
+export type { ChildResultReceipt } from "./ChildResultReceipt";
 export type { ChildSessionSummary } from "./ChildSessionSummary";
 export type { ChildTurnSummary } from "./ChildTurnSummary";
 export type { ChildWaitingReason } from "./ChildWaitingReason";

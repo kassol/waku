@@ -22,6 +22,15 @@ impl WakuBackend {
                 }
                 (Some(std::slice::from_ref(session_id)), 0)
             }
+            StewardQuery::Results { session_ids, handled, max_chars } => {
+                if session_ids.is_empty() || session_ids.len() > 128 || handled.len() > 128 {
+                    bail!("session_ids must contain 1..128 direct children; handled accepts at most 128 receipts");
+                }
+                if max_chars.is_some_and(|limit| limit == 0 || limit > 100_000) {
+                    bail!("max_chars must be within 1..100000");
+                }
+                (Some(session_ids.as_slice()), 0)
+            }
             StewardQuery::Status {
                 session_ids,
                 wait_ms,
@@ -69,6 +78,39 @@ impl WakuBackend {
                         bail!("target is not a direct child in the steward project");
                     }
                 }
+            }
+            if let StewardQuery::Results { session_ids, handled, max_chars } = query {
+                let mut results = Vec::new();
+                let mut remaining = max_chars.unwrap_or(20_000);
+                for id in session_ids {
+                    if results.iter().any(|r: &waku_protocol::ChildBatchResult| r.session.session_id == *id) {
+                        continue;
+                    }
+                    let session = state.sessions.iter_mut().find(|s| s.id == *id).expect("authorized target exists");
+                    self.task_store.hydrate(session)?;
+                    let summary = self.child_summary(session);
+                    let actionable = summary.turn.as_ref().is_some_and(|t| t.status != crate::model::TurnStatus::Running)
+                        || !summary.waiting_for.is_empty() || summary.error.is_some();
+                    let receipt = actionable.then(|| result_receipt(session)).transpose()?;
+                    let was_handled = receipt.as_ref().is_some_and(|receipt| handled.contains(receipt));
+                    let mut reply = None;
+                    let mut reply_truncated = false;
+                    if actionable && !was_handled {
+                        if let ResponsePayload::ChildResult { reply:text, reply_truncated:truncated, .. } =
+                            self.child_result(session, false, remaining) {
+                            remaining = remaining.saturating_sub(text.chars().count());
+                            reply = Some(text);
+                            reply_truncated = truncated;
+                        }
+                    }
+                    results.push(waku_protocol::ChildBatchResult {
+                        session: summary, receipt, handled: was_handled, reply, reply_truncated,
+                        workspace: (actionable && !was_handled).then(|| session.managed_workspace.clone()).flatten(),
+                    });
+                }
+                drop(state);
+                events.ensure_steward_active()?;
+                return Ok(ResponsePayload::ChildResults { results });
             }
             if let StewardQuery::Result {
                 session_id,
@@ -436,4 +478,34 @@ impl WakuBackend {
             session: self.child_summary(&child),
         })
     }
+}
+
+/// Hash full result inputs, independently of display truncation. Late output, changed questions,
+/// failures or fixed-commit evidence must invalidate an older handled receipt.
+fn result_receipt(session: &AgentSession) -> anyhow::Result<waku_protocol::ChildResultReceipt> {
+    use sha2::{Digest, Sha256};
+    struct Writer(Sha256);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let turn = session.turns.last();
+    let turn_id = turn.map(|t| t.id);
+    let mut digest = Writer(Sha256::new());
+    serde_json::to_writer(&mut digest, &(session.id, turn,
+        &session.pending_permission, &session.pending_user_input,
+        &session.history_save_error, &session.last_driver_error, &session.managed_workspace))?;
+    for message in session.messages.iter().filter(|m| m.turn_id == turn_id) {
+        serde_json::to_writer(&mut digest, message)?;
+    }
+    for block in session.transcript_blocks.iter().filter(|b| b.turn_id == turn_id) {
+        serde_json::to_writer(&mut digest, block)?;
+    }
+    Ok(waku_protocol::ChildResultReceipt {
+        session_id: session.id, turn_id,
+        snapshot: format!("v1:{:x}", digest.0.finalize()),
+    })
 }
