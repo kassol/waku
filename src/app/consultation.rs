@@ -74,12 +74,12 @@ impl Waku {
             execution_attempt: None,
             error: None,
             rows: ListState::new(0, ListAlignment::Bottom, px(256.0)),
-            history_focus: cx.focus_handle(),
-            send_focus: cx.focus_handle(),
-            close_focus: cx.focus_handle(),
-            execute_focus: cx.focus_handle(),
-            refresh_focus: cx.focus_handle(),
-            retry_focus: cx.focus_handle(),
+            history_focus: cx.focus_handle().tab_stop(true),
+            send_focus: cx.focus_handle().tab_stop(true),
+            close_focus: cx.focus_handle().tab_stop(true),
+            execute_focus: cx.focus_handle().tab_stop(true),
+            refresh_focus: cx.focus_handle().tab_stop(true),
+            retry_focus: cx.focus_handle().tab_stop(true),
         });
         self.request_consultation(
             waku_client::Command::LoadConsultation {
@@ -380,11 +380,20 @@ impl Waku {
         let history = consultation_history(rows.clone(), &dialog.history_focus, count, theme, cx)
             .child(history);
         let can_send = !dialog.pending;
-        let card = div()
-            .id("consultation-card")
-            .key_context("Consultation")
-            .tab_group()
-            .tab_stop(false)
+        let mut focus_order = vec![
+            dialog.history_focus.clone(),
+            dialog.input.read(cx).focus(),
+            dialog.refresh_focus.clone(),
+        ];
+        if dialog.record.as_ref().is_some_and(|r| !r.instructions.is_empty()) {
+            focus_order.push(dialog.retry_focus.clone());
+        }
+        focus_order.extend([
+            dialog.execute_focus.clone(),
+            dialog.close_focus.clone(),
+            dialog.send_focus.clone(),
+        ]);
+        let card = consultation_card(focus_order)
             .on_action(cx.listener(|this, _: &SendConsultation, _, cx| this.send_consultation(cx)))
             .on_action(cx.listener(|this, _: &CloseConsultation, window, cx| {
                 this.close_consultation(window, cx)
@@ -582,6 +591,33 @@ impl Waku {
     }
 }
 
+fn consultation_card(focus_order: Vec<FocusHandle>) -> Stateful<Div> {
+    div()
+        .id("consultation-card")
+        .key_context("Consultation")
+        .tab_group()
+        .tab_stop(false)
+        .on_key_down(move |event, window, cx| {
+            let modifiers = event.keystroke.modifiers;
+            if event.keystroke.key != "tab"
+                || modifiers.control
+                || modifiers.alt
+                || modifiers.platform
+                || modifiers.function
+            {
+                return;
+            }
+            let current = focus_order.iter().position(|focus| focus.is_focused(window));
+            let next = match current {
+                Some(index) if modifiers.shift => (index + focus_order.len() - 1) % focus_order.len(),
+                Some(index) => (index + 1) % focus_order.len(),
+                None => 0,
+            };
+            window.focus(&focus_order[next], cx);
+            cx.stop_propagation();
+        })
+}
+
 fn consultation_history<T: 'static>(
     scroll_rows: ListState,
     focus: &FocusHandle,
@@ -624,6 +660,69 @@ fn consultation_history<T: 'static>(
 #[cfg(test)]
 mod history_keyboard_tests {
     use super::*;
+
+    struct DialogTabView {
+        background: FocusHandle,
+        controls: Vec<FocusHandle>,
+        clicks: usize,
+    }
+
+    impl Render for DialogTabView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .on_key_down(crate::ui::navigate_tab)
+                .child(div().track_focus(&self.background).size(px(20.0)))
+                .child(
+                    consultation_card(self.controls.clone())
+                        .children(self.controls.iter().enumerate().map(|(index, focus)| {
+                            div()
+                                .id(index)
+                                .track_focus(focus)
+                                .size(px(20.0))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.clicks += 1;
+                                    cx.notify();
+                                }))
+                        })),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn consultation_tab_stays_in_dialog_and_controls_activate_once(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| DialogTabView {
+            background: cx.focus_handle().tab_stop(true),
+            controls: (0..7).map(|_| cx.focus_handle().tab_stop(true)).collect(),
+            clicks: 0,
+        });
+        // Retry is conditional: cover both the full footer and the footer without it.
+        for count in [7, 6] {
+            cx.update_entity(&view, |view, cx| {
+                view.controls.truncate(count);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let controls = cx.read_entity(&view, |view, _| view.controls.clone());
+            cx.update(|window, cx| window.focus(&controls[0], cx));
+            for key in ["tab", "shift-tab"] {
+                for step in 1..=count * 2 {
+                    cx.simulate_keystrokes(key);
+                    cx.run_until_parked();
+                    let index = if key == "tab" { step % count } else { (count - step % count) % count };
+                    assert!(cx.update(|window, _| controls[index].is_focused(window)), "{key} step {step}");
+                }
+            }
+            let before = cx.read_entity(&view, |view, _| view.clicks);
+            for (key, increment) in [("enter", 1), ("space", 2)] {
+                cx.simulate_keystrokes(key);
+                cx.simulate_event(gpui::KeyUpEvent {
+                    keystroke: gpui::Keystroke::parse(key).unwrap(),
+                });
+                cx.run_until_parked();
+                assert_eq!(cx.read_entity(&view, |view, _| view.clicks), before + increment);
+            }
+        }
+    }
 
     struct HistoryView {
         rows: ListState,
