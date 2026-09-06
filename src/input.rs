@@ -1799,8 +1799,15 @@ impl EntityInputHandler for TextInput {
     ) -> Option<Bounds<Pixels>> {
         let layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
-        let start = layout.position_for_index(range.start)?;
-        let end = layout.position_for_index(range.end)?;
+        // AppKit can query immediately after setMarkedText, before the new
+        // content is painted. Keep the candidate window at the composition's
+        // last painted insertion point instead of returning no screen anchor.
+        let start = layout.position_for_index(range.start).or_else(|| {
+            self.marked_range
+                .as_ref()
+                .and_then(|marked| layout.position_for_index(marked.start))
+        })?;
+        let end = layout.position_for_index(range.end).unwrap_or(start);
         let line_height = layout.line_height();
         if start.y == end.y {
             Some(Bounds::from_corners(
@@ -3239,6 +3246,54 @@ mod tests {
         assert_eq!(word_range_at(text, 9), 8..13);
         assert_eq!(word_range_at(text, 14), 14..text.len());
         assert_eq!(word_range_at(text, text.len()), text.len()..text.len());
+    }
+
+    #[gpui::test]
+    fn ime_candidate_bounds_survive_composition_before_repaint(cx: &mut TestAppContext) {
+        for content in ["", "hi", "你好🙂", "first line\n你好🙂"] {
+            let (input, cx) = setup_input(cx, content, px(300.));
+            let offset = content.len();
+            let utf16_offset = content.encode_utf16().count();
+            let bounds = gpui::Bounds::new(gpui::point(px(0.), px(0.)), gpui::size(px(300.), px(100.)));
+            cx.update(|window, cx| {
+                input.update(cx, |input, cx| {
+                    input.select_range(offset..offset, cx);
+                    let previous = input
+                        .bounds_for_range(utf16_offset..utf16_offset, bounds, window, cx)
+                        .unwrap();
+                    // AppKit queries before the frame notified by setMarkedText.
+                    input.replace_and_mark_text_in_range(None, "nihao", Some(5..5), window, cx);
+                    for range in [
+                        utf16_offset..utf16_offset + 5,
+                        utf16_offset + 5..utf16_offset + 5,
+                    ] {
+                        let anchor = input
+                            .bounds_for_range(range, bounds, window, cx)
+                            .expect("IME must retain an input anchor before the next paint");
+                        assert_eq!(anchor.origin, previous.origin);
+                        assert!(anchor.size.height > px(0.));
+                    }
+                });
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                input.update(cx, |input, cx| {
+                    let expected = input
+                        .last_layout
+                        .as_ref()
+                        .unwrap()
+                        .position_for_index(input.content.len())
+                        .unwrap();
+                    let anchor = input
+                        .bounds_for_range(utf16_offset + 5..utf16_offset + 5, bounds, window, cx)
+                        .unwrap();
+                    assert_eq!(
+                        anchor.origin, expected,
+                        "repaint restores exact caret coordinates"
+                    );
+                });
+            });
+        }
     }
 
     /// ASCII keeps UTF-16 and UTF-8 offsets in step, so composing after it has
