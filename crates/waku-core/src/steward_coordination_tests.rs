@@ -335,5 +335,125 @@ fn mcp_coordination_batches_reviews_feedback_wait_and_dependency_evidence() {
                 .request(id, Uuid::nil(), Command::CloseSession)
                 .unwrap();
         }
+        // No explicit cleanup command: completion and runtime close events wake
+        // the existing worker. Only accepted clean child resources may disappear.
+        for id in [implementer, dependent] {
+            let removed = settled(&client, id, |session| {
+                session.managed_workspace.as_ref().is_some_and(|workspace| {
+                    workspace
+                        .cleanup
+                        .iter()
+                        .any(|item| item.status == crate::model::WorkspaceCleanupStatus::Removed)
+                })
+            });
+            let workspace = removed.managed_workspace.as_ref().unwrap();
+            assert!(!workspace.path.exists());
+            assert_eq!(workspace.results[0].owner, id);
+            assert!(workspace.results[0].integration_commit.is_some());
+            assert!(!workspace.results[0].evidence.is_empty());
+        }
+        let parent_after_cleanup = settled(&client, parent.id, |session| {
+            session.managed_workspace.as_ref().is_some_and(|workspace| {
+                workspace.cleanup.len() == 2
+                    && workspace.cleanup.iter().all(|item| {
+                        matches!(
+                            item.status,
+                            crate::model::WorkspaceCleanupStatus::Removed
+                                | crate::model::WorkspaceCleanupStatus::Retained
+                        )
+                    })
+            })
+        });
+        let workspace = parent_after_cleanup.managed_workspace.as_ref().unwrap();
+        assert!(workspace.cleanup.iter().any(|item| item.path == task.path
+            && item.status == crate::model::WorkspaceCleanupStatus::Removed));
+        // The fixture's MCP configuration is an untracked coordination file.
+        // Automatic cleanup must retain it, just as it retains user files.
+        assert!(
+            workspace
+                .cleanup
+                .iter()
+                .any(|item| item.path == task.coordination.as_ref().unwrap().path
+                    && item.status == crate::model::WorkspaceCleanupStatus::Retained)
+        );
+        assert!(
+            task.coordination
+                .as_ref()
+                .unwrap()
+                .path
+                .join("mcp-config.json")
+                .exists()
+        );
+        let reference = workspace.deliveries[0].reference.clone();
+        let fixed_delivery = workspace.deliveries[0].commit.clone();
+        let ref_output = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", &reference])
+            .current_dir(repository)
+            .output()
+            .unwrap();
+        assert!(ref_output.status.success());
+        assert_eq!(
+            String::from_utf8(ref_output.stdout).unwrap().trim(),
+            fixed_delivery
+        );
+        assert!(matches!(
+            client
+                .request(Uuid::nil(), Uuid::nil(), Command::PrepareShutdown)
+                .unwrap(),
+            ResponsePayload::Ack
+        ));
+        let ids = [parent.id, implementer, reviewer, fixed_reviewer, dependent];
+        let history = |session: &AgentSession| {
+            json!({
+                "id":session.id, "parent":session.parent_session_id,
+                "messages":session.messages, "turns":session.turns,
+                "activities":session.transcript_blocks,
+                "deliveries":session.input_deliveries, "workspace":session.managed_workspace,
+                "permission":session.pending_permission, "question":session.pending_user_input,
+            })
+        };
+        let snapshots = ids
+            .into_iter()
+            .map(|id| history(&settled(&client, id, |_| true)))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            client
+                .request(Uuid::nil(), Uuid::nil(), Command::ShutdownDaemon)
+                .unwrap(),
+            ResponsePayload::Ack
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !client.is_disconnected() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "old daemon did not close its socket"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        with_reopened_creation_daemon(root, |reopened| {
+            for (id, expected) in ids.into_iter().zip(snapshots) {
+                let restored = settled(&reopened, id, |_| true);
+                assert_eq!(
+                    history(&restored),
+                    expected,
+                    "cleanup/restart changed saved history for {id}"
+                );
+            }
+            let retained = std::process::Command::new("git")
+                .args(["rev-parse", "--verify", &reference])
+                .current_dir(repository)
+                .output()
+                .unwrap();
+            assert!(retained.status.success());
+            assert_eq!(
+                String::from_utf8(retained.stdout).unwrap().trim(),
+                fixed_delivery
+            );
+            assert!(!implementation_path.exists());
+            assert!(!dependent_path.exists());
+        });
+        println!(
+            "coordination_cleanup_restart=passed accepted_children_removed=2 history_snapshots_equal=5 retained_delivery_ref=true"
+        );
     });
 }
