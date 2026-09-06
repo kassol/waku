@@ -1,12 +1,28 @@
-# 管家一期任务拆分草案
+# 管家一期任务清单
 
-父规格：[kassol/waku#1](https://github.com/kassol/waku/issues/1)。状态：待用户确认粒度及阻塞关系，尚未发布子任务。
+父规格：[kassol/waku#1](https://github.com/kassol/waku/issues/1)。状态：用户已确认拆分，11 张子任务已发布为 #2–#12，均标记 ready-for-agent。
 
-T 编号仅用于本轮审阅。确认后按依赖顺序创建 GitHub Issues，用实际 Issue 编号替换阻塞项并建立原生依赖。保留父规格原文和状态，不关闭或编辑父规格。
+T 编号保留为拆分记录；实际执行使用下表的 GitHub Issue 和原生阻塞关系。正文保留获批的验收范围，GitHub 任务另含每票共用的回归与评审要求。父规格原文和状态保持不变。
 
 每票在自己的行为范围完成接口、持久化、必要的界面及回归验证；前置票可从现有 daemon 协议验收，MCP 可用后优先从工具入口验收。协议变化同步检查 Rust 和共享 TypeScript 客户端。使用隔离测试资源，每票完成 Standards / Spec 两轴评审；测试通过后再提交。所有新增控件在所属票内具备键盘路径，性能与可访问性不留到末票补做。
 
 票的创建不代表立即开工或解除暂缓安装工具链的约束。首次实现和工具链安装继续遵循当前授权；测试启动必须先通过隔离检查。没有独立预重构票：必要的历史逻辑提取在 T02 内先保持原有行为，再实现 daemon 保存。
+
+## 已发布任务
+
+| 拆分编号 | GitHub 任务 | 阻塞任务 |
+| --- | --- | --- |
+| T01 | [#2 测试 App 独立启动与资源隔离](https://github.com/kassol/waku/issues/2) | 无 |
+| T02 | [#3 无人查看时仍保存并恢复会话历史](https://github.com/kassol/waku/issues/3) | [#2](https://github.com/kassol/waku/issues/2) |
+| T03 | [#4 创建可打开的 Codex 子会话及父子关系](https://github.com/kassol/waku/issues/4) | [#3](https://github.com/kassol/waku/issues/3) |
+| T04 | [#5 Claude 管家通过 MCP 创建 Codex 子会话](https://github.com/kassol/waku/issues/5) | [#4](https://github.com/kassol/waku/issues/4) |
+| T05 | [#6 查询直属子会话状态与结果](https://github.com/kassol/waku/issues/6) | [#5](https://github.com/kassol/waku/issues/5) |
+| T06 | [#7 Claude 子会话、递归委派与用户审批](https://github.com/kassol/waku/issues/7) | [#6](https://github.com/kassol/waku/issues/6) |
+| T07 | [#8 可恢复的创建重试与工作目录选择](https://github.com/kassol/waku/issues/8) | [#5](https://github.com/kassol/waku/issues/5) |
+| T08 | [#9 后续输入与取消当前执行](https://github.com/kassol/waku/issues/9) | [#6](https://github.com/kassol/waku/issues/6) |
+| T09 | [#10 父子导航与长期历史保留](https://github.com/kassol/waku/issues/10) | [#4](https://github.com/kassol/waku/issues/4) |
+| T10 | [#11 保存失败停止任务与安全退出恢复](https://github.com/kassol/waku/issues/11) | [#3](https://github.com/kassol/waku/issues/3) |
+| T11 | [#12 长历史多会话下的原生交互验收](https://github.com/kassol/waku/issues/12) | [#7](https://github.com/kassol/waku/issues/7), [#8](https://github.com/kassol/waku/issues/8), [#9](https://github.com/kassol/waku/issues/9), [#10](https://github.com/kassol/waku/issues/10), [#11](https://github.com/kassol/waku/issues/11) |
 
 ## T01：测试 App 独立启动与资源隔离
 
