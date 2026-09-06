@@ -448,3 +448,21 @@ test('a late steer receipt preserves a wait registered by the revised plan', () 
   expect(received.steward_wait).toEqual(wait)
   expect(received.messages.at(-1)?.turn_id).toBe(oldTurn)
 })
+
+
+test('snapshot restores task evidence without rewinding its revision', () => {
+  const current = idleSession()
+  const saved: AgentSession = { ...current, managed_workspace: {
+    task_id: current.id, revision: 2, name: 'Accepted task', repository: '/isolated/repository',
+    base_commit: 'base', target_branch: 'main', target_commit: 'base', integration_branch: 'task',
+    integration_commit: 'accepted', branch: 'task', path: '/isolated/task', owned: true, ready: true,
+    created: true, coordination: null, cleanup: [], deliveries: [], dependencies: [], results: [], error: null,
+  } }
+  const restored = reduceRuntimeEvent(current, event('historySnapshot', saved), clock).session
+  expect(restored.managed_workspace?.revision).toBe(2)
+  saved.managed_workspace!.revision = 1
+  const retained = reduceRuntimeEvent(restored, event('historySnapshot', saved), clock).session
+  expect(retained.managed_workspace?.revision).toBe(2)
+  saved.managed_workspace = undefined
+  expect(reduceRuntimeEvent(retained, event('historySnapshot', saved), clock).session.managed_workspace?.integration_commit).toBe('accepted')
+})

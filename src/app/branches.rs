@@ -41,11 +41,11 @@ impl Waku {
                             .iter_mut()
                             .find(|local| local.id == session_id)
                         {
-                            local.managed_workspace = session.managed_workspace;
+                            local.apply_managed_workspace(session.managed_workspace);
                         }
                     }
                     Err(error) => waku.show_toast(error.to_string()),
-                    _ => waku.show_toast("Invalid cleanup response".to_owned()),
+                    _ => waku.show_toast(tr!("task_workspace.invalid_cleanup")),
                 }
                 cx.notify();
             });
@@ -122,8 +122,9 @@ impl Waku {
                             .iter_mut()
                             .find(|local| local.id == session_id)
                         {
-                            local.workspace = session.workspace;
-                            local.managed_workspace = session.managed_workspace;
+                            if local.apply_managed_workspace(session.managed_workspace) {
+                                local.workspace = session.workspace;
+                            }
                             if let Some(error) = local
                                 .managed_workspace
                                 .as_ref()
@@ -139,7 +140,7 @@ impl Waku {
                         }
                     }
                     Err(error) => waku.show_toast(error.to_string()),
-                    _ => waku.show_toast("Invalid task workspace response".to_owned()),
+                    _ => waku.show_toast(tr!("task_workspace.invalid_response")),
                 }
                 cx.notify();
             });

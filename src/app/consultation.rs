@@ -601,16 +601,20 @@ fn consultation_history<T: 'static>(
                 return;
             }
             match event.keystroke.key.as_str() {
-                "up" => scroll_rows.scroll_by(px(-40.0)),
-                "down" => scroll_rows.scroll_by(px(40.0)),
-                "pageup" => scroll_rows.scroll_by(px(-300.0)),
-                "pagedown" => scroll_rows.scroll_by(px(300.0)),
-                "home" => scroll_rows.scroll_to(ListOffset {
-                    item_ix: 0,
-                    offset_in_item: px(0.0),
-                }),
                 "end" => scroll_rows.scroll_to_end(),
-                _ => return,
+                "home" => scroll_rows.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.0) }),
+                key => {
+                    let delta = match key {
+                        "up" => -40.0, "down" => 40.0,
+                        "pageup" => -300.0, "pagedown" => 300.0,
+                        _ => return,
+                    };
+                    // Bottom-aligned lists keep an end anchor; move from the visible pixel offset.
+                    let max = scroll_rows.max_offset_for_scrollbar().y;
+                    let current = (-scroll_rows.scroll_px_offset_for_scrollbar().y).clamp(px(0.0), max);
+                    let next = (current + px(delta)).clamp(px(0.0), max);
+                    scroll_rows.set_offset_from_scrollbar(point(px(0.0), -next));
+                }
             }
             cx.notify();
             cx.stop_propagation();
@@ -658,20 +662,21 @@ mod history_keyboard_tests {
         cx.simulate_keystrokes("home");
         cx.run_until_parked();
         assert_eq!(rows.logical_scroll_top().offset_in_item, px(0.0));
+        let end = f32::from(rows.max_offset_for_scrollbar().y);
+        assert!(end > 500.0, "the answer must exceed the viewport");
         for (key, expected) in [
             ("down", 40.0),
-            ("end", 600.0),
-            ("up", 560.0),
-            ("pageup", 260.0),
-            ("pagedown", 560.0),
+            ("end", end),
+            ("up", end - 40.0),
+            ("pageup", end - 340.0),
+            ("pagedown", end - 40.0),
             ("home", 0.0),
         ] {
             let renders = cx.read_entity(&view, |view, _| view.renders);
             cx.simulate_keystrokes(key);
             cx.run_until_parked();
-            assert_eq!(rows.logical_scroll_top().item_ix, 0, "{key}");
             assert_eq!(
-                rows.logical_scroll_top().offset_in_item,
+                (-rows.scroll_px_offset_for_scrollbar().y).min(rows.max_offset_for_scrollbar().y),
                 px(expected),
                 "{key}"
             );
@@ -679,8 +684,12 @@ mod history_keyboard_tests {
                 cx.read_entity(&view, |view, _| view.renders) > renders,
                 "{key} must repaint the owner without provider events"
             );
-            let bounds = rows.bounds_for_item(0).expect("answer remains rendered");
-            assert_eq!(bounds.size.height, px(900.0));
+            if key == "end" {
+                assert_eq!(rows.is_scrolled_to_end(), Some(true));
+            } else {
+                let bounds = rows.bounds_for_item(0).expect("answer remains rendered");
+                assert_eq!(bounds.size.height, px(900.0));
+            }
         }
     }
 }

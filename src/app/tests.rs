@@ -26,7 +26,7 @@ use crate::git_branch::BranchEntry;
 use crate::model::{
     ActivityItem, ActivityKind, AgentSession, Checkpoint, CheckpointFile, CheckpointStatus,
     DriverEvent, Message, MessageRole, ProviderKind, ReasoningBlock, RuntimeEventCursor,
-    SessionStatus, TranscriptBlock, TurnStatus, UserInputOption, UserInputQuestion,
+    SessionStatus, SessionWorkspace, TranscriptBlock, TurnStatus, UserInputOption, UserInputQuestion,
 };
 
 #[test]
@@ -125,6 +125,35 @@ fn remote_task_catalog_adds_web_tasks_without_replacing_hydrated_detail() {
     assert_eq!(merged_local.messages.len(), 1);
     assert_eq!(merged_local.messages[0].content, "keep this transcript");
     assert!(catalog.iter().any(|session| session.id == web_task_id));
+}
+
+#[test]
+fn task_catalog_keeps_newer_workspace_evidence_and_execution_location() {
+    let mut current = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+    current.managed_workspace = Some(serde_json::from_value(serde_json::json!({
+        "task_id": current.id, "revision": 2, "name": "Accepted task",
+        "repository": "/isolated/repository", "base_commit": "base",
+        "target_branch": "main", "target_commit": "base",
+        "integration_branch": "task", "integration_commit": "accepted",
+        "branch": "task", "path": "/isolated/task", "owned": true, "ready": true
+    })).unwrap());
+    current.workspace = SessionWorkspace::Worktree { path: "/isolated/task".into(), branch: "task".into() };
+    let mut stale = current.list_projection();
+    stale.managed_workspace.as_mut().unwrap().revision = 1;
+    stale.workspace = SessionWorkspace::Local;
+    let mut catalog = vec![current];
+    merge_remote_session_catalog(&mut catalog, vec![stale.clone()], |_| true);
+    assert_eq!(catalog[0].managed_workspace.as_ref().unwrap().revision, 2);
+    assert_eq!(catalog[0].workspace.path(), Some(std::path::Path::new("/isolated/task")));
+    stale.managed_workspace = None;
+    merge_remote_session_catalog(&mut catalog, vec![stale], |_| false);
+    assert_eq!(catalog[0].managed_workspace.as_ref().unwrap().revision, 2);
+    let mut latest = catalog[0].list_projection();
+    latest.managed_workspace.as_mut().unwrap().revision = 3;
+    latest.workspace = SessionWorkspace::Worktree { path: "/isolated/coordination".into(), branch: "coordination".into() };
+    merge_remote_session_catalog(&mut catalog, vec![latest], |_| false);
+    assert_eq!(catalog[0].managed_workspace.as_ref().unwrap().revision, 3);
+    assert_eq!(catalog[0].workspace.path(), Some(std::path::Path::new("/isolated/coordination")));
 }
 
 #[test]

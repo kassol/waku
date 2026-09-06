@@ -2242,3 +2242,60 @@ consultation.pending_targets:
   en: "%{count} child results retained for this direction; the steward must review them and renew required waits."
 consultation.instruction_saved:
   en: Instruction saved; no submission confirmed. Retry to continue.
+
+task_workspace.snapshot:
+  en: "Saved task evidence (snapshot when opened)"
+task_workspace.owner:
+  en: "%{title} · owner %{owner}"
+task_workspace.base:
+  en: "Base: %{commit}"
+task_workspace.execution:
+  en: "Execution: %{path}"
+task_workspace.integration:
+  en: "Integration: %{branch} → target %{target}"
+task_workspace.dependency:
+  en: "Dependency: %{owner} at %{commit}"
+task_workspace.result:
+  en: "Result: %{commit} · owner %{owner} · integrated %{integrated}"
+task_workspace.evidence:
+  en: "Commit: %{commit}\nChecks: %{checks}\nEnvironment: %{environment}\nReviewer: %{reviewer}"
+task_workspace.delivery:
+  en: "Delivery: %{commit} · %{status}\nReference: %{reference}"
+task_workspace.overall_evidence:
+  en: "Overall checks: %{checks}\nEnvironment: %{environment}\nReviewer: %{reviewer}"
+task_workspace.cleanup:
+  en: "Cleanup: %{path} · %{status}%{reason}"
+task_workspace.pending:
+  en: "pending"
+task_workspace.cleanup_ready:
+  en: "Ready for cleanup"
+task_workspace.cleanup_waiting:
+  en: "Waiting for safe cleanup"
+task_workspace.cleanup_retained:
+  en: "Retained"
+task_workspace.cleanup_removed:
+  en: "Removed"
+task_workspace.results:
+  en: "Task results"
+task_workspace.delivered:
+  en: "Delivered locally"
+task_workspace.integrated:
+  en: "Integrated"
+task_workspace.awaiting_delivery:
+  en: "Awaiting overall acceptance and delivery"
+task_workspace.executing:
+  en: "Executing"
+task_workspace.awaiting_integration:
+  en: "Awaiting acceptance and integration"
+task_workspace.ready:
+  en: "Ready to execute"
+task_workspace.begin:
+  en: "Create task integration branch"
+task_workspace.retry_cleanup:
+  en: "Retry safe cleanup"
+task_workspace.cleaned:
+  en: " · cleaned %{removed}/%{total}"
+task_workspace.invalid_cleanup:
+  en: "The daemon returned an invalid cleanup response."
+task_workspace.invalid_response:
+  en: "The daemon returned an invalid task workspace response."

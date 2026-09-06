@@ -65,6 +65,9 @@ export function reduceRuntimeEvent(
       context_window: current.context_window,
       agent_preset: current.agent_preset,
       queued_messages: clone(current.queued_messages ?? []),
+      managed_workspace: current.managed_workspace &&
+        (!snapshot.managed_workspace || snapshot.managed_workspace.revision < current.managed_workspace.revision)
+        ? clone(current.managed_workspace) : snapshot.managed_workspace,
       updated_at: Math.max(current.updated_at, snapshot.updated_at),
       last_reply_at: Math.max(current.last_reply_at ?? 0, snapshot.last_reply_at ?? 0) || undefined,
     }

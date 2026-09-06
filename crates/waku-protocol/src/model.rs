@@ -1194,6 +1194,17 @@ fn detail_loaded_default() -> bool {
 impl AgentSession {
     pub const DEFAULT_TITLE: &'static str = "New task";
 
+    /// Catalogs, history replay and action replies can arrive out of order.
+    pub fn apply_managed_workspace(&mut self, incoming: Option<ManagedWorkspace>) -> bool {
+        if self.managed_workspace.as_ref().is_some_and(|current| {
+            incoming.as_ref().is_none_or(|next| next.revision < current.revision)
+        }) {
+            return false;
+        }
+        self.managed_workspace = incoming;
+        true
+    }
+
     pub fn new(project_id: Uuid, provider: ProviderKind) -> Self {
         let now = unix_time();
         Self {

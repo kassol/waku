@@ -94,11 +94,6 @@ impl HistoryReducer {
                 }
             }
             DriverEvent::HistorySnapshot(mut snapshot) => {
-                if session.managed_workspace.as_ref().is_some_and(|current| {
-                    snapshot.managed_workspace.as_ref().is_none_or(|incoming| incoming.revision < current.revision)
-                }) {
-                    snapshot.managed_workspace = session.managed_workspace.clone();
-                }
                 if history_snapshot_is_stale(session, &snapshot) {
                     return effects;
                 }
@@ -145,6 +140,7 @@ impl HistoryReducer {
                 session.last_reply_at = session.last_reply_at.max(snapshot.last_reply_at);
                 session.detail_loaded = true;
                 session.input_deliveries = snapshot.input_deliveries.clone();
+                session.apply_managed_workspace(snapshot.managed_workspace.take());
                 apply_rewound_history(session, *snapshot);
                 self.last_driver_error = session.last_driver_error.clone();
                 self.stream_phase = if session
@@ -887,6 +883,28 @@ mod tests {
         assert_eq!(current.messages.len(), saved.messages.len());
         assert_eq!(current.messages.last().unwrap().content, "preserved tail");
         assert_eq!(current.parent_session_id, saved.parent_session_id);
+    }
+
+    #[test]
+    fn snapshot_restores_managed_workspace_without_rewinding_its_revision() {
+        let mut current = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let mut saved = current.clone();
+        saved.managed_workspace = Some(serde_json::from_value(serde_json::json!({
+            "task_id": current.id, "revision": 2, "name": "Accepted task",
+            "repository": "/isolated/repository", "base_commit": "base",
+            "target_branch": "main", "target_commit": "base",
+            "integration_branch": "task", "integration_commit": "accepted",
+            "branch": "task", "path": "/isolated/task", "owned": true, "ready": true
+        })).unwrap());
+        let mut reducer = HistoryReducer::default();
+        reducer.apply(&mut current, DriverEvent::HistorySnapshot(Box::new(saved.clone())));
+        assert_eq!(current.managed_workspace.as_ref().map(|w| w.revision), Some(2));
+        saved.managed_workspace.as_mut().unwrap().revision = 1;
+        reducer.apply(&mut current, DriverEvent::HistorySnapshot(Box::new(saved.clone())));
+        assert_eq!(current.managed_workspace.as_ref().unwrap().revision, 2);
+        saved.managed_workspace = None;
+        reducer.apply(&mut current, DriverEvent::HistorySnapshot(Box::new(saved)));
+        assert_eq!(current.managed_workspace.as_ref().unwrap().integration_commit, "accepted");
     }
 
     #[test]
