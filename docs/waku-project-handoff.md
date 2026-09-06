@@ -4,7 +4,7 @@
 
 ## 新的已确认设计方向
 
-2026-09-07，用户确认子会话作为临时执行单元，生命周期结束后归档隐藏，主会话保留摘要和追溯入口；问题由管家在已有授权内代决，超出授权统一回主会话询问。见 [ADR 0005](adr/0005-transient-child-sessions-and-manager-decisions.md)。此方向尚待规格、拆票和实现，历史子会话归档范围待明确；下方已安装版本仍保留此前交互。
+2026-09-07，用户确认子会话作为临时执行单元，生命周期结束后归档隐藏，主会话保留摘要和追溯入口；问题由管家在已有授权内代决，超出授权统一回主会话询问。见 [ADR 0005](adr/0005-transient-child-sessions-and-manager-decisions.md)。已发布 [Issue #23](https://github.com/kassol/waku/issues/23) 及[生命周期规格](waku-steward-child-lifecycle-spec.md)，标记 ready-for-agent，待拆票和实现。用户确认沿用公共 MCP／daemon 测试边界，补充原生 harness 与隔离 App 验收；升级不自动处理历史子会话。下方已安装版本仍保留此前交互。
 
 ## 当前扩展与交付边界
 
