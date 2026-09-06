@@ -190,6 +190,16 @@ fn with_creation_daemon_seed<T>(
     config
         .provider_binary_overrides
         .insert(ProviderKind::Codex, binary.to_string_lossy().into());
+    let claude_binary = root.join("claude-child-fixture");
+    std::fs::write(
+        &claude_binary,
+        include_str!("../tests/fixtures/claude_create.py"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&claude_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    config
+        .provider_binary_overrides
+        .insert(ProviderKind::Claude, claude_binary.to_string_lossy().into());
     settings.replace(config).unwrap();
     let fixture = seed(&root, &project_path);
     let backend =

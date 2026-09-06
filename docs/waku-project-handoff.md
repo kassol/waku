@@ -94,3 +94,9 @@ Matt 流程产生仓库产物时，遵循用户的独立提交及默认 push 约
 - Rust 四包 502 项、共享客户端 30 项、主 checkout 类型检查及生成协议检查通过；独立 Standards / Spec 复核通过。真实 stdio 子进程与临时 SQLite/Git 的权限、并发、项目变化和撤销回归通过。
 - 真实 Claude Code 2.1.263（现有 fable 配置）经 MCP 创建 gpt-6-astra 子会话；父子轮次均结束，独立 worktree 中指定文件内容正确。后台原生 App 显示子会话、完整首轮结果和 History saved。#5 已关闭。
 - #5 验收时公开创建工具；本轮已加入 #6 查询接口，真实原生查询验收待完成。#8 创建重试与工作目录选择继续推进；#4 的后台键盘验收仍保留开放状态。
+
+## Claude 子会话与递归委派
+
+- `waku_spawn_session` 使用同一 daemon 创建 Claude/Codex 子会话。两种 provider 启动时均获得按会话、项目及运行时绑定的 MCP；Claude 使用 `--mcp-config`，Codex 使用进程级 `-c mcp_servers.waku=...`，不写共用原生配置。
+- 每层 MCP 仅管理直属子会话；子会话可继续委派，父子关系沿用既有持久化。跨 provider 仅接受 Ask 或权限上限为 FullAccess 的父会话；其他无法安全映射的自动审批组合明确拒绝。同 provider 保持现有权限上限。
+- 复用现有新会话入口，以说明文字提示委派能力；审批与回答仍由用户进入子会话处理。原生 App、真实 Claude 流程与键盘验收由整合阶段完成。

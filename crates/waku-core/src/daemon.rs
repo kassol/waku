@@ -522,8 +522,8 @@ impl WakuBackend {
                 title,
                 runtime_mode,
             } => {
-                if provider != ProviderKind::Codex {
-                    bail!("child creation currently supports Codex only");
+                if !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
+                    bail!("child creation supports Claude and Codex only");
                 }
                 if prompt.trim().is_empty() {
                     bail!("a child session requires a nonempty prompt");
@@ -560,7 +560,7 @@ impl WakuBackend {
                     bail!("child worktrees require a Git project");
                 }
                 let mode = runtime_mode.unwrap_or(parent.runtime_mode);
-                validate_child_mode(parent.provider, parent.runtime_mode, mode)?;
+                validate_child_mode(parent.provider, provider, parent.runtime_mode, mode)?;
                 let binary = self.provider_binary(provider)?;
                 let mut child = AgentSession::new(project.id, provider);
                 child.parent_session_id = Some(parent.id);
@@ -607,6 +607,7 @@ impl WakuBackend {
                         })?;
                     validate_child_mode(
                         current_parent.provider,
+                        provider,
                         current_parent.runtime_mode,
                         mode,
                     )?;
@@ -627,7 +628,7 @@ impl WakuBackend {
                 let start = self.handle_accepted(Request {
                     request_id: Uuid::new_v4(), session_id: child_id, runtime_id: child_runtime,
                     command: Command::Start { options: crate::WireDriverStartOptions {
-                        provider: "codex".into(), binary, cwd: worktree.path.clone(), mode: serde_json::to_value(mode)?.as_str().unwrap().to_owned(),
+                        provider: waku_protocol::encode_enum(provider)?, binary, cwd: worktree.path.clone(), mode: serde_json::to_value(mode)?.as_str().unwrap().to_owned(),
                         model, reasoning_effort: None, service_tier: None, context_window: None, agent_preset: None,
                         computer_use_enabled: false, provider_cursor: None,
                     } },
@@ -837,8 +838,8 @@ impl WakuBackend {
                         .find(|session| session.id == incoming.id)
                     {
                         if let Some(parent_id) = existing.parent_session_id {
-                            if incoming.provider != ProviderKind::Codex {
-                                bail!("a Codex child cannot switch provider");
+                            if incoming.provider != existing.provider {
+                                bail!("a child session cannot switch provider");
                             }
                             if incoming.detail_loaded
                                 && let Some(parent) = sessions.iter().find(|session| {
@@ -847,6 +848,7 @@ impl WakuBackend {
                             {
                                 validate_child_mode(
                                     parent.provider,
+                                    incoming.provider,
                                     parent.runtime_mode,
                                     incoming.runtime_mode,
                                 )?;
@@ -1300,7 +1302,7 @@ impl WakuBackend {
                     .lock()
                     .retain(|(id, _), pending| *id != session_id || !pending.is_empty());
                 let provider = decode_enum(&options.provider)?;
-                let mcp_config = if provider == ProviderKind::Claude {
+                let mcp_config = if matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
                     let project_id = self
                         .task_state
                         .lock()
@@ -1483,8 +1485,8 @@ fn validate_child_options(
     let Some(parent_id) = state.sessions[index].parent_session_id else {
         return Ok(());
     };
-    if provider != ProviderKind::Codex {
-        bail!("a Codex child cannot switch provider");
+    if provider != state.sessions[index].provider {
+        bail!("a child session cannot switch provider");
     }
     store.hydrate(&mut state.sessions[index])?;
     if let Some(parent) = state
@@ -1493,12 +1495,13 @@ fn validate_child_options(
         .find(|session| session.id == parent_id)
     {
         store.hydrate(parent)?;
-        validate_child_mode(parent.provider, parent.runtime_mode, mode)
+        validate_child_mode(parent.provider, provider, parent.runtime_mode, mode)
     } else {
         // Removing a parent preserves child history. A surviving child may
         // resume or lower its last saved permission, but cannot raise it.
         validate_child_mode(
-            ProviderKind::Codex,
+            provider,
+            provider,
             state.sessions[index].runtime_mode,
             mode,
         )
@@ -1507,13 +1510,14 @@ fn validate_child_options(
 
 fn validate_child_mode(
     parent_provider: ProviderKind,
+    child_provider: ProviderKind,
     parent: RuntimeMode,
     child: RuntimeMode,
 ) -> anyhow::Result<()> {
     // Claude's auto approval classifier and Codex's auto_review approver have
     // different authority. Their matching enum names do not establish a safe
     // permission mapping. Ask and an unrestricted parent are unambiguous.
-    let allowed = if parent_provider != ProviderKind::Codex {
+    let allowed = if parent_provider != child_provider {
         child == RuntimeMode::Ask || parent == RuntimeMode::FullAccess
     } else {
         match parent {

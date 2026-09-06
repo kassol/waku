@@ -548,6 +548,8 @@ onboarding.web_description:
   en: Choose a path on the daemon host, or start without a project.
 onboarding.open_project_folder:
   en: Open project folder…
+onboarding.steward_hint:
+  en: In a Git project, ask this assistant to delegate tasks and check direct child sessions. Handle approvals and questions in each child session.
 onboarding.what_should_we_build:
   en: What should we build?
 onboarding.what_should_we_build_in:
