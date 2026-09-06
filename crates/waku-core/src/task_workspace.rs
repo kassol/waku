@@ -12,7 +12,14 @@ pub(super) fn git(path: &Path, args: &[&str]) -> anyhow::Result<String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!("{}", if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() });
+        bail!(
+            "{}",
+            if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            }
+        );
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
@@ -51,7 +58,7 @@ impl WakuBackend {
                 self.cleanup_task_resources(session_id, events, Some(session_id), true)?;
                 let (session, _) = self.managed_task(session_id)?;
                 Ok(ResponsePayload::TaskWorkspace { session })
-            },
+            }
             StewardWorkspaceOperation::Cleanup { session_id: target } => {
                 if target != session_id {
                     self.authorized_child(&mut self.task_state.lock(), session_id, target, events)?;
@@ -59,7 +66,7 @@ impl WakuBackend {
                 self.cleanup_task_resources(target, events, Some(session_id), true)?;
                 let (session, _) = self.managed_task(target)?;
                 Ok(ResponsePayload::TaskWorkspace { session })
-            },
+            }
             StewardWorkspaceOperation::Integrate {
                 session_id: child,
                 commit,
@@ -87,6 +94,7 @@ impl WakuBackend {
                     self.authorized_child(&mut state, session_id, target, events)?
                         .0
                 };
+                drop(state);
                 let mut session = session;
                 if let Some(resource) = &mut session.managed_workspace {
                     if let Ok(commit) = git(
@@ -95,6 +103,15 @@ impl WakuBackend {
                     ) {
                         resource.integration_commit = commit;
                     }
+                }
+                events.ensure_steward_active()?;
+                let state = self.task_state.lock();
+                if !state.sessions.iter().any(|current| {
+                    current.id == session.id
+                        && current.project_id == session.project_id
+                        && current.parent_session_id == session.parent_session_id
+                }) {
+                    bail!("session scope changed while inspecting its workspace");
                 }
                 Ok(ResponsePayload::TaskWorkspace { session })
             }
@@ -317,6 +334,113 @@ impl WakuBackend {
         Ok(ResponsePayload::TaskWorkspace { session })
     }
 
+    /// A leaf acquires an integration directory only when it starts delegating.
+    /// Its existing runtime stays in the recorded coordination directory.
+    pub(super) fn prepare_managed_delegation(
+        &self,
+        owner: Uuid,
+        events: &EventSink,
+    ) -> anyhow::Result<AgentSession> {
+        let _workspace = self.workspace_start_gate.lock();
+        let (session, mut task) = self.managed_task(owner)?;
+        let (_, root) = self.managed_task(task.task_id)?;
+        if root.deliveries.iter().any(|delivery| delivery.completed) {
+            bail!("task has already been delivered; new child work requires a new task");
+        }
+        if task.coordination.is_some() && task.ready {
+            return Ok(session);
+        }
+        if task.coordination.is_none() {
+            if !task.ready {
+                bail!("managed execution workspace is not ready");
+            }
+            let path = self
+                .task_store
+                .path()
+                .parent()
+                .ok_or_else(|| anyhow!("database directory unavailable"))?
+                .join("task-worktrees")
+                .join(format!("{owner}-integration"));
+            let branch = format!("{}-integration", task.branch);
+            if std::fs::symlink_metadata(&path).is_ok()
+                || git(
+                    &task.repository,
+                    &["show-ref", "--verify", &format!("refs/heads/{branch}")],
+                )
+                .is_ok()
+            {
+                bail!("nested integration name is already used; existing resources were preserved");
+            }
+            let base = git(&task.path, &["rev-parse", "HEAD"])?;
+            task.coordination = Some(ManagedWorkspaceLocation {
+                path: task.path.clone(),
+                branch: task.branch.clone(),
+                created: task.created,
+            });
+            task.path = path;
+            task.branch = branch.clone();
+            task.integration_branch = branch;
+            task.integration_commit = base;
+            task.created = false;
+            task.owned = true;
+            task.ready = false;
+            task.cleanup.clear();
+            self.save_task_workspace(owner, task.clone())?;
+        } else if task.task_id == owner {
+            bail!("initial task workspace creation must finish before delegation");
+        }
+        let outcome = (|| -> anyhow::Result<()> {
+            if task.created {
+                if canonical_workspace(&task.path)? != std::fs::canonicalize(&task.path)?
+                    || git(&task.path, &["branch", "--show-current"])? != task.branch
+                {
+                    bail!("nested integration identity changed; resources were preserved");
+                }
+                return Ok(());
+            }
+            if std::fs::symlink_metadata(&task.path).is_ok()
+                || git(
+                    &task.repository,
+                    &[
+                        "show-ref",
+                        "--verify",
+                        &format!("refs/heads/{}", task.branch),
+                    ],
+                )
+                .is_ok()
+            {
+                bail!("unconfirmed nested integration resources were preserved");
+            }
+            std::fs::create_dir_all(
+                task.path
+                    .parent()
+                    .ok_or_else(|| anyhow!("workspace parent unavailable"))?,
+            )?;
+            git(
+                &task.repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &task.branch,
+                    task.path
+                        .to_str()
+                        .ok_or_else(|| anyhow!("workspace path is not UTF-8"))?,
+                    &task.integration_commit,
+                ],
+            )?;
+            task.created = true;
+            self.save_task_workspace(owner, task.clone())?;
+            Ok(())
+        })();
+        task.ready = outcome.is_ok();
+        task.error = outcome.as_ref().err().map(ToString::to_string);
+        let session = self.save_task_workspace(owner, task)?;
+        events.task_workspace_saved(&session);
+        outcome?;
+        Ok(session)
+    }
+
     pub(super) fn save_task_workspace(
         &self,
         session_id: Uuid,
@@ -361,69 +485,121 @@ impl WakuBackend {
     ) -> anyhow::Result<()> {
         let path = canonical_workspace(cwd)?;
         let active = self.sessions.lock().keys().copied().collect::<HashSet<_>>();
-        let mut state = self.task_state.lock();
-        let mut managed = false;
-        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == session_id) {
-            self.task_store.hydrate(session)?;
-            if let Some(resource) = &session.managed_workspace {
-                if !resource.ready {
-                    bail!("task workspace is not ready");
-                }
-                let expected = resource
-                    .coordination
-                    .as_ref()
-                    .map_or(&resource.path, |location| &location.path);
-                if canonical_workspace(expected)? != path {
-                    bail!("managed runtime must use its recorded execution workspace");
-                }
-                managed = true;
-            }
-        }
-        for session in &state.sessions {
-            if let Some(resource) = &session.managed_workspace
-                && resource.coordination.is_some()
-                && canonical_workspace(&resource.path).is_ok_and(|reserved| reserved == path)
+        let runtime_paths = self.runtime_workspaces.lock().clone();
+        let (expected, known, owners, reserved, fallback) = {
+            let mut state = self.task_state.lock();
+            if let Some(session) = state
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == session_id)
             {
-                bail!("the integration workspace is reserved for daemon Git operations");
+                self.task_store.hydrate(session)?;
             }
-        }
-        for (id, other) in self.runtime_workspaces.lock().iter() {
-            if *id != session_id
-                && *other == path
-                && (managed
-                    || state
-                        .sessions
-                        .iter()
-                        .any(|s| s.id == *id && s.managed_workspace.is_some()))
-            {
-                bail!(
-                    "workspace is already owned by running session {id}; use an independent worktree"
-                );
-            }
-        }
-        for id in active.into_iter().filter(|id| *id != session_id) {
-            let Some(index) = state.sessions.iter().position(|s| s.id == id) else {
-                continue;
-            };
-            self.task_store.hydrate(&mut state.sessions[index])?;
-            let session = &state.sessions[index];
-            if !managed && session.managed_workspace.is_none() {
-                continue;
-            }
-            let other = session.workspace.path().or_else(|| {
-                state
-                    .projects
-                    .iter()
-                    .find(|p| p.id == session.project_id)
-                    .map(|p| p.path.as_path())
+            let selected = state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id);
+            let known = selected.map(|session| {
+                (
+                    session.project_id,
+                    session
+                        .managed_workspace
+                        .as_ref()
+                        .map(|resource| resource.revision),
+                )
             });
-            if other
-                .is_some_and(|other| canonical_workspace(other).is_ok_and(|other| other == path))
-            {
+            let expected = selected
+                .and_then(|session| session.managed_workspace.as_ref())
+                .map(|resource| {
+                    (
+                        resource.ready,
+                        resource
+                            .coordination
+                            .as_ref()
+                            .map_or(&resource.path, |location| &location.path)
+                            .clone(),
+                    )
+                });
+            let owners = state
+                .sessions
+                .iter()
+                .filter(|session| session.managed_workspace.is_some())
+                .map(|session| session.id)
+                .collect::<HashSet<_>>();
+            let reserved = state
+                .sessions
+                .iter()
+                .filter_map(|session| session.managed_workspace.as_ref())
+                .filter(|resource| resource.coordination.is_some())
+                .map(|resource| resource.path.clone())
+                .collect::<Vec<_>>();
+            let fallback = state
+                .sessions
+                .iter()
+                .filter(|session| {
+                    session.id != session_id
+                        && active.contains(&session.id)
+                        && !runtime_paths.contains_key(&session.id)
+                        && (expected.is_some() || session.managed_workspace.is_some())
+                })
+                .filter_map(|session| {
+                    let path = session.workspace.path().or_else(|| {
+                        state
+                            .projects
+                            .iter()
+                            .find(|project| project.id == session.project_id)
+                            .map(|project| project.path.as_path())
+                    })?;
+                    Some((session.id, path.to_path_buf()))
+                })
+                .collect::<Vec<_>>();
+            (expected, known, owners, reserved, fallback)
+        };
+        if let Some((ready, expected)) = &expected {
+            if !ready {
+                bail!("task workspace is not ready");
+            }
+            if canonical_workspace(expected)? != path {
+                bail!("managed runtime must use its recorded execution workspace");
+            }
+        }
+        if reserved
+            .iter()
+            .any(|reserved| canonical_workspace(reserved).is_ok_and(|reserved| reserved == path))
+        {
+            bail!("the integration workspace is reserved for daemon Git operations");
+        }
+        for (id, other) in runtime_paths {
+            if id != session_id && other == path && (expected.is_some() || owners.contains(&id)) {
                 bail!(
                     "workspace is already owned by running session {id}; use an independent worktree"
                 );
             }
+        }
+        for (id, other) in fallback {
+            if canonical_workspace(&other).is_ok_and(|other| other == path) {
+                bail!(
+                    "workspace is already owned by running session {id}; use an independent worktree"
+                );
+            }
+        }
+        let current = self
+            .task_state
+            .lock()
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| {
+                (
+                    session.project_id,
+                    session
+                        .managed_workspace
+                        .as_ref()
+                        .map(|resource| resource.revision),
+                )
+            });
+        if current != known {
+            bail!("session workspace changed before runtime startup");
         }
         Ok(())
     }

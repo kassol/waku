@@ -237,14 +237,26 @@ fn managed_task_accepts_fixed_child_commit_through_mcp_while_parent_runs() {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while workspace_path.exists() || successor_path.exists() || task.path.exists() {
             if std::time::Instant::now() >= deadline {
-                let child_state = workspace_tool(address, token, parent.id, runtime,
-                    json!({"type":"inspect","sessionId":child.id}));
-                let next_state = workspace_tool(address, token, parent.id, runtime,
-                    json!({"type":"inspect","sessionId":successor.id}));
-                panic!("cleanup missing: root={:?} child={:?} successor={:?}",
+                let child_state = workspace_tool(
+                    address,
+                    token,
+                    parent.id,
+                    runtime,
+                    json!({"type":"inspect","sessionId":child.id}),
+                );
+                let next_state = workspace_tool(
+                    address,
+                    token,
+                    parent.id,
+                    runtime,
+                    json!({"type":"inspect","sessionId":successor.id}),
+                );
+                panic!(
+                    "cleanup missing: root={:?} child={:?} successor={:?}",
                     delivered["session"]["managed_workspace"]["cleanup"],
                     child_state["session"]["managed_workspace"]["cleanup"],
-                    next_state["session"]["managed_workspace"]["cleanup"]);
+                    next_state["session"]["managed_workspace"]["cleanup"]
+                );
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -372,4 +384,299 @@ fn managed_task_conflict_preserves_history_and_retries_after_resolution() {
             "fixture\n"
         );
     });
+}
+
+fn with_managed_steward(
+    test: impl FnOnce(
+        DaemonClient,
+        &Path,
+        &Path,
+        std::net::SocketAddr,
+        AgentSession,
+        Project,
+        serde_json::Value,
+        Uuid,
+    ),
+) {
+    with_creation_daemon(|client, _, root, repository, address| {
+        let project = Project::from_path(repository.to_owned());
+        let parent = AgentSession::new(project.id, ProviderKind::Claude);
+        client
+            .request(
+                parent.id,
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project.clone()],
+                    sessions: vec![parent.clone()],
+                    live_session_ids: vec![parent.id],
+                },
+            )
+            .unwrap();
+        let ResponsePayload::TaskWorkspace {
+            session: mut parent,
+        } = client
+            .request(
+                parent.id,
+                Uuid::nil(),
+                serde_json::from_value(
+                    json!({"type":"stewardWorkspace","operation":{"type":"begin",
+                "name":"Recursive task","targetBranch":"main","expectedCommit":""}}),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        else {
+            panic!("task missing");
+        };
+        let coordination = parent
+            .managed_workspace
+            .as_ref()
+            .unwrap()
+            .coordination
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        parent.begin_turn("Coordinate the task");
+        let (parent, project, config, runtime) =
+            start_steward_saved(&client, root, &coordination, parent, project);
+        test(
+            client, root, repository, address, parent, project, config, runtime,
+        );
+    });
+}
+
+#[test]
+fn managed_task_rejects_new_children_after_delivery_with_retained_integration() {
+    with_managed_steward(|client, _, _, address, parent, project, config, runtime| {
+        let task = parent.managed_workspace.as_ref().unwrap();
+        let oversized = vec![json!({"session_id":parent.id,"commit":task.base_commit}); 129];
+        let rejected = client.request(parent.id, runtime, serde_json::from_value(json!({
+            "type":"createSession","provider":"codex","prompt":"too many dependencies", "dependencies":oversized
+        })).unwrap()).unwrap_err();
+        assert!(rejected.to_string().contains("128"));
+
+        let mut reference = AgentSession::new(project.id, ProviderKind::Codex);
+        reference.begin_turn("Keep integration reference");
+        reference.finish_active_turn(crate::model::TurnStatus::Completed);
+        reference.workspace = crate::model::SessionWorkspace::Worktree {
+            path: task.path.clone(),
+            branch: task.branch.clone(),
+        };
+        client
+            .request(
+                parent.id,
+                runtime,
+                Command::SaveTaskState {
+                    projects: vec![project],
+                    sessions: vec![parent.clone(), reference.clone()],
+                    live_session_ids: vec![parent.id, reference.id],
+                },
+            )
+            .unwrap();
+        let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+            .as_str()
+            .unwrap();
+        workspace_tool(
+            address,
+            token,
+            parent.id,
+            runtime,
+            json!({"type":"deliver","commit":task.base_commit,
+            "expectedTargetCommit":task.base_commit,"evidence":[{"commit":task.base_commit,
+            "checks":"verified","environment":"fixture","reviewer":"fixture reviewer"}]}),
+        );
+        assert!(task.path.exists());
+        let response = client.request(parent.id, runtime, serde_json::from_value(json!({
+            "type":"createSession","provider":"codex","prompt":"must not create after delivery"
+        })).unwrap()).unwrap();
+        let ResponsePayload::SessionCreationFailed {
+            error,
+            workspace_path,
+            ..
+        } = response
+        else {
+            panic!("delivered tasks must reject a new child: {response:?}");
+        };
+        assert!(error.contains("delivered"), "{error}");
+        assert!(workspace_path.is_none());
+    });
+}
+
+#[test]
+fn managed_task_recursively_integrates_only_direct_results_without_moving_runtime() {
+    with_managed_steward(
+        |client, root, repository, address, parent, _, config, runtime| {
+            let root_task = parent.managed_workspace.as_ref().unwrap();
+            let root_token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+                .as_str()
+                .unwrap();
+            let ResponsePayload::SessionCreated {
+                session: manager,
+                workspace_path: execution,
+                ..
+            } = client
+                .request(
+                    parent.id,
+                    runtime,
+                    serde_json::from_value(json!({"type":"createSession","provider":"claude",
+                "prompt":"Coordinate nested work"}))
+                    .unwrap(),
+                )
+                .unwrap()
+            else {
+                panic!("manager missing");
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let nested_config: serde_json::Value = loop {
+                if let Ok(text) = std::fs::read_to_string(execution.join("mcp-config.json")) {
+                    if let Ok(config) = serde_json::from_str(&text) {
+                        break config;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let env = &nested_config["mcpServers"]["waku"]["env"];
+            let nested_token = env["WAKU_MCP_TOKEN"].as_str().unwrap();
+            let nested_runtime =
+                Uuid::parse_str(env["WAKU_MCP_RUNTIME"].as_str().unwrap()).unwrap();
+            let seed = commit_all(&execution, "Committed manager fixture inputs");
+            let reserved = root
+                .join("task-worktrees")
+                .join(format!("{}-integration", manager.id));
+            std::fs::create_dir_all(&reserved).unwrap();
+            std::fs::write(reserved.join("user-file"), "preserve existing directory").unwrap();
+            let rejected = client.request(manager.id, nested_runtime, serde_json::from_value(json!({
+                "type":"createSession","provider":"codex","prompt":"must preserve existing integration directory"
+            })).unwrap()).unwrap();
+            assert!(matches!(
+                rejected,
+                ResponsePayload::SessionCreationFailed { .. }
+            ));
+            assert_eq!(
+                std::fs::read_to_string(reserved.join("user-file")).unwrap(),
+                "preserve existing directory"
+            );
+            let unchanged = workspace_tool(
+                address,
+                nested_token,
+                manager.id,
+                nested_runtime,
+                json!({"type":"inspect","sessionId":manager.id}),
+            );
+            assert!(unchanged["session"]["managed_workspace"]["coordination"].is_null());
+            std::fs::remove_dir_all(&reserved).unwrap();
+
+            let ResponsePayload::SessionCreated {
+                session: child,
+                workspace_path: child_path,
+                ..
+            } = client
+                .request(
+                    manager.id,
+                    nested_runtime,
+                    serde_json::from_value(json!({"type":"createSession","provider":"codex",
+                "prompt":"write fixture result"}))
+                    .unwrap(),
+                )
+                .unwrap()
+            else {
+                panic!("nested child missing");
+            };
+            let promoted = workspace_tool(
+                address,
+                nested_token,
+                manager.id,
+                nested_runtime,
+                json!({"type":"inspect","sessionId":manager.id}),
+            );
+            let promoted: AgentSession =
+                serde_json::from_value(promoted["session"].clone()).unwrap();
+            let task = promoted.managed_workspace.as_ref().unwrap();
+            assert_eq!(
+                task.coordination
+                    .as_ref()
+                    .expect("nested manager needs its own integration directory")
+                    .path,
+                execution
+            );
+            assert_eq!(promoted.workspace, manager.workspace);
+            assert_ne!(task.path, execution);
+            assert_eq!(child.managed_workspace.as_ref().unwrap().base_commit, seed);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !child_path.join("child-result.txt").exists() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let child_commit = commit_all(&child_path, "Nested accepted result");
+            let accept = json!({"type":"integrate","sessionId":child.id,"commit":child_commit,
+            "expectedIntegrationCommit":seed,"evidence":[{"commit":child_commit,"checks":"verified nested output",
+            "environment":"temporary repository","reviewer":"nested reviewer"}]});
+            assert!(
+                client
+                    .request(
+                        parent.id,
+                        runtime,
+                        serde_json::from_value(json!({
+                            "type":"stewardWorkspace","operation":accept
+                        }))
+                        .unwrap()
+                    )
+                    .is_err(),
+                "root must not integrate a grandchild directly"
+            );
+            workspace_tool(address, nested_token, manager.id, nested_runtime, accept);
+            let ResponsePayload::SessionCreated { session: successor, workspace_path: successor_path, .. } = client.request(
+            manager.id, nested_runtime, serde_json::from_value(json!({"type":"createSession","provider":"codex",
+                "prompt":"use nested result","dependencies":[{"session_id":child.id,"commit":child_commit}]})).unwrap(),
+        ).unwrap() else { panic!("nested successor missing"); };
+            assert_eq!(
+                successor.managed_workspace.as_ref().unwrap().base_commit,
+                child_commit
+            );
+            assert!(successor_path.join("child-result.txt").exists());
+            let next = commit_all(&successor_path, "Accepted successor fixture inputs");
+            workspace_tool(
+                address,
+                nested_token,
+                manager.id,
+                nested_runtime,
+                json!({"type":"integrate","sessionId":successor.id,
+            "commit":next,"expectedIntegrationCommit":child_commit,"evidence":[{"commit":next,"checks":"successor validated",
+            "environment":"fixture","reviewer":"nested reviewer"}]}),
+            );
+            workspace_tool(
+                address,
+                root_token,
+                parent.id,
+                runtime,
+                json!({"type":"integrate","sessionId":manager.id,
+            "commit":next,"expectedIntegrationCommit":root_task.base_commit,"evidence":[{"commit":next,
+            "checks":"nested combined result validated","environment":"fixture","reviewer":"root reviewer"}]}),
+            );
+            workspace_tool(
+                address,
+                root_token,
+                parent.id,
+                runtime,
+                json!({"type":"deliver","commit":next,
+            "expectedTargetCommit":root_task.base_commit,"evidence":[{"commit":next,"checks":"whole task validated",
+            "environment":"fixture","reviewer":"overall reviewer"}]}),
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while task.path.exists()
+                || execution.exists()
+                || child_path.exists()
+                || successor_path.exists()
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "nested delivered resources should clean"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(repository.join("child-result.txt").exists());
+        },
+    );
 }

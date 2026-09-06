@@ -1,7 +1,7 @@
 //! Acceptance is bound to immutable commits; execution completion is independent.
 use super::task_workspace::{canonical_workspace, git};
 use super::*;
-use crate::model::{ManagedWorkspace, WorkspaceDelivery, WorkspaceEvidence, TaskResult};
+use crate::model::{ManagedWorkspace, TaskResult, WorkspaceDelivery, WorkspaceEvidence};
 
 pub(super) fn fixed_commit(repository: &Path, commit: &str) -> anyhow::Result<String> {
     if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -43,31 +43,26 @@ impl WakuBackend {
         base: &str,
         events: &EventSink,
     ) -> anyhow::Result<()> {
+        if dependencies.len() > 128 {
+            bail!("dependencies must contain at most 128 results");
+        }
         let (_, task) = self.managed_task(parent)?;
-        let mut state = self.task_state.lock();
-        for dependency in dependencies {
-            let child = self
-                .authorized_child(&mut state, parent, dependency.session_id, events)?
-                .0;
-            let resource = child
-                .managed_workspace
-                .as_ref()
-                .ok_or_else(|| anyhow!("dependency has no managed result"))?;
-            if resource.task_id != task.task_id {
-                bail!("dependency belongs to another task");
-            }
-            let result = resource
-                .results
-                .iter()
-                .find(|result| result.commit == dependency.commit)
-                .and_then(|result| result.integration_commit.as_ref())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "dependency has not been accepted and integrated at the requested commit"
-                    )
-                })?;
-            if !is_ancestor(&task.repository, result, base)
-                || !is_ancestor(&task.repository, &dependency.commit, base)
+        let commits = {
+            let mut state = self.task_state.lock();
+            dependencies.iter().map(|dependency| {
+                let child = self.authorized_child(&mut state, parent, dependency.session_id, events)?.0;
+                let resource = child.managed_workspace.as_ref()
+                    .ok_or_else(|| anyhow!("dependency has no managed result"))?;
+                if resource.task_id != task.task_id { bail!("dependency belongs to another task"); }
+                let integrated = resource.results.iter().find(|result| result.commit == dependency.commit)
+                    .and_then(|result| result.integration_commit.as_ref())
+                    .ok_or_else(|| anyhow!("dependency has not been accepted and integrated at the requested commit"))?;
+                Ok((dependency.commit.clone(), integrated.clone()))
+            }).collect::<anyhow::Result<Vec<_>>>()?
+        };
+        for (commit, integrated) in commits {
+            if !is_ancestor(&task.repository, &integrated, base)
+                || !is_ancestor(&task.repository, &commit, base)
             {
                 bail!("dependency is absent from the selected integration commit");
             }
@@ -136,7 +131,7 @@ impl WakuBackend {
         let _child = events.reserve_steward_target(child)?;
         let _workspace = self.workspace_start_gate.lock();
         let (_, mut task) = self.managed_task(parent)?;
-        if task.task_id != parent || task.coordination.is_none() || !task.ready {
+        if task.coordination.is_none() || !task.ready {
             bail!("integration requires this task's coordinating session");
         }
         let child_session = self
@@ -146,9 +141,10 @@ impl WakuBackend {
             .managed_workspace
             .clone()
             .ok_or_else(|| anyhow!("child has no managed result workspace"))?;
-        if resource.task_id != parent {
+        if resource.task_id != task.task_id {
             bail!("child workspace belongs to another task");
         }
+        let (_, root_task) = self.managed_task(task.task_id)?;
         fixed_commit(&task.repository, &commit)?;
         fixed_commit(&task.repository, &expected)?;
         check_evidence(&commit, &evidence)?;
@@ -162,7 +158,7 @@ impl WakuBackend {
                 bail!("this commit already has different acceptance parameters");
             }
             if let Some(integrated) = &result.integration_commit {
-                let retained = task
+                let retained = root_task
                     .deliveries
                     .iter()
                     .find(|delivery| delivery.completed)
@@ -177,7 +173,11 @@ impl WakuBackend {
                 });
             }
         }
-        if task.deliveries.iter().any(|delivery| delivery.completed) {
+        if root_task
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.completed)
+        {
             bail!("task has already been delivered; start a new task for more work");
         }
         if !is_ancestor(&task.repository, &resource.base_commit, &commit)

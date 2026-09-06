@@ -112,3 +112,15 @@ resources keep a saved reason and can be retried with `waku_workspace cleanup`.
 Cleanup uses ordinary Git removal, preserves history and delivery refs, and never
 adopts legacy workspaces or deletes later work after a partial cleanup. The task
 results popup shows saved commit evidence, dependencies and per-resource outcomes.
+
+A managed child that delegates for the first time gets a separate integration
+worktree. Its existing execution directory becomes its recorded coordination
+location, without moving or restarting the provider. It integrates only direct
+child results into that directory; its parent then accepts the combined fixed
+commit. Only the root task can deliver to the original target. New child creation
+is rejected after delivery. Dependency lists contain at most 128 fixed results;
+Git ancestry checks run after releasing the shared session-state lock.
+
+Cleanup also retains execution directories while durable input is queued,
+accepted or unconfirmed. Shared-reference path checks and workspace inspection
+run outside the shared session-state lock.

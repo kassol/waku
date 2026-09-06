@@ -122,7 +122,7 @@ pub fn run_stdio(
                                     "minLength": 1
                                 },
                                 "dependencies": {
-                                    "type":"array", "items":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"commit":{"type":"string"}},"required":["session_id","commit"],"additionalProperties":false}
+                                    "type":"array", "maxItems":128, "items":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"commit":{"type":"string"}},"required":["session_id","commit"],"additionalProperties":false}
                                 },
                                 "workspace": {
                                     "type": "string",

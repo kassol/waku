@@ -69,6 +69,7 @@ impl WakuBackend {
         if !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
             bail!("child creation supports Claude and Codex only");
         }
+        if dependencies.len() > 128 { bail!("dependencies must contain at most 128 results"); }
         if prompt.trim().is_empty() {
             bail!("a child session requires a nonempty prompt");
         }
@@ -93,7 +94,7 @@ impl WakuBackend {
         let _creation_lock = creation_lock.as_ref().map(|lock| lock.lock());
         events.ensure_steward_active()?;
         // Revalidate after waiting for this key, including retries of a cached outcome.
-        let (parent, project) = {
+        let (mut parent, project) = {
             let mut state = self.task_state.lock();
             let parent = state
                 .sessions
@@ -182,6 +183,9 @@ impl WakuBackend {
                 .parent()
                 .ok_or_else(|| anyhow!("the task database has no workspace directory"))?
                 .join("worktrees");
+            if parent.managed_workspace.is_some() {
+                parent = self.prepare_managed_delegation(parent_id, &events)?;
+            }
             let task_base = parent
                 .managed_workspace
                 .as_ref()

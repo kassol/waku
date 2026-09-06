@@ -28,6 +28,7 @@ fn task_workspace_cleanup_retains_unsafe_resources_and_rechecks_retries() {
         "partial-new-work",
         "background",
         "terminal",
+        "durable-input",
     ] {
         let root = std::env::temp_dir().join(format!("waku-cleanup-{}", Uuid::new_v4()));
         let repo = root.join("repo");
@@ -80,7 +81,7 @@ fn task_workspace_cleanup_retains_unsafe_resources_and_rechecks_retries() {
         let coordination = task.coordination.as_ref().unwrap();
         session = saved;
         session.begin_turn("Saved history survives cleanup");
-        if case != "active" {
+        if case != "active" && case != "durable-input" {
             session.finish_active_turn(TurnStatus::Completed);
         }
         let mut sessions = vec![session.clone()];
@@ -169,6 +170,64 @@ fn task_workspace_cleanup_retains_unsafe_resources_and_rechecks_retries() {
             sessions,
             live_session_ids: ids,
         });
+        if case == "durable-input" {
+            backend.sessions.lock().insert(
+                session.id,
+                (
+                    Uuid::nil(),
+                    DriverHandle::from_control(Arc::new(CleanupDriver)),
+                ),
+            );
+            backend.runtime_workspaces.lock().insert(
+                session.id,
+                std::fs::canonicalize(&coordination.path).unwrap(),
+            );
+            let mut controller = AgentSession::new(project.id, ProviderKind::Codex);
+            controller.begin_turn("Manage queued input");
+            {
+                let mut state = backend.task_state.lock();
+                state
+                    .sessions
+                    .iter_mut()
+                    .find(|item| item.id == session.id)
+                    .unwrap()
+                    .parent_session_id = Some(controller.id);
+                state.sessions.push(controller.clone());
+                state.mark_session_dirty(session.id);
+                state.mark_session_dirty(controller.id);
+                backend.task_store.save(&mut state).unwrap();
+            }
+            let response = backend
+                .handle(
+                    Request {
+                        request_id: Uuid::new_v4(),
+                        session_id: controller.id,
+                        runtime_id: Uuid::nil(),
+                        command: Command::StewardPrompt {
+                            child_session_id: session.id,
+                            prompt: "Pending durable feedback".into(),
+                            delivery_id: Some(Uuid::new_v4()),
+                        },
+                    },
+                    sink.clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(response).unwrap()["delivery"]["state"],
+                "queued"
+            );
+            sink.send(
+                event_to_wire(DriverEvent::TurnFinished {
+                    success: true,
+                    summary: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let (saved, _) = backend.managed_task(session.id).unwrap();
+            assert!(saved.active_turn_id().is_none());
+            assert!(saved.queued_messages.is_empty());
+        }
         let ResponsePayload::TaskWorkspace { session: delivered } = call(operation(json!({
             "type":"deliver", "commit":task.base_commit, "expectedTargetCommit":task.base_commit,
             "evidence":[{"commit":task.base_commit,"checks":"base verified","environment":"temporary repository","reviewer":"fixture reviewer"}]

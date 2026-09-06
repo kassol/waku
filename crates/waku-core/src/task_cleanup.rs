@@ -7,6 +7,26 @@ use crate::model::{
     WorkspaceCleanup, WorkspaceCleanupStatus as Status,
 };
 
+fn session_can_release_workspace(session: &AgentSession) -> bool {
+    use crate::model::InputDeliveryState;
+    session.active_turn_id().is_none()
+        && !session.is_busy()
+        && session.pending_permission.is_none()
+        && session.pending_user_input.is_none()
+        && session.queued_messages.is_empty()
+        && session.steward_wait.is_none()
+        && session.history_save_error.is_none()
+        && session.cancellation_requested_turn_id.is_none()
+        && !session.input_deliveries.iter().any(|delivery| {
+            matches!(
+                delivery.state,
+                InputDeliveryState::Queued
+                    | InputDeliveryState::Accepted
+                    | InputDeliveryState::Uncertain
+            )
+        })
+}
+
 impl WakuBackend {
     pub(super) fn track_cleanup_background(
         &self,
@@ -92,12 +112,7 @@ impl WakuBackend {
                 .sessions
                 .iter()
                 .filter(|session| {
-                    !session.is_busy()
-                        && session.active_turn_id().is_none()
-                        && session.pending_permission.is_none()
-                        && session.pending_user_input.is_none()
-                        && session.queued_messages.is_empty()
-                        && session.steward_wait.is_none()
+                    session_can_release_workspace(session)
                         && session.managed_workspace.as_ref().is_some_and(|task| {
                             delivered.contains(&task.task_id)
                                 && (task.cleanup.len()
@@ -258,15 +273,7 @@ impl WakuBackend {
                             .get(&(session.id, *runtime))
                             .is_some_and(|keys| !keys.is_empty())
                     });
-            if session.active_turn_id().is_some()
-                || session.is_busy()
-                || session.pending_permission.is_some()
-                || session.pending_user_input.is_some()
-                || !session.queued_messages.is_empty()
-                || session.steward_wait.is_some()
-                || session.history_save_error.is_some()
-                || has_background
-            {
+            if !session_can_release_workspace(session) || has_background {
                 cleanup.status = Status::Waiting;
                 bail!("session has active work, user input, unsaved history or background work");
             }
@@ -314,26 +321,26 @@ impl WakuBackend {
             {
                 bail!("workspace contains modified, untracked or ignored files");
             }
-            let shared = {
+            let references = {
                 let state = self.task_state.lock();
-                state.sessions.iter().any(|other| {
-                    if other.id == session.id {
-                        return false;
-                    }
-                    let path = match &other.workspace {
-                        crate::model::SessionWorkspace::Worktree { path, .. } => Some(path),
+                state
+                    .sessions
+                    .iter()
+                    .filter(|other| other.id != session.id)
+                    .filter_map(|other| match &other.workspace {
+                        crate::model::SessionWorkspace::Worktree { path, .. } => Some(path.clone()),
                         crate::model::SessionWorkspace::Local => state
                             .projects
                             .iter()
                             .find(|project| project.id == other.project_id)
-                            .map(|project| &project.path),
+                            .map(|project| project.path.clone()),
                         crate::model::SessionWorkspace::NewWorktree { .. } => None,
-                    };
-                    path.is_some_and(|path| {
-                        std::fs::canonicalize(path).is_ok_and(|path| path == physical)
                     })
-                })
+                    .collect::<Vec<_>>()
             };
+            let shared = references
+                .iter()
+                .any(|path| std::fs::canonicalize(path).is_ok_and(|path| path == physical));
             if shared {
                 bail!("another session still references this workspace");
             }
