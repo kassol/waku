@@ -87,6 +87,7 @@ pub struct EventSink {
     hub: Arc<Hub>,
     creation_started: Option<Sender<Result<(), String>>>,
     pub(crate) scoped_project: Option<Uuid>,
+    scoped_principal: Option<Uuid>,
 }
 
 pub(crate) struct ChildCreationGuard {
@@ -105,6 +106,16 @@ impl Drop for ChildCreationGuard {
 }
 
 impl EventSink {
+    pub(crate) fn ensure_steward_active(&self) -> anyhow::Result<()> {
+        if self
+            .scoped_principal
+            .is_some_and(|principal| !self.hub.state.lock().capabilities.contains_key(&principal))
+        {
+            bail!("steward runtime is no longer active");
+        }
+        Ok(())
+    }
+
     pub(crate) fn mcp_config(&self, project_id: Uuid) -> anyhow::Result<Option<String>> {
         let Some(address) = self.hub.address else {
             return Ok(None);
@@ -347,6 +358,7 @@ impl Hub {
             hub: self.clone(),
             creation_started: None,
             scoped_project: None,
+            scoped_principal: None,
         }
     }
 
@@ -688,7 +700,9 @@ impl RequestDispatcher {
         outgoing: Sender<ServerMessage>,
         source_subscriber_id: u64,
     ) {
-        if !self.hub.reserve_request(request.request_id, &outgoing) {
+        if !matches!(request.command, Command::StewardQuery { .. })
+            && !self.hub.reserve_request(request.request_id, &outgoing)
+        {
             return;
         }
         if command_targets_runtime(&request.command) {
@@ -1087,7 +1101,10 @@ fn dispatch_steward(
     let active = hub.state.lock().capabilities.contains_key(&scope.principal);
     let authorized = request.session_id == scope.session_id
         && request.runtime_id == scope.runtime_id
-        && matches!(request.command, Command::CreateSession { .. })
+        && matches!(
+            request.command,
+            Command::CreateSession { .. } | Command::StewardQuery { .. }
+        )
         && active
         && backend
             .authorize_steward(scope.session_id, scope.project_id)
@@ -1103,7 +1120,8 @@ fn dispatch_steward(
         });
         return;
     }
-    if !hub.reserve_request_as(scope.principal, request.request_id, &outgoing) {
+    let cacheable = !matches!(request.command, Command::StewardQuery { .. });
+    if cacheable && !hub.reserve_request_as(scope.principal, request.request_id, &outgoing) {
         return;
     }
     let request_id = request.request_id;
@@ -1121,7 +1139,9 @@ fn dispatch_steward(
                 message: format!("could not start steward request: {error}"),
             },
         };
-        failed_hub.cache_response_as(principal, request_id, outcome.clone());
+        if cacheable {
+            failed_hub.cache_response_as(principal, request_id, outcome.clone());
+        }
         let _ = failed_outgoing.send(ServerMessage::Response {
             request_id,
             outcome,
@@ -1355,6 +1375,7 @@ fn handle_request_as(
     let principal = scope.as_ref().map_or(Uuid::nil(), |scope| scope.principal);
     let request_id = request.request_id;
     let notification = request_id.is_nil();
+    let cacheable = !notification && !matches!(request.command, Command::StewardQuery { .. });
     let session_id = request.session_id;
     let runtime_id = request.runtime_id;
     let task_catalog_action = task_catalog_action(&request.command);
@@ -1365,7 +1386,7 @@ fn handle_request_as(
     );
     let mut began_runtime = false;
     let (outcome, executed) =
-        if !notification && let Some(cached) = hub.cached_response_as(principal, request_id) {
+        if cacheable && let Some(cached) = hub.cached_response_as(principal, request_id) {
             (cached, false)
         } else {
             let mutation = (command_targets_runtime(&request.command)
@@ -1390,6 +1411,7 @@ fn handle_request_as(
             let outcome = match prepared.and_then(|_| {
                 let mut events = hub.event_sink(session_id, runtime_id);
                 events.scoped_project = scope.as_ref().map(|scope| scope.project_id);
+                events.scoped_principal = scope.as_ref().map(|scope| scope.principal);
                 if let Some(scope) = &scope {
                     if !hub.state.lock().capabilities.contains_key(&scope.principal) {
                         bail!("steward runtime is no longer active");
@@ -1402,7 +1424,7 @@ fn handle_request_as(
                     error: RpcError::from(error),
                 },
             };
-            if !notification {
+            if cacheable {
                 hub.cache_response_as(principal, request_id, outcome.clone());
             }
             (outcome, true)

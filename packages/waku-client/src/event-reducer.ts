@@ -74,6 +74,7 @@ export function reduceRuntimeEvent(
       session.messages.push(...clone(current.messages.filter((message) => message.turn_id && localIds.has(message.turn_id))))
       session.transcript_blocks.push(...clone(current.transcript_blocks.filter((block) => block.turn_id && localIds.has(block.turn_id))))
       session.status = current.status
+      session.last_driver_error = current.last_driver_error
     }
     return { session, permission: session.pending_permission ?? null, userInput: session.pending_user_input ?? null, settled: false, removeRuntime: false }
   }
@@ -150,6 +151,7 @@ export function reduceRuntimeEvent(
       // submitter's ids so every client's projection names the same rows.
       const value = asRecord(payload)
       if (!value || typeof value.message !== 'string') break
+      delete session.last_driver_error
       adoptSubmittedPrompt(
         session,
         value.message,
@@ -293,6 +295,8 @@ export function reduceRuntimeEvent(
     case 'turnFinished': {
       const value = asRecord(payload)
       const success = value?.success === true
+      if (success) delete session.last_driver_error
+      else session.last_driver_error ??= typeof value?.summary === 'string' ? value.summary : 'The agent stopped before responding.'
       result.settled = settleTurn(
         session,
         success ? 'completed' : 'failed',
@@ -341,6 +345,7 @@ export function reduceRuntimeEvent(
       break
     }
     case 'processExited':
+      if (activeTurn(session)) session.last_driver_error ??= processExitError ?? 'The agent exited before responding.'
       result.settled = settleTurn(
         session,
         'failed',
@@ -355,7 +360,7 @@ export function reduceRuntimeEvent(
       break
   }
 
-  if (['cancelRequested', 'connected', 'turnStarted', 'turnFinished', 'processExited'].includes(kind)) {
+  if (['cancelRequested', 'turnStarted'].includes(kind)) {
     delete session.last_driver_error
   }
   if (['cancelRequested', 'turnParked', 'turnFinished', 'processExited'].includes(kind)) {

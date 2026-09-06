@@ -86,6 +86,7 @@ impl HistoryReducer {
                     );
                     snapshot.turns.extend(local_turns);
                     snapshot.status = session.status;
+                    snapshot.last_driver_error = session.last_driver_error.clone();
                 }
                 session.parent_session_id = snapshot.parent_session_id;
                 session.auto_title = snapshot.auto_title.take();
@@ -124,6 +125,8 @@ impl HistoryReducer {
                 message_id,
             } => {
                 session.adopt_submitted_prompt(&message, turn_id, message_id);
+                self.last_driver_error = None;
+                session.last_driver_error = None;
             }
             DriverEvent::CancelRequested => {
                 session.pending_permission = None;
@@ -223,8 +226,16 @@ impl HistoryReducer {
             DriverEvent::TurnFinished { success, summary } => {
                 session.pending_permission = None;
                 session.pending_user_input = None;
+                session.last_driver_error = if success {
+                    None
+                } else {
+                    self.last_driver_error
+                        .take()
+                        .or_else(|| session.last_driver_error.clone())
+                        .or_else(|| summary.clone())
+                        .or_else(|| Some(tr!("session.stopped_before_response")))
+                };
                 self.last_driver_error = None;
-                session.last_driver_error = None;
                 if session.active_turn_id().is_some() {
                     finish_streaming_assistant(session);
                     complete_turn_blocks(session);
@@ -291,8 +302,8 @@ impl HistoryReducer {
                     .take()
                     .or_else(|| session.last_driver_error.clone())
                     .unwrap_or_else(|| tr!("session.codex_exited_before_response"));
-                session.last_driver_error = None;
-                if session.status.is_busy() {
+                if session.status.is_busy() || session.active_turn_id().is_some() {
+                    session.last_driver_error = Some(failure_message.clone());
                     session.status = SessionStatus::Failed;
                     session.updated_at = unix_time();
                     if needs_fallback {
@@ -306,7 +317,6 @@ impl HistoryReducer {
             }
             DriverEvent::Connected { provider_cursor } => {
                 self.last_driver_error = None;
-                session.last_driver_error = None;
                 if let Some(ProviderResumeCursor::Claude {
                     resume_at: Some(message_id),
                     ..
@@ -725,6 +735,7 @@ mod tests {
         let mut snapshot = current.clone();
         snapshot.messages.last_mut().unwrap().content = "complete saved answer".into();
         snapshot.available_commands = vec![];
+        snapshot.last_driver_error = Some("previous failure".into());
         snapshot.context_usage = Some(crate::model::ContextUsage {
             tokens: 321,
             window: Some(1000),
@@ -752,6 +763,7 @@ mod tests {
         assert_eq!(current.messages[1].content, "complete saved answer");
         assert_eq!(current.messages[2].content, "new local task");
         assert_eq!(current.context_usage.unwrap().tokens, 321);
+        assert_eq!(current.last_driver_error, None);
         assert_eq!(current.status, SessionStatus::Connecting);
     }
 

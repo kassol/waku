@@ -90,52 +90,151 @@ pub fn run_stdio(
         } else if method == "ping" {
             Ok(json!({}))
         } else if method == "tools/list" {
-            Ok(
-                json!({"tools":[{"name":"waku_spawn_session","description":"Create a direct Codex child in a new Git worktree. No automatic retry after a lost response.","inputSchema":{"type":"object","properties":{"provider":{"type":"string","enum":["codex"]},"prompt":{"type":"string","minLength":1},"model":{"type":"string"},"title":{"type":"string"},"runtime_mode":{"type":"string","enum":["ask","autoAcceptEdits","auto","fullAccess"]}},"required":["provider","prompt"],"additionalProperties":false}}]}),
-            )
-        } else if method == "tools/call" {
-            if message["params"]["name"] != "waku_spawn_session" {
-                Err((-32602, "Unknown tool".into()))
-            } else {
-                match serde_json::from_value::<SpawnArguments>(
-                    message["params"]["arguments"].clone(),
-                ) {
-                    Err(error) => Err((-32602, format!("Invalid tool arguments: {error}"))),
-                    Ok(args) => {
-                        let request_id = Uuid::new_v4();
-                        send(
-                            &mut socket,
-                            &ClientMessage::Request(Request {
-                                request_id,
-                                session_id,
-                                runtime_id,
-                                command: Command::CreateSession {
-                                    provider: args.provider,
-                                    prompt: args.prompt,
-                                    model: args.model,
-                                    title: args.title,
-                                    runtime_mode: args.runtime_mode,
+            Ok(json!({
+                "tools": [
+                    {
+                        "name": "waku_spawn_session",
+                        "description": "Create a direct Codex child in a new Git worktree. No automatic retry after a lost response.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "provider": {
+                                    "type": "string",
+                                    "enum": [
+                                        "codex"
+                                    ]
                                 },
-                            }),
-                        )?;
-                        match read(&mut socket)? {
-                            ServerMessage::Response {
-                                request_id: returned,
-                                outcome,
-                            } if returned == request_id => {
-                                let (text, failed) = match outcome {
-                                    ResponseOutcome::Ok { payload: ResponsePayload::SessionCreated { session, workspace_path, branch, .. } } => (json!({"session_id":session.id,"workspace_path":workspace_path,"branch":branch}).to_string(), false),
-                                    ResponseOutcome::Error { error } => (error.message, true),
-                                    _ => bail!("unexpected steward response"),
-                                };
-                                Ok(
-                                    json!({"content":[{"type":"text","text":text}],"isError":failed}),
-                                )
-                            }
-                            _ => bail!(
-                                "unexpected steward response; check session state before retrying"
-                            ),
+                                "prompt": {
+                                    "type": "string",
+                                    "minLength": 1
+                                },
+                                "model": {
+                                    "type": "string"
+                                },
+                                "title": {
+                                    "type": "string"
+                                },
+                                "runtime_mode": {
+                                    "type": "string",
+                                    "enum": [
+                                        "ask",
+                                        "autoAcceptEdits",
+                                        "auto",
+                                        "fullAccess"
+                                    ]
+                                }
+                            },
+                            "required": [
+                                "provider",
+                                "prompt"
+                            ],
+                            "additionalProperties": false
                         }
+                    },
+                    {
+                        "name": "waku_list_sessions",
+                        "description": "List summaries of direct child sessions.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        }
+                    },
+                    {
+                        "name": "waku_status",
+                        "description": "Read direct children session and current/latest turn states; optionally wait for a change or timeout. Timeout is not failure.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "session_ids": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string",
+                                        "format": "uuid"
+                                    },
+                                    "minItems": 1,
+                                    "maxItems": 128
+                                },
+                                "wait_ms": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 60000,
+                                    "default": 0
+                                }
+                            },
+                            "required": [
+                                "session_ids"
+                            ],
+                            "additionalProperties": false
+                        }
+                    },
+                    {
+                        "name": "waku_result",
+                        "description": "Read current/latest turn reply in native text order. Turn status reports running/completed/failed/interrupted; null means no turn. Normal completion does not verify task correctness. Optional transcript includes prior turns. Text limits count Unicode characters independently for reply and transcript and report truncation.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "session_id": {
+                                    "type": "string",
+                                    "format": "uuid"
+                                },
+                                "include_transcript": {
+                                    "type": "boolean",
+                                    "default": false
+                                },
+                                "max_chars": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 100000,
+                                    "default": 20000
+                                }
+                            },
+                            "required": [
+                                "session_id"
+                            ],
+                            "additionalProperties": false
+                        }
+                    }
+                ]
+            }))
+        } else if method == "tools/call" {
+            match tool_command(
+                message["params"]["name"].as_str().unwrap_or(""),
+                message["params"]
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            ) {
+                Err(error) => Err((-32602, error)),
+                Ok(command) => {
+                    let request_id = Uuid::new_v4();
+                    send(
+                        &mut socket,
+                        &ClientMessage::Request(Request {
+                            request_id,
+                            session_id,
+                            runtime_id,
+                            command,
+                        }),
+                    )?;
+                    match read(&mut socket)? {
+                        ServerMessage::Response {
+                            request_id: returned,
+                            outcome,
+                        } if returned == request_id => {
+                            let (text,failed) = match outcome {
+                                ResponseOutcome::Ok { payload:ResponsePayload::SessionCreated {session,workspace_path,branch,..} } => (json!({"session_id":session.id,"workspace_path":workspace_path,"branch":branch}).to_string(),false),
+                                ResponseOutcome::Ok { payload:ResponsePayload::ChildSessions {sessions} } => (json!({"sessions":sessions}).to_string(),false),
+                                ResponseOutcome::Ok { payload:ResponsePayload::ChildStatus {sessions,timed_out} } => (json!({"sessions":sessions,"timed_out":timed_out}).to_string(),false),
+                                ResponseOutcome::Ok { payload:ResponsePayload::ChildResult {session,reply,reply_truncated,transcript,transcript_truncated} } => (json!({"session":session,"reply":reply,"reply_truncated":reply_truncated,"transcript":transcript,"transcript_truncated":transcript_truncated}).to_string(),false),
+                                ResponseOutcome::Error {error} => (error.message,true),
+                                _ => bail!("unexpected steward response"),
+                            };
+                            Ok(json!({"content":[{"type":"text","text":text}],"isError":failed}))
+                        }
+                        _ => bail!(
+                            "unexpected steward response; check session state before retrying"
+                        ),
                     }
                 }
             }
@@ -168,5 +267,40 @@ fn read(socket: &mut WebSocket<TcpStream>) -> anyhow::Result<ServerMessage> {
             }
             _ => {}
         }
+    }
+}
+
+fn tool_command(name: &str, arguments: Value) -> Result<Command, String> {
+    if name == "waku_spawn_session" {
+        let args: SpawnArguments = serde_json::from_value(arguments)
+            .map_err(|error| format!("Invalid tool arguments: {error}"))?;
+        Ok(Command::CreateSession {
+            provider: args.provider,
+            prompt: args.prompt,
+            model: args.model,
+            title: args.title,
+            runtime_mode: args.runtime_mode,
+        })
+    } else if name == "waku_list_sessions" || name == "waku_status" || name == "waku_result" {
+        let mut arguments = arguments
+            .as_object()
+            .cloned()
+            .ok_or("Tool arguments must be an object")?;
+        let (kind, allowed): (&str, &[&str]) = if name == "waku_list_sessions" {
+            ("listSessions", &[])
+        } else if name == "waku_status" {
+            ("status", &["session_ids", "wait_ms"])
+        } else {
+            ("result", &["session_id", "include_transcript", "max_chars"])
+        };
+        if arguments.keys().any(|key| !allowed.contains(&key.as_str())) {
+            return Err("Unknown tool argument".into());
+        }
+        arguments.insert("type".into(), Value::String(kind.into()));
+        let query = serde_json::from_value(Value::Object(arguments))
+            .map_err(|error| format!("Invalid tool arguments: {error}"))?;
+        Ok(Command::StewardQuery { query })
+    } else {
+        Err("Unknown tool".into())
     }
 }

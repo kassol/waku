@@ -326,6 +326,7 @@ test('snapshot preserves the provider error until the exit is settled', () => {
 test('snapshot keeps newer user choices and the local submitted turn', () => {
   const saved = idleSession()
   saved.messages[1]!.content = 'complete saved answer'
+  saved.last_driver_error = 'previous failure'
   saved.context_usage = { tokens: 321, window: 1000 }
   const current = apply(idleSession(), 'promptSubmitted', SUBMISSION)
   current.project_id = 'new-project'
@@ -343,6 +344,7 @@ test('snapshot keeps newer user choices and the local submitted turn', () => {
   expect(restored.messages[1]?.content).toBe('complete saved answer')
   expect(restored.messages.at(-1)?.content).toBe('Second prompt')
   expect(restored.context_usage?.tokens).toBe(321)
+  expect(restored.last_driver_error).toBeUndefined()
   expect(restored.status).toBe('connecting')
 })
 
@@ -355,4 +357,18 @@ test('snapshot does not rewind an already applied event', () => {
   const restored = reduceRuntimeEvent(current, event('historySnapshot', saved), clock).session
   expect(restored.messages.at(-1)?.content).toBe('saved later')
   expect(restored.runtime_event_cursor?.sequence).toBe(9)
+})
+
+test('failed turn reasons survive exit and reconnect until a new submitted turn', () => {
+  const failed = apply(apply(runningSession(), 'error', 'provider lost connection'), 'processExited', null)
+  expect(failed.last_driver_error).toBe('provider lost connection')
+  expect(failed.turns.at(-1)?.status).toBe('failed')
+  const reconnected = apply(failed, 'connected', null)
+  expect(reconnected.last_driver_error).toBe('provider lost connection')
+  expect(apply(reconnected, 'promptSubmitted', SUBMISSION).last_driver_error).toBeUndefined()
+  const ended = apply(runningSession(), 'turnFinished', { success: false, summary: 'provider failed turn' })
+  expect(ended.last_driver_error).toBe('provider failed turn')
+  expect(apply(ended, 'processExited', null).last_driver_error).toBe('provider failed turn')
+  const success = apply(apply(runningSession(), 'error', 'temporary error'), 'turnFinished', { success: true })
+  expect(success.last_driver_error).toBeUndefined()
 })

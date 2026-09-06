@@ -72,7 +72,7 @@ thread_goal?: ThreadGoal | null,
  */
 context_usage?: ContextUsage | null, runtime_event_cursor?: RuntimeEventCursor | null, history_saved_cursor?: RuntimeEventCursor | null, history_save_error?: string | null,
 /**
- * Pending provider failure used if the runtime exits before producing a reply.
+ * Current or latest turn failure, retained across exit until the next turn or success.
  */
 last_driver_error?: string | null, pending_permission?: PendingPermission | null, pending_user_input?: UserInputRequest | null,
 /**

@@ -10,6 +10,16 @@ fn start_steward(
     let mut parent = AgentSession::new(project.id, ProviderKind::Claude);
     parent.runtime_mode = RuntimeMode::Ask;
     parent.begin_turn("Delegate");
+    start_steward_saved(client, root, project_path, parent, project)
+}
+
+fn start_steward_saved(
+    client: &DaemonClient,
+    root: &Path,
+    project_path: &Path,
+    parent: AgentSession,
+    project: Project,
+) -> (AgentSession, Project, serde_json::Value, Uuid) {
     client
         .request(
             Uuid::nil(),
@@ -134,45 +144,7 @@ fn mcp_stdio_creates_real_child_and_rejects_spoofed_arguments() {
             json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"waku_spawn_session","arguments":{"provider":"codex","prompt":"write fixture result"}}}),
             json!([]),
         ].iter().map(|value| format!("{value}\n")).collect::<String>();
-        let mut output = Vec::new();
-        if let Ok(binary) = std::env::var("WAKU_TEST_MCP_BINARY") {
-            use std::io::Write;
-            let mut child = std::process::Command::new(binary)
-                .arg("mcp")
-                .env("WAKU_MCP_ADDRESS", address.to_string())
-                .env("WAKU_MCP_TOKEN", token)
-                .env("WAKU_MCP_SESSION", parent.id.to_string())
-                .env("WAKU_MCP_RUNTIME", runtime.to_string())
-                .env_remove(crate::protocol::DAEMON_TOKEN_ENV)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(input.as_bytes())
-                .unwrap();
-            let result = child.wait_with_output().unwrap();
-            assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-            output = result.stdout;
-        } else {
-            crate::mcp::run_stdio(
-                Cursor::new(input),
-                &mut output,
-                &address.to_string(),
-                token,
-                parent.id,
-                runtime,
-            )
-            .unwrap();
-        }
+        let output = run_mcp(input, address, token, parent.id, runtime);
         let replies: Vec<serde_json::Value> = String::from_utf8(output)
             .unwrap()
             .lines()
@@ -180,7 +152,7 @@ fn mcp_stdio_creates_real_child_and_rejects_spoofed_arguments() {
             .collect();
         assert_eq!(replies.len(), 6);
         assert_eq!(replies[5]["error"]["code"], -32600);
-        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 4);
         assert_eq!(replies[2]["error"]["code"], -32602);
         assert_eq!(replies[3]["result"]["isError"], true);
         assert_eq!(replies[4]["result"]["isError"], false);
@@ -464,4 +436,747 @@ fn scoped_inflight_uuid_cannot_join_a_desktop_request() {
             .request(parent.id, runtime, Command::CloseSession)
             .unwrap();
     });
+}
+
+fn mcp_response(
+    address: std::net::SocketAddr,
+    token: &str,
+    parent: Uuid,
+    runtime: Uuid,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let input = format!(
+        "{}\n{}\n{}\n",
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}})
+    );
+    let output = run_mcp(input, address, token, parent, runtime);
+    let response: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output).unwrap().lines().last().unwrap()).unwrap();
+    response
+}
+
+fn mcp_tool(
+    address: std::net::SocketAddr,
+    token: &str,
+    parent: Uuid,
+    runtime: Uuid,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let response = mcp_response(address, token, parent, runtime, name, arguments);
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+#[test]
+fn mcp_query_lists_only_direct_children() {
+    with_creation_daemon(|client, _, root, project_path, address| {
+        let (parent, _, config, runtime) = start_steward(&client, root, project_path);
+        let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+            .as_str()
+            .unwrap();
+        let ResponsePayload::SessionCreated { session: child, .. } = client
+            .request(parent.id, runtime, spawn_command("write fixture result"))
+            .unwrap()
+        else {
+            panic!("child missing")
+        };
+        let result = mcp_tool(
+            address,
+            token,
+            parent.id,
+            runtime,
+            "waku_list_sessions",
+            json!({}),
+        );
+        assert_eq!(result["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(result["sessions"][0]["session_id"], child.id.to_string());
+        client
+            .request(parent.id, runtime, Command::CloseSession)
+            .unwrap();
+    });
+}
+
+fn seed_query_sessions(
+    root: &Path,
+    project_path: &Path,
+) -> (Project, AgentSession, Vec<AgentSession>) {
+    use crate::model::{DriverEvent, MessageRole, TurnStatus};
+    let project = Project::from_path(project_path.into());
+    let mut parent = AgentSession::new(project.id, ProviderKind::Claude);
+    parent.runtime_mode = RuntimeMode::Ask;
+    parent.begin_turn("delegate");
+    parent.finish_active_turn(TurnStatus::Completed);
+    parent.status = SessionStatus::Idle;
+    let mut child = AgentSession::new(project.id, ProviderKind::Codex);
+    child.parent_session_id = Some(parent.id);
+    child.runtime_mode = RuntimeMode::Ask;
+    child.begin_turn("previous task");
+    child.push_message(MessageRole::Assistant, "previous answer");
+    child.finish_active_turn(TurnStatus::Completed);
+    child.begin_turn("current task");
+    let mut reducer = waku_protocol::history::HistoryReducer::default();
+    reducer.apply(&mut child, DriverEvent::TurnStarted);
+    reducer.apply(&mut child, DriverEvent::TextDelta("前段".into()));
+    reducer.apply(
+        &mut child,
+        DriverEvent::Activity {
+            id: Some("tool".into()),
+            kind: crate::model::ActivityKind::Command,
+            title: "Run check".into(),
+            detail: Some("check output".into()),
+            complete: true,
+        },
+    );
+    reducer.apply(&mut child, DriverEvent::TextDelta("后段🌍".into()));
+    reducer.apply(
+        &mut child,
+        DriverEvent::TurnFinished {
+            success: true,
+            summary: None,
+        },
+    );
+    let mut empty = AgentSession::new(project.id, ProviderKind::Codex);
+    empty.parent_session_id = Some(parent.id);
+    empty.runtime_mode = RuntimeMode::Ask;
+    let mut grandchild = AgentSession::new(project.id, ProviderKind::Codex);
+    grandchild.parent_session_id = Some(child.id);
+    grandchild.runtime_mode = RuntimeMode::Ask;
+    let mut foreign = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+    foreign.parent_session_id = Some(parent.id);
+    foreign.runtime_mode = RuntimeMode::Ask;
+    for session in [&mut empty, &mut grandchild, &mut foreign] {
+        session.push_message(MessageRole::User, "legacy history without a turn");
+    }
+    let children = vec![child, empty, grandchild, foreign];
+    let store = StateStore::daemon(root.join("app.db"));
+    let mut state = store.load().unwrap();
+    state.projects = vec![project.clone()];
+    state.sessions = std::iter::once(parent.clone())
+        .chain(children.clone())
+        .collect();
+    for id in state
+        .sessions
+        .iter()
+        .map(|session| session.id)
+        .collect::<Vec<_>>()
+    {
+        state.mark_session_dirty(id);
+    }
+    store.save(&mut state).unwrap();
+    (project, parent, children)
+}
+
+#[test]
+fn mcp_status_waits_for_changes_and_distinguishes_no_turn() {
+    with_creation_daemon_seed(
+        seed_query_sessions,
+        |client, _, root, project_path, address, (project, parent, children)| {
+            let (parent, _, config, runtime) =
+                start_steward_saved(&client, root, project_path, parent, project);
+            let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+                .as_str()
+                .unwrap();
+            let ids = vec![children[0].id, children[1].id];
+            let snapshot = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_status",
+                json!({"session_ids":ids}),
+            );
+            let summaries = snapshot["sessions"].as_array().unwrap();
+            let completed = summaries
+                .iter()
+                .find(|s| s["session_id"] == children[0].id.to_string())
+                .unwrap();
+            let empty = summaries
+                .iter()
+                .find(|s| s["session_id"] == children[1].id.to_string())
+                .unwrap();
+            assert_eq!(completed["status"], "idle");
+            assert_eq!(completed["turn"]["status"], "completed");
+            assert!(empty["turn"].is_null());
+            let started = std::time::Instant::now();
+            let timeout = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_status",
+                json!({"session_ids":ids,"wait_ms":100}),
+            );
+            assert_eq!(timeout["timed_out"], true);
+            assert!(started.elapsed() >= Duration::from_millis(100));
+            let token_owned = token.to_owned();
+            let parent_id = parent.id;
+            let targets = ids.clone();
+            let waiting = std::thread::spawn(move || {
+                mcp_tool(
+                    address,
+                    &token_owned,
+                    parent_id,
+                    runtime,
+                    "waku_status",
+                    json!({"session_ids":targets,"wait_ms":3000}),
+                )
+            });
+            std::thread::sleep(Duration::from_millis(250));
+            let mut changed = children[1].clone();
+            changed.begin_turn("new task");
+            changed.status = SessionStatus::Background;
+            changed.updated_at += 1;
+            client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::SaveTaskState {
+                        projects: vec![],
+                        sessions: vec![changed],
+                        live_session_ids: vec![children[1].id],
+                    },
+                )
+                .unwrap();
+            let updated = waiting.join().unwrap();
+            assert_eq!(updated["timed_out"], false);
+            let changed = updated["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["session_id"] == children[1].id.to_string())
+                .unwrap();
+            assert_eq!(changed["status"], "background");
+            assert_eq!(changed["turn"]["status"], "running");
+            assert_eq!(changed["turn_open"], true);
+            let mut waiting_child = children[1].clone();
+            waiting_child.begin_turn("needs approval");
+            waiting_child.status = SessionStatus::Waiting;
+            waiting_child.updated_at += 2;
+            waiting_child.pending_permission = Some(crate::model::PendingPermission {
+                request_id: "permission".into(),
+                title: "Run check".into(),
+                detail: "check".into(),
+                options: vec![],
+            });
+            waiting_child.pending_user_input = Some(crate::model::UserInputRequest {
+                request_id: "question".into(),
+                questions: vec![],
+            });
+            client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::SaveTaskState {
+                        projects: vec![],
+                        sessions: vec![waiting_child],
+                        live_session_ids: vec![children[1].id],
+                    },
+                )
+                .unwrap();
+            let waiting = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_status",
+                json!({"session_ids":[children[1].id]}),
+            );
+            assert_eq!(waiting["sessions"][0]["status"], "waiting");
+            assert_eq!(waiting["sessions"][0]["turn"]["status"], "running");
+            assert_eq!(
+                waiting["sessions"][0]["waiting_for"],
+                json!(["permission", "userInput"])
+            );
+            client
+                .request(parent.id, runtime, Command::CloseSession)
+                .unwrap();
+        },
+    );
+}
+
+#[test]
+fn mcp_result_preserves_turn_order_and_unicode_boundaries() {
+    with_creation_daemon_seed(
+        seed_query_sessions,
+        |client, _, root, project_path, address, (project, parent, children)| {
+            let (parent, _, config, runtime) =
+                start_steward_saved(&client, root, project_path, parent, project);
+            let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+                .as_str()
+                .unwrap();
+            let result = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_result",
+                json!({"session_id":children[0].id,"include_transcript":true}),
+            );
+            assert_eq!(result["reply"], "前段\n\n后段🌍");
+            assert_eq!(result["session"]["turn"]["status"], "completed");
+            assert_eq!(result["reply_truncated"], false);
+            let transcript = result["transcript"].as_str().unwrap();
+            assert!(transcript.find("前段").unwrap() < transcript.find("Run check").unwrap());
+            assert!(transcript.find("Run check").unwrap() < transcript.find("后段🌍").unwrap());
+            let short = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_result",
+                json!({"session_id":children[0].id,"max_chars":5,"include_transcript":true}),
+            );
+            assert_eq!(short["reply"], "前段\n\n后");
+            assert_eq!(short["reply_truncated"], true);
+            assert_eq!(short["transcript_truncated"], true);
+            let empty = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_result",
+                json!({"session_id":children[1].id}),
+            );
+            assert!(empty["session"]["turn"].is_null());
+            assert_eq!(empty["reply"], "");
+            assert!(empty["transcript"].is_null());
+            let mut next = children[0].clone();
+            next.begin_turn("next unfinished task");
+            next.status = SessionStatus::Working;
+            next.updated_at += 1;
+            client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::SaveTaskState {
+                        projects: vec![],
+                        sessions: vec![next.clone()],
+                        live_session_ids: vec![next.id],
+                    },
+                )
+                .unwrap();
+            let running = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_result",
+                json!({"session_id":next.id}),
+            );
+            assert_eq!(running["session"]["turn"]["status"], "running");
+            assert_eq!(running["reply"], "");
+            for status in [
+                crate::model::TurnStatus::Failed,
+                crate::model::TurnStatus::Interrupted,
+            ] {
+                let mut ended = next.clone();
+                ended.finish_active_turn(status);
+                ended.updated_at += 2;
+                ended.status = SessionStatus::Idle;
+                client
+                    .request(
+                        Uuid::nil(),
+                        Uuid::nil(),
+                        Command::SaveTaskState {
+                            projects: vec![],
+                            sessions: vec![ended],
+                            live_session_ids: vec![next.id],
+                        },
+                    )
+                    .unwrap();
+                let result = mcp_tool(
+                    address,
+                    token,
+                    parent.id,
+                    runtime,
+                    "waku_result",
+                    json!({"session_id":next.id}),
+                );
+                assert_eq!(
+                    result["session"]["turn"]["status"],
+                    serde_json::to_value(status).unwrap()
+                );
+                assert_eq!(result["reply"], "");
+            }
+            client
+                .request(parent.id, runtime, Command::CloseSession)
+                .unwrap();
+        },
+    );
+}
+
+#[test]
+fn steward_queries_recheck_targets_and_do_not_cache_results() {
+    use waku_protocol::StewardQuery;
+    with_creation_daemon_seed(
+        seed_query_sessions,
+        |client, _, root, project_path, address, (project, parent, children)| {
+            let (parent, _, config, runtime) =
+                start_steward_saved(&client, root, project_path, parent, project);
+            let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+                .as_str()
+                .unwrap();
+            let mut socket = scoped_socket(address, token);
+            let request_id = Uuid::new_v4();
+            let request = |query| Request {
+                request_id,
+                session_id: parent.id,
+                runtime_id: runtime,
+                command: Command::StewardQuery { query },
+            };
+            let result = scoped_request(&mut socket, request(StewardQuery::ListSessions {}));
+            let ResponseOutcome::Ok {
+                payload: ResponsePayload::ChildSessions { sessions },
+            } = result
+            else {
+                panic!("list failed")
+            };
+            assert_eq!(sessions.len(), 2);
+            for target in [parent.id, children[2].id, children[3].id, Uuid::new_v4()] {
+                for query in [
+                    StewardQuery::Status {
+                        session_ids: vec![children[0].id, target],
+                        wait_ms: 0,
+                    },
+                    StewardQuery::Result {
+                        session_id: target,
+                        include_transcript: true,
+                        max_chars: None,
+                    },
+                ] {
+                    assert!(matches!(
+                        scoped_request(&mut socket, request(query)),
+                        ResponseOutcome::Error { .. }
+                    ));
+                }
+            }
+            let query = StewardQuery::Result {
+                session_id: children[0].id,
+                include_transcript: false,
+                max_chars: None,
+            };
+            assert!(matches!(
+                scoped_request(&mut socket, request(query.clone())),
+                ResponseOutcome::Ok {
+                    payload: ResponsePayload::ChildResult { .. }
+                }
+            ));
+            let mut changed = children[0].clone();
+            changed.project_id = Uuid::new_v4();
+            changed.updated_at += 1;
+            client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::SaveTaskState {
+                        projects: vec![],
+                        sessions: vec![changed],
+                        live_session_ids: vec![children[0].id],
+                    },
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    scoped_request(&mut socket, request(query)),
+                    ResponseOutcome::Error { .. }
+                ),
+                "cached result bypassed changed project"
+            );
+            for (name, args) in [
+                ("waku_list_sessions", json!({"parent_only":false})),
+                ("waku_list_sessions", json!({"parent_session_id":parent.id})),
+                (
+                    "waku_status",
+                    json!({"session_ids":[children[1].id],"wait_ms":-1}),
+                ),
+                (
+                    "waku_status",
+                    json!({"session_ids":[children[1].id],"wait_ms":60001}),
+                ),
+                ("waku_status", json!({"session_ids":[]})),
+                (
+                    "waku_result",
+                    json!({"session_id":children[1].id,"max_chars":0}),
+                ),
+                (
+                    "waku_result",
+                    json!({"session_id":children[1].id,"max_chars":100001}),
+                ),
+            ] {
+                let response = mcp_response(address, token, parent.id, runtime, name, args);
+                assert!(
+                    response.get("error").is_some() || response["result"]["isError"] == true,
+                    "{response}"
+                );
+            }
+            client
+                .request(parent.id, runtime, Command::CloseSession)
+                .unwrap();
+            assert!(matches!(
+                scoped_request(&mut socket, request(StewardQuery::ListSessions {})),
+                ResponseOutcome::Error { .. }
+            ));
+        },
+    );
+}
+
+#[test]
+fn steward_status_wait_is_revoked_when_parent_runtime_ends() {
+    with_creation_daemon_seed(
+        seed_query_sessions,
+        |client, _, root, project_path, address, (project, parent, children)| {
+            let (parent, _, config, runtime) =
+                start_steward_saved(&client, root, project_path, parent, project);
+            let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let parent_id = parent.id;
+            let target = children[0].id;
+            let waiting = std::thread::spawn(move || {
+                mcp_response(
+                    address,
+                    &token,
+                    parent_id,
+                    runtime,
+                    "waku_status",
+                    json!({"session_ids":[target],"wait_ms":60000}),
+                )
+            });
+            std::thread::sleep(Duration::from_millis(250));
+            let started = std::time::Instant::now();
+            client
+                .request(parent.id, runtime, Command::CloseSession)
+                .unwrap();
+            let result = waiting.join().unwrap();
+            assert_eq!(result["result"]["isError"], true, "{result}");
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "revocation waited for status timeout"
+            );
+        },
+    );
+}
+
+fn run_mcp(
+    input: String,
+    address: std::net::SocketAddr,
+    token: &str,
+    parent: Uuid,
+    runtime: Uuid,
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    if let Ok(binary) = std::env::var("WAKU_TEST_MCP_BINARY") {
+        use std::io::Write;
+        let mut child = std::process::Command::new(binary)
+            .arg("mcp")
+            .env("WAKU_MCP_ADDRESS", address.to_string())
+            .env("WAKU_MCP_TOKEN", token)
+            .env("WAKU_MCP_SESSION", parent.to_string())
+            .env("WAKU_MCP_RUNTIME", runtime.to_string())
+            .env_remove(crate::protocol::DAEMON_TOKEN_ENV)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        output = result.stdout;
+    } else {
+        crate::mcp::run_stdio(
+            Cursor::new(input),
+            &mut output,
+            &address.to_string(),
+            token,
+            parent,
+            runtime,
+        )
+        .unwrap();
+    }
+
+    output
+}
+
+#[test]
+fn result_queries_progress_while_provider_events_are_persisted() {
+    use waku_protocol::StewardQuery;
+    with_creation_daemon(|client, _, root, project_path, address| {
+        let (parent, _, config, runtime) = start_steward(&client, root, project_path);
+        let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+            .as_str()
+            .unwrap();
+        let ResponsePayload::SessionCreated { session: child, .. } = client
+            .request(parent.id, runtime, spawn_command("stream query result"))
+            .unwrap()
+        else {
+            panic!("child missing")
+        };
+        let mut socket = scoped_socket(address, token);
+        socket
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        let mut saw_running = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let outcome = scoped_request(
+                &mut socket,
+                Request {
+                    request_id,
+                    session_id: parent.id,
+                    runtime_id: runtime,
+                    command: Command::StewardQuery {
+                        query: StewardQuery::Result {
+                            session_id: child.id,
+                            include_transcript: true,
+                            max_chars: None,
+                        },
+                    },
+                },
+            );
+            let ResponseOutcome::Ok {
+                payload: ResponsePayload::ChildResult { session, reply, .. },
+            } = outcome
+            else {
+                panic!("result query failed")
+            };
+            if session
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.status == crate::model::TurnStatus::Completed)
+            {
+                assert_eq!(reply, "x".repeat(100));
+                break;
+            }
+            saw_running = true;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "query or provider made no progress"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_running);
+        client
+            .request(parent.id, runtime, Command::CloseSession)
+            .unwrap();
+    });
+}
+
+#[test]
+fn query_preserves_failed_turn_reason_across_storage_restart() {
+    fn seed_failed(root: &Path, path: &Path) -> (Project, AgentSession, Vec<AgentSession>) {
+        let (project, parent, mut children) = seed_query_sessions(root, path);
+        let child = &mut children[0];
+        child.begin_turn("fail after partial output");
+        let mut reducer = waku_protocol::history::HistoryReducer::default();
+        reducer.apply(child, crate::model::DriverEvent::TurnStarted);
+        reducer.apply(
+            child,
+            crate::model::DriverEvent::TextDelta("partial".into()),
+        );
+        reducer.apply(
+            child,
+            crate::model::DriverEvent::Error("provider lost connection".into()),
+        );
+        reducer.apply(child, crate::model::DriverEvent::ProcessExited);
+        reducer.apply(
+            child,
+            crate::model::DriverEvent::Connected {
+                provider_cursor: None,
+            },
+        );
+        let store = StateStore::daemon(root.join("app.db"));
+        let mut state = store.load().unwrap();
+        *state
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == child.id)
+            .unwrap() = child.clone();
+        state.mark_session_dirty(child.id);
+        store.save(&mut state).unwrap();
+        (project, parent, children)
+    }
+    with_creation_daemon_seed(
+        seed_failed,
+        |client, _, root, project_path, address, (project, parent, children)| {
+            let (parent, _, config, runtime) =
+                start_steward_saved(&client, root, project_path, parent, project);
+            let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+                .as_str()
+                .unwrap();
+            let result = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_result",
+                json!({"session_id":children[0].id}),
+            );
+            assert_eq!(result["session"]["error"], "provider lost connection");
+            assert_eq!(result["session"]["turn"]["status"], "failed");
+            assert_eq!(result["reply"], "partial");
+            let status = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_status",
+                json!({"session_ids":[children[0].id]}),
+            );
+            assert_eq!(status["sessions"][0]["error"], "provider lost connection");
+            let mut next = children[0].clone();
+            let mut reducer = waku_protocol::history::HistoryReducer::default();
+            reducer.apply(
+                &mut next,
+                crate::model::DriverEvent::PromptSubmitted {
+                    message: "retry".into(),
+                    turn_id: Uuid::new_v4(),
+                    message_id: Uuid::new_v4(),
+                },
+            );
+            next.updated_at += 1;
+            client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::SaveTaskState {
+                        projects: vec![],
+                        sessions: vec![next],
+                        live_session_ids: vec![children[0].id],
+                    },
+                )
+                .unwrap();
+            let next = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_result",
+                json!({"session_id":children[0].id}),
+            );
+            assert!(next["session"]["error"].is_null());
+            assert_eq!(next["session"]["turn"]["status"], "running");
+            assert_eq!(next["reply"], "");
+            client
+                .request(parent.id, runtime, Command::CloseSession)
+                .unwrap();
+        },
+    );
 }

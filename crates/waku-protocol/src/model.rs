@@ -973,7 +973,7 @@ pub struct AgentSession {
     pub history_saved_cursor: Option<RuntimeEventCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_save_error: Option<String>,
-    /// Pending provider failure used if the runtime exits before producing a reply.
+    /// Current or latest turn failure, retained across exit until the next turn or success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_driver_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

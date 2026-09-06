@@ -9,8 +9,8 @@ use crate::attachments::{AttachmentUpload, StoredAttachment};
 use crate::computer_use::ComputerPermissions;
 use crate::model::{
     AgentSession, GoalOperation, Project, ProviderKind, ProviderProbe, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, RuntimeEventCursor, RuntimeMode,
-    UserInputAnswer,
+    ProviderSessionHistory, ProviderSessionSummary, RuntimeEventCursor, RuntimeMode, SessionStatus,
+    TurnStatus, UserInputAnswer,
 };
 use crate::persistence::{ComposerDraftChange, ComposerDrafts, SessionMessageMatch};
 use crate::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
@@ -20,7 +20,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -72,12 +72,62 @@ pub struct ReplayCursor {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum StewardQuery {
+    ListSessions {},
+    Result {
+        session_id: Uuid,
+        #[serde(default)]
+        include_transcript: bool,
+        max_chars: Option<usize>,
+    },
+    Status {
+        session_ids: Vec<Uuid>,
+        #[serde(default)]
+        wait_ms: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct ChildTurnSummary {
+    pub turn_id: Uuid,
+    pub status: TurnStatus,
+    pub started_at: u64,
+    pub completed_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ChildWaitingReason {
+    Permission,
+    UserInput,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct ChildSessionSummary {
+    pub session_id: Uuid,
+    pub title: String,
+    pub provider: ProviderKind,
+    pub status: SessionStatus,
+    pub created_at: u64,
+    pub last_activity: u64,
+    pub turn_open: bool,
+    pub turn: Option<ChildTurnSummary>,
+    pub waiting_for: Vec<ChildWaitingReason>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
 pub enum Command {
+    /// Read direct children of Request.session_id.
+    StewardQuery {
+        query: StewardQuery,
+    },
     /// Create a direct child of Request.session_id on the daemon host.
     CreateSession {
         provider: ProviderKind,
@@ -411,6 +461,20 @@ pub enum ResponseOutcome {
     rename_all_fields = "camelCase"
 )]
 pub enum ResponsePayload {
+    ChildSessions {
+        sessions: Vec<ChildSessionSummary>,
+    },
+    ChildStatus {
+        sessions: Vec<ChildSessionSummary>,
+        timed_out: bool,
+    },
+    ChildResult {
+        session: ChildSessionSummary,
+        reply: String,
+        reply_truncated: bool,
+        transcript: Option<String>,
+        transcript_truncated: bool,
+    },
     SessionCreated {
         session: AgentSession,
         runtime_id: Uuid,
@@ -580,7 +644,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 11);
     }
 
     #[test]
@@ -589,7 +653,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 11);
     }
 
     #[test]
