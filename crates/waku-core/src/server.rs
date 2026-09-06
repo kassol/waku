@@ -1521,7 +1521,14 @@ fn handle_request_as(
                 || matches!(&request.command, Command::CreateSession { .. });
             let operation = if mutation
                 && scope.is_none()
-                && !matches!(&request.command, Command::CreateSession { .. })
+                && !matches!(
+                    &request.command,
+                    Command::CreateSession { .. }
+                        | Command::OpenTerminal { .. }
+                        | Command::WriteTerminal { .. }
+                        | Command::ResizeTerminal { .. }
+                        | Command::CloseTerminal
+                )
             {
                 // Runs on the session mailbox worker, outside hub/backend locks.
                 // A callback already submitting a turn must finish before user input.
