@@ -1,6 +1,6 @@
 # 管家协作与任务收尾澄清
 
-2026-09-06。用户已确认设计方向与验证边界；规格已发布为 [Issue #13](https://github.com/kassol/waku/issues/13)，仓库副本见[协作规格](waku-steward-orchestration-spec.md)。可独立验收的任务已发布，本轮不实现功能。已安装 App 与现有工作区保持不变。
+2026-09-06。本文保留实现前的设计澄清。规格为 [Issue #13](https://github.com/kassol/waku/issues/13)，仓库副本见[协作规格](waku-steward-orchestration-spec.md)。后续用户已授权实现 #14–#22；当前交付状态见[项目交接](waku-project-handoff.md)。
 
 ## 已确认方向
 
@@ -13,7 +13,7 @@
 - 用户明确要求改方向时，优先 steer 受影响任务，无关任务继续；无法及时接收且继续会造成冲突时暂停相关任务。
 - 即时交流仅读取任务记录并标出记录时间。讨论想法不改变执行；用户明确要求执行后，指令进入原任务，显示受理、送达、失败或待核实状态。
 
-## 当前实现依据
+## 设计时的实现依据（历史）
 
 - `crates/waku-core/src/steward.rs` 的后续输入入口拒绝开放轮次、忙碌状态及用户审批或回答等待。当前 `waku_prompt` 尚未接入 steer。
 - `crates/waku-core/src/driver/codex.rs` 已发送带 `expectedTurnId` 的 `turn/steer`；`driver/claude.rs` 已支持轮中输入，写入成功后报告受理。受理不等于模型采纳。
@@ -29,4 +29,4 @@
 - 用任务名与状态说明待整合、已整合和可清理资源。清理核查共享目录、运行中使用者及成果保留，不因会话结束直接删除目录。
 - 以可运行回归验证投递、等待与用户介入、整合和清理边界；减少重复查询与重复验收，保留独立评审。
 
-设计、规格与纵向任务拆分已完成；9 张任务 #14–#22 及依赖见[任务清单](waku-steward-orchestration-tickets.md)。实现与验收尚未完成。当前等待回调包的交付状态仍以 `waku-steward-wait.md` 为准。
+9 张任务 #14–#22 及依赖见[任务清单](waku-steward-orchestration-tickets.md)。可靠输入和即时交流的当前实现见[输入说明](waku-steward-input.md)，集中结果与反馈见[协作说明](waku-steward-coordination.md)。安装包状态以项目交接为准。

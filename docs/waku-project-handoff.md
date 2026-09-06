@@ -4,9 +4,9 @@
 
 ## 当前扩展与交付边界
 
-管家协作扩展已完成设计澄清和测试边界确认，规格发布为 [Issue #13](https://github.com/kassol/waku/issues/13)，见[协作规格](waku-steward-orchestration-spec.md)。范围包括可靠 steer/反馈排队、独立即时交流、动态分工与任务集成分支、安全清理。9 张纵向任务 #14–#22 已按确认的依赖发布，见[任务清单](waku-steward-orchestration-tickets.md)；尚未实现，不改变以下等待回调包的交付状态。
+管家协作扩展已按 [Issue #13](https://github.com/kassol/waku/issues/13) 的[协作规格](waku-steward-orchestration-spec.md)实现可靠 steer/反馈排队、独立即时交流、动态分工与任务集成分支、安全清理，并补充公共接口回归。9 张纵向任务 #14–#22 的完整验收尚未结束，均未关闭；见[任务清单](waku-steward-orchestration-tickets.md)和[本轮验收记录](waku-steward-orchestration-acceptance.md)。签名 Debug App 的后台 CUA 交互受阻，原生界面验收待完成；自动化通过项不替代该验收。
 
-用户已批准新增 `waku_wait`，详见[管家等待与完成通知](waku-steward-wait.md)。一期六工具验收仍为历史基线。当前扩展要求管家登记持久等待后结束当前轮；父轮成功结束且子轮次可处理时，由 daemon 的事件回调自动开启一次通知轮。用户新输入、已接受的 steer 或取消，以及父轮失败或中断，均撤销旧等待。
+用户已批准新增 `waku_wait`，详见[管家等待与完成通知](waku-steward-wait.md)。一期六工具验收仍为历史基线。管家登记持久等待后结束当前轮；父轮成功结束且子轮次可处理时，由 daemon 的事件回调自动开启一次通知轮。即时交流查询保留等待。经可靠输入提交的用户 steer 在受理或待核实时暂停旧等待回调，接收确认后撤销同轮旧等待，明确失败允许旧等待继续；新计划按需登记新等待。普通新轮输入、取消及父轮失败或中断继续遵循原有撤销边界。
 
 本轮禁止替换运行中的 `Waku Steward.app`，交付包待用户结束当前工作后安装。以下历史构建、安装与验收记录不代表本次扩展的交付状态。
 
@@ -128,7 +128,8 @@ Matt 流程产生仓库产物时，遵循用户的独立提交及默认 push 约
 
 ## 后续输入与取消实现边界
 
-- `waku_prompt` 仅接收直属 Claude/Codex 子会话的新轮次；忙碌或等待用户时拒绝。daemon 在同一状态锁内检查并保存输入及 turn_id，随后提交 provider；断连不自动重发，调用方查询当前轮次恢复判断。provider 拒绝提交后保留已保存输入并报告 Failed。
+- `waku_prompt` 向直属 Claude/Codex 子会话投递：空闲时开始保存后的新轮，忙碌且支持 steer 时发送当前轮输入，明确不支持时持久排队。等待用户或取消未确认时拒绝普通输入。`delivery_id` 绑定调用者、目标与原文，同键重试返回原记录，`waku_prompt_status` 查询实际状态；投递及查询重验关系与权限。
+- daemon 提交前保存受理记录；Codex 确认 provider 接收，Claude 确认传输接收。部分写入、断连、确认丢失或重启后的不确定输入不自动重发。持久队列按受理顺序消费，出队再次核对当前轮次、权限和用户等待；具体边界见[可靠输入说明](waku-steward-input.md)。这些扩展的实际检查和未完成项见[本轮验收记录](waku-steward-orchestration-acceptance.md)。
 - `waku_cancel` 返回独立的 accepted 与 stopped。取消受理保留开放轮次；provider 中断、结束或进程退出确认后才显示 Interrupted。取消按当前轮次记录，保留历史和工作区；Codex 忽略旧轮次的迟到结束通知。Claude 仍有后台任务时请求关闭原生运行时，保持开放轮次直到进程退出确认。
 - 桌面及共享 TypeScript 客户端沿用同一停止边界。真实 Claude 经 MCP 向 Astra 提交后续输入并精确返回标记；第二轮实际执行 sleep 60，取消先受理、18 秒时确认 Interrupted，状态/结果及保存历史一致，#9 已验收。自动回归使用临时数据库、Git 目录和可控子进程。
 

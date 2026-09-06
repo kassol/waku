@@ -16,7 +16,7 @@
 | T08 | [#21 动态分工与集中反馈交接](https://github.com/kassol/waku/issues/21) | [#15](https://github.com/kassol/waku/issues/15), [#19](https://github.com/kassol/waku/issues/19) |
 | T09 | [#22 管家协作完整流程与效率验收](https://github.com/kassol/waku/issues/22) | [#17](https://github.com/kassol/waku/issues/17), [#20](https://github.com/kassol/waku/issues/20), [#21](https://github.com/kassol/waku/issues/21) |
 
-初始可执行任务为 #14、#16、#18。实际同时修改共享源码时协调写入；产品内的 worktree 调度能力尚未实现。按阻塞任务完成后的可执行集合推进，无需将独立任务串成单链。
+初始可执行任务为 #14、#16、#18。实施采用隔离工作树协调共享源码修改；产品的受管理 worktree 能力在 #18–#20 中实现。按阻塞任务完成后的可执行集合推进。
 
 ## 规格覆盖
 
