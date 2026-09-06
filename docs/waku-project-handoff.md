@@ -8,6 +8,7 @@
 - 设计 v2：[设计 v2](waku-steward-design.md)。
 - 当前一期澄清：[澄清记录](waku-steward-scope.md)，包含逐项已确认决策、ADR 与当前源码证据。
 - 已发布规格：[GitHub Issue #1](https://github.com/kassol/waku/issues/1)；仓库副本见[一期规格](waku-steward-spec.md)。规格和测试边界已确认，尚未实施。
+- 任务拆分：[11 张纵向任务草案](waku-steward-tickets.md)，等待用户确认粒度和阻塞关系，尚未创建子任务。
 - 先读上述文件，再读取正式仓库及其父目录适用的 `AGENTS.md` / `CONTEXT.md`。迁移前已读取正式仓库根规范，并检查测试 App 隔离相关源码；期 1 源码复核仍待执行。
 
 ## 建仓时的核验记录（2026-09-06）
