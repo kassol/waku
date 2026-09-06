@@ -838,6 +838,14 @@ fn with_creation_daemon_seed<T>(
     seed: impl FnOnce(&Path, &Path) -> T,
     test: impl FnOnce(DaemonClient, DaemonClient, &Path, &Path, std::net::SocketAddr, T),
 ) {
+    with_creation_daemon_seed_backend(seed, |backend| backend, test);
+}
+
+fn with_creation_daemon_seed_backend<T>(
+    seed: impl FnOnce(&Path, &Path) -> T,
+    wrap: impl FnOnce(Arc<WakuBackend>) -> Arc<dyn Backend>,
+    test: impl FnOnce(DaemonClient, DaemonClient, &Path, &Path, std::net::SocketAddr, T),
+) {
     let root = std::env::temp_dir().join(format!("waku-create-{}", Uuid::new_v4()));
     let project_path = root.join("project");
     std::fs::create_dir_all(&project_path).unwrap();
@@ -882,7 +890,7 @@ fn with_creation_daemon_seed<T>(
     let address = listener.local_addr().unwrap();
     let stopping = Arc::new(AtomicBool::new(false));
     let stop = stopping.clone();
-    let service = backend.clone();
+    let service = wrap(backend.clone());
     let server = std::thread::spawn(move || {
         serve(
             listener,

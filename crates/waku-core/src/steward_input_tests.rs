@@ -1180,3 +1180,74 @@ fn consultation_execution_waits_for_an_inflight_callback_before_steering_it() {
     drop(server);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+// Advertise an explicitly unsupported capability at the provider boundary.
+// Tracked input, cancellation and process lifetime still use the real fixture process.
+struct UnsteerableParent(DriverHandle);
+impl crate::driver::DriverControl for UnsteerableParent {
+    fn prompt(&self, prompt: String) {
+        self.0.prompt(prompt);
+    }
+    fn supports_steer(&self) -> bool {
+        false
+    }
+    fn deliver_input(&self, prompt: String, id: Uuid, steer: bool) -> anyhow::Result<()> {
+        assert!(!steer, "unsupported parent must receive a queued new turn");
+        self.0.deliver_input(prompt, id, steer)
+    }
+    fn cancel(&self) {
+        self.0.cancel();
+    }
+    fn respond(&self, id: String, option: String) {
+        self.0.respond(id, option);
+    }
+    fn rollback(&self, turns: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
+        self.0.rollback(turns)
+    }
+}
+struct CoordinationBackend(Arc<WakuBackend>);
+impl Backend for CoordinationBackend {
+    fn prepare_start(
+        &self,
+        id: Uuid,
+        options: &crate::WireDriverStartOptions,
+    ) -> anyhow::Result<()> {
+        self.0.prepare_start(id, options)
+    }
+    fn stop_failed_work(&self) {
+        self.0.stop_failed_work();
+    }
+    fn authorize_steward(&self, id: Uuid, project: Uuid) -> anyhow::Result<()> {
+        self.0.authorize_steward(id, project)
+    }
+    fn authorize_cached_creation(&self, child: &AgentSession) -> anyhow::Result<()> {
+        self.0.authorize_cached_creation(child)
+    }
+    fn shutdown(&self) {
+        self.0.shutdown();
+    }
+    fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
+        let parent =
+            matches!(&request.command, Command::Start {options} if options.provider == "claude")
+                .then_some(request.session_id);
+        let response = self.0.handle(request, events)?;
+        if let Some(parent) = parent {
+            let mut sessions = self.0.sessions.lock();
+            let (_, driver) = sessions.get_mut(&parent).expect("started parent fixture");
+            *driver = DriverHandle::from_control(Arc::new(UnsteerableParent(driver.clone())));
+        }
+        Ok(response)
+    }
+    fn persist_events(&self, events: &[crate::SequencedEvent]) -> anyhow::Result<bool> {
+        self.0.persist_events(events)
+    }
+    fn resume_stewards(&self, events: EventSink) {
+        self.0.resume_stewards(events);
+    }
+}
+
+impl WakuBackend {
+    pub(crate) fn fixture_with_unsteerable_parent(self: Arc<Self>) -> Arc<dyn Backend> {
+        Arc::new(CoordinationBackend(self))
+    }
+}

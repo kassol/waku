@@ -38,6 +38,14 @@ if is_parent:
                 initial_input.set()
                 root.joinpath('parent-prompt-received').touch()
                 continue
+            if 'Waku explicit user instruction from independent discussion' in json.dumps(value):
+                with root.joinpath('direction-prompts.jsonl').open('a') as output:
+                    output.write(json.dumps(value) + '\n')
+                def finish_direction():
+                    wait_file('finish-direction')
+                    send({'type': 'result', 'is_error': False, 'stop_reason': 'end_turn'})
+                threading.Thread(target=finish_direction, daemon=True).start()
+                continue
             with root.joinpath('callback-prompts.jsonl').open('a') as output:
                 output.write(json.dumps(value) + '\n')
             send({'type': 'result', 'is_error': False, 'stop_reason': 'end_turn'})

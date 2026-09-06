@@ -48,6 +48,19 @@ def finish(turn, result):
     send({'method': 'item/agentMessage/delta', 'params': {'threadId': key, 'turnId': turn, 'itemId': turn, 'delta': result}})
     send({'method': 'turn/completed', 'params': {'threadId': key, 'turn': {'id': turn, 'status': 'completed'}}})
 
+if '--safe-mode' in sys.argv:
+    assert '--strict-mcp-config' in sys.argv and '--no-session-persistence' in sys.argv
+    assert sys.argv[sys.argv.index('--tools') + 1] == ''
+    assert json.loads(sys.argv[sys.argv.index('--mcp-config') + 1]) == {'mcpServers': {}}
+    context = json.loads(sys.argv[-1])
+    assert context['records'][0]['summary']['session_id'] == context['source_session_id']
+    assert len(context['records']) >= 3
+    with root.joinpath('consultation-calls.jsonl').open('a') as output:
+        output.write(json.dumps({'source': context['source_session_id'], 'question': context['question']}) + '\n')
+    send({'type': 'system', 'subtype': 'init', 'tools': [], 'mcp_servers': []})
+    send({'type': 'result', 'subtype': 'success', 'result': 'Discussed only; no task direction has been changed.'})
+    sys.exit(0)
+
 if '--version' in sys.argv:
     print('codex-cli 0.0.0')
     sys.exit(0)
@@ -85,8 +98,9 @@ for line in sys.stdin:
         else:
             # Dependent work consumes the exact accepted integration baseline.
             assert git('rev-parse', 'HEAD') == assignment['baseline']
-            result = {'commit': commit('dependent.txt', 'dependent result'), 'owner': role}
-            check(result['commit'], 'dependent.txt', 'dependent result')
+            expected = assignment.get('expected', 'dependent result')
+            result = {'commit': commit('dependent.txt', expected), 'owner': role}
+            check(result['commit'], 'dependent.txt', expected)
         root.joinpath(key + '.ready').write_text(json.dumps(result))
         threading.Thread(target=finish, args=(turn, result), daemon=True).start()
     elif method == 'turn/steer':
