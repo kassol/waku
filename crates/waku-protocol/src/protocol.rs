@@ -19,7 +19,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -170,6 +170,9 @@ pub enum Command {
         dirs: Vec<PathBuf>,
     },
     LoadTaskState,
+    ReplayEvents {
+        cursor: ReplayCursor,
+    },
     SaveTaskState {
         projects: Vec<Project>,
         live_session_ids: Vec<Uuid>,
@@ -347,6 +350,14 @@ pub enum ServerMessage {
         outcome: ResponseOutcome,
     },
     Event(SequencedEvent),
+    /// A reliable storage commit (or its failure), separate from receipt.
+    HistoryPersistence {
+        session_id: Uuid,
+        runtime_id: Uuid,
+        epoch: Uuid,
+        sequence: u64,
+        error: Option<String>,
+    },
     /// The daemon-owned project/task catalog changed through another client.
     /// Clients should invalidate their lightweight task-state snapshot; live
     /// runtime events continue through [`Self::Event`].
@@ -412,6 +423,9 @@ pub enum ResponsePayload {
         sessions: Vec<AgentSession>,
         default_cwd: PathBuf,
         projectless_root: Option<PathBuf>,
+    },
+    EventReplay {
+        events: Vec<SequencedEvent>,
     },
     TaskStateSaved {
         sessions: Vec<AgentSession>,
@@ -530,7 +544,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 8);
     }
 
     #[test]
@@ -539,7 +553,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 8);
     }
 
     #[test]

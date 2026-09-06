@@ -18,6 +18,7 @@ use gpui::{
     prelude::*, pulsating_between, px, rgb,
 };
 use uuid::Uuid;
+use waku_protocol::history::StreamPhase;
 
 use crate::checkpoint;
 use crate::composer_complete::{FileEntry, SlashCommand};
@@ -177,13 +178,6 @@ const LIVE_REASONING_WINDOW_TARGET: usize = 6 * 1024;
 /// a slide costs a full window rebuild, and sliding every commit would pay
 /// it at commit rate.
 const LIVE_REASONING_WINDOW_MAX: usize = 18 * 1024;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StreamPhase {
-    Text,
-    Reasoning,
-    Activity,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StreamDeltaKind {
@@ -560,6 +554,7 @@ struct DriverStartRequest {
     options: DriverStartOptions,
     event_wake: smol::channel::Sender<()>,
     daemon: waku_client::DaemonSupervisor,
+    save_state: Box<dyn FnOnce() -> std::io::Result<()> + Send>,
 }
 
 /// A provider process that has started off-thread but is not installed into
@@ -646,7 +641,7 @@ impl EscapeStopConfirmation {
 enum EventPumpSchedule {
     Idle,
     StreamFrame,
-    BackgroundOutput(Duration),
+    WakeAfter(Duration),
 }
 
 /// One cached island of the root view: a region rendered by delegating back
@@ -1294,6 +1289,11 @@ pub struct Waku {
     /// re-inserted it.
     pending_queue_drains: Vec<Uuid>,
     stream_state_dirty: bool,
+    state_save_executor: gpui::BackgroundExecutor,
+    state_save_pending: bool,
+    state_save_requested: bool,
+    state_save_tx: Sender<std::io::Result<waku_client::persistence::SaveReceipt>>,
+    state_save_events: Receiver<std::io::Result<waku_client::persistence::SaveReceipt>>,
     last_stream_save: Instant,
     /// User expansion overrides keyed by persisted transcript block index.
     activities_expanded: HashMap<usize, bool>,
@@ -2183,6 +2183,7 @@ impl Waku {
             })
             .collect::<Vec<_>>();
         let (provider_probe_tx, provider_probe_events) = unbounded();
+        let (state_save_tx, state_save_events) = unbounded();
         let (provider_version_tx, provider_version_events) = unbounded();
         let (provider_detection_tx, provider_detection_events) = unbounded();
         let (computer_permission_tx, computer_permission_events) = unbounded();
@@ -2478,9 +2479,12 @@ impl Waku {
 
             // Window-frame changes are only mirrored in memory; the quit save
             // is what lands the final position and size on disk.
-            cx.on_app_quit(|this, _| {
-                this.save();
-                async {}
+            cx.on_app_quit(|this, cx| {
+                let save = this.store.prepare_save(&this.state);
+                let pending = cx.background_executor().spawn(async move { save() });
+                async move {
+                    let _ = pending.await;
+                }
             })
             .detach();
 
@@ -2633,10 +2637,10 @@ impl Waku {
                                 // next drain's single batch.
                                 cx.background_executor().timer(STREAM_FRAME_INTERVAL).await;
                             }
-                            EventPumpSchedule::BackgroundOutput(delay) => {
-                                // A log cache has its own 100 ms batching
-                                // cadence. A new provider edge interrupts that
-                                // wait; it must not wait behind log rendering.
+                            EventPumpSchedule::WakeAfter(delay) => {
+                                // Log refreshes and a final stream save retain
+                                // their deadlines even after output stops. New
+                                // provider events can interrupt this wait.
                                 futures_lite::future::race(
                                     async {
                                         let _ = event_wake_events.recv().await;
@@ -2847,6 +2851,11 @@ impl Waku {
                 response_fork_preparations: HashMap::new(),
                 pending_queue_drains: Vec::new(),
                 stream_state_dirty: false,
+                state_save_executor: cx.background_executor().clone(),
+                state_save_pending: false,
+                state_save_requested: false,
+                state_save_tx,
+                state_save_events,
                 last_stream_save: Instant::now(),
                 activities_expanded: HashMap::new(),
                 expanded_activity_items: HashMap::new(),

@@ -2,6 +2,7 @@
 import type { AgentTurn } from "./AgentTurn";
 import type { ContextUsage } from "./ContextUsage";
 import type { Message } from "./Message";
+import type { PendingPermission } from "./PendingPermission";
 import type { ProviderKind } from "./ProviderKind";
 import type { ProviderResumeCursor } from "./ProviderResumeCursor";
 import type { QueuedMessage } from "./QueuedMessage";
@@ -12,6 +13,7 @@ import type { SessionStatus } from "./SessionStatus";
 import type { SessionWorkspace } from "./SessionWorkspace";
 import type { ThreadGoal } from "./ThreadGoal";
 import type { TranscriptBlock } from "./TranscriptBlock";
+import type { UserInputRequest } from "./UserInputRequest";
 
 export type AgentSession = { id: string,
 /**
@@ -64,7 +66,7 @@ thread_goal?: ThreadGoal | null,
  * Context-window occupancy from the live stream, kept so a resumed
  * session's meter starts where the conversation left off.
  */
-context_usage?: ContextUsage | null, runtime_event_cursor?: RuntimeEventCursor | null,
+context_usage?: ContextUsage | null, runtime_event_cursor?: RuntimeEventCursor | null, history_saved_cursor?: RuntimeEventCursor | null, history_save_error?: string | null, pending_permission?: PendingPermission | null, pending_user_input?: UserInputRequest | null,
 /**
  * Read-only compatibility field for v1 state files. New saves omit it.
  */

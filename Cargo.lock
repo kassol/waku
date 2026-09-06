@@ -8350,6 +8350,7 @@ dependencies = [
  "smol",
  "tar",
  "tokio",
+ "tungstenite",
  "unicode-segmentation",
  "url",
  "uuid",

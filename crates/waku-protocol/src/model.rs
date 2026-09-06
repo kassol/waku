@@ -966,6 +966,14 @@ pub struct AgentSession {
     pub context_usage: Option<ContextUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_event_cursor: Option<RuntimeEventCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_saved_cursor: Option<RuntimeEventCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_save_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_permission: Option<PendingPermission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_user_input: Option<UserInputRequest>,
     /// Read-only compatibility field for v1 state files. New saves omit it.
     #[serde(default, skip_serializing)]
     pub provider_session_id: Option<String>,
@@ -1023,6 +1031,10 @@ impl AgentSession {
             thread_goal: None,
             context_usage: None,
             runtime_event_cursor: None,
+            history_saved_cursor: None,
+            history_save_error: None,
+            pending_permission: None,
+            pending_user_input: None,
             provider_session_id: None,
             messages: Vec::new(),
             transcript_blocks: Vec::new(),
@@ -1059,6 +1071,10 @@ impl AgentSession {
             thread_goal: None,
             context_usage: None,
             runtime_event_cursor: None,
+            history_saved_cursor: None,
+            history_save_error: None,
+            pending_permission: None,
+            pending_user_input: None,
             provider_session_id: None,
             messages: Vec::new(),
             transcript_blocks: Vec::new(),
@@ -1499,6 +1515,8 @@ impl AgentSession {
     }
 
     pub fn truncate_after_turn(&mut self, turn_count: usize) {
+        self.pending_permission = None;
+        self.pending_user_input = None;
         let retained = self
             .turns
             .iter()
@@ -1800,6 +1818,10 @@ pub enum DriverEvent {
     /// sequence has been incorporated into the local session projection.
     /// Providers never emit this and the daemon never serializes it.
     RuntimeEventCursorAdvanced(RuntimeEventCursor),
+    HistoryPersistence {
+        cursor: RuntimeEventCursor,
+        error: Option<String>,
+    },
     Connected {
         provider_cursor: Option<ProviderResumeCursor>,
     },
@@ -1824,6 +1846,11 @@ pub enum DriverEvent {
         message: String,
         turn_id: Uuid,
         message_id: Uuid,
+    },
+    /// Mirrors the existing immediate user-stop history policy.
+    CancelRequested,
+    InteractionResponded {
+        request_id: String,
     },
     TurnStarted,
     /// The provider's turn ended while detached work it will wake the
@@ -3401,12 +3428,20 @@ impl<'de> Deserialize<'de> for TranscriptBlock {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingPermission {
     pub request_id: String,
     pub title: String,
     pub detail: String,
     pub options: Vec<PermissionOption>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputRequest {
+    pub request_id: String,
+    pub questions: Vec<UserInputQuestion>,
 }
 
 pub fn unix_time() -> u64 {

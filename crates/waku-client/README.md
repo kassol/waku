@@ -7,3 +7,9 @@ preview caches. It depends on `waku-protocol`, never on `waku-core`.
 
 Both bare socket addresses and complete `ws://` or `wss://` URLs are accepted.
 Dropping a connection to an externally managed daemon does not stop it.
+
+`subscribe_after` starts live delivery before filling any missing persisted
+prefix on a background thread. Replay and live events share cursor deduplication.
+Unsubscribed buffers prune only acknowledged events beyond the 4096-entry hot
+window; opening a session recovers that prefix through paged `ReplayEvents`.
+Storage acknowledgments remain separate from event receipt.

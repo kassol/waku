@@ -1,8 +1,8 @@
 # waku-protocol
 
 `waku-protocol` is Waku's versioned, transport-neutral contract. It contains
-the Serde wire messages and shared data models, but no database, provider,
-filesystem, Git, attachment, or socket implementation.
+the Serde wire messages, shared data models, and pure history projection, but
+no database, provider, filesystem, Git, attachment, or socket implementation.
 
 Generate the checked-in TypeScript contract with:
 

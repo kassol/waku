@@ -153,7 +153,7 @@ describe("WakuClient", () => {
     await firstConnection;
 
     const received: number[] = [];
-    client.subscribe("session", "runtime", (event) => received.push(event.sequence));
+    client.subscribe("session", "runtime", (event) => received.push(event.sequence), { epoch: "epoch-one", sequence: 3 });
     const event = {
       type: "event",
       sessionId: "session",
@@ -175,6 +175,56 @@ describe("WakuClient", () => {
     ]);
     second.receive({ type: "hello", protocolVersion: PROTOCOL_VERSION, daemonVersion: "test" });
     await secondConnection;
+  });
+
+  test("reconnect finishes an interrupted replay without new provider events", async () => {
+    const { client, sockets } = fixture();
+    const socket = await connect(client, sockets);
+    const received: number[] = [];
+    client.subscribe("session", "runtime", (event) => received.push(event.sequence));
+    const wire = (sequence: number) => ({ sessionId: "session", runtimeId: "runtime", epoch: "epoch", sequence, event: { kind: "textDelta", payload: "x" } });
+    socket.receive({ type: "event", ...wire(5) });
+    expect(received).toEqual([]);
+    expect(JSON.parse(socket.sent.at(-1)!).command.type).toBe("replayEvents");
+    client.disconnect();
+    await Promise.resolve();
+    const replacement = await connect(client, sockets);
+    const request = JSON.parse(replacement.sent.at(-1)!);
+    expect(request.command).toEqual({ type: "replayEvents", cursor: { sessionId: "session", runtimeId: "runtime", epoch: "epoch", sequence: 0 } });
+    replacement.receive({ type: "response", requestId: request.requestId, outcome: { status: "ok", payload: { type: "eventReplay", events: [1, 2, 3, 4].map(wire) } } });
+    await Promise.resolve();
+    expect(received).toEqual([1, 2, 3, 4, 5]);
+    replacement.receive({ type: "event", ...wire(5) });
+    replacement.receive({ type: "event", ...wire(6) });
+    expect(received).toEqual([1, 2, 3, 4, 5, 6]);
+    client.disconnect();
+  });
+
+  test("saved hot-window pruning restores the complete stream on subscription", async () => {
+    const { client, sockets } = fixture();
+    const socket = await connect(client, sockets);
+    const wire = (sequence: number) => ({ sessionId: "session", runtimeId: "runtime", epoch: "epoch", sequence, event: { kind: "textDelta", payload: "x" } });
+    for (let sequence = 1; sequence <= 5_000; sequence++) {
+      socket.receive({ type: "event", ...wire(sequence) });
+      if (sequence % 100 === 0) socket.receive({ type: "historyPersistence", sessionId: "session", runtimeId: "runtime", epoch: "epoch", sequence, error: null });
+    }
+    const received: number[] = [];
+    client.subscribe("session", "runtime", (event) => { if (event.event.kind !== "historyPersistence") received.push(event.sequence); });
+    const answered = new Set<string>();
+    for (let pass = 0; pass < 20 && received.length < 5_000; pass++) {
+      const request = JSON.parse(socket.sent.at(-1)!);
+      if (request.command?.type === "replayEvents" && !answered.has(request.requestId)) {
+        answered.add(request.requestId);
+        const after = request.command.cursor.sequence;
+        socket.receive({ type: "response", requestId: request.requestId, outcome: { status: "ok", payload: { type: "eventReplay", events: Array.from({ length: Math.min(512, 5_000 - after) }, (_, index) => wire(after + index + 1)) } } });
+      }
+      await Promise.resolve();
+    }
+    expect(received.length).toBe(5_000);
+    expect(received[0]).toBe(1);
+    expect(received.at(-1)).toBe(5_000);
+    expect(new Set(received).size).toBe(5_000);
+    client.disconnect();
   });
 
   test("disconnect rejects an in-flight handshake and permits reconnecting", async () => {
@@ -205,7 +255,7 @@ describe("WakuClient", () => {
     const received: Array<[string, number]> = [];
     client.subscribe("session", "runtime", (event) => {
       received.push([event.epoch, event.sequence]);
-    });
+    }, { epoch: "old", sequence: 8 });
 
     socket.receive({
       type: "event",

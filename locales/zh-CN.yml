@@ -1049,3 +1049,7 @@ usage_error.curl_did_not_finish: curl 未能完成请求
 usage_error.curl_failed: "curl 失败：%{error}"
 usage_error.unknown_error: 未知错误
 usage_error.curl_no_status: curl 未返回 HTTP 状态行
+
+session.history_saved: 历史已保存
+session.history_pending: 正在保存历史…
+session.history_save_failed: '历史尚未保存：%{error}'

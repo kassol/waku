@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { reduceRuntimeEvent } from './event-reducer'
+import { reduceRuntimeEvent, reduceRuntimeEventAfterPersistence } from './event-reducer'
 import type { AgentSession, SequencedEvent } from './generated'
 
 const clock = {
@@ -203,3 +203,100 @@ function runningSession(): AgentSession {
     ],
   }
 }
+
+test('durable acknowledgments preserve pending and failed boundaries across stale replies', () => {
+  const cursor = { runtime_id: 'runtime', epoch: 'epoch', sequence: 10 }
+  let session: AgentSession = { ...runningSession(), runtime_event_cursor: cursor, history_save_error: 'disk full' }
+  const acknowledge = (sequence: number, error: string | null, runtimeId = 'runtime') => {
+    session = reduceRuntimeEvent(session, {
+      sessionId: 'session', runtimeId, epoch: 'epoch', sequence,
+      event: { kind: 'historyPersistence', payload: { error } },
+    }).session
+  }
+  acknowledge(8, null)
+  expect(session.history_save_error).toBe('disk full')
+  expect(session.runtime_event_cursor?.sequence).toBe(10)
+  acknowledge(10, null)
+  expect(session.history_save_error).toBeUndefined()
+  acknowledge(9, 'old failure')
+  acknowledge(11, 'other runtime', 'stale-runtime')
+  expect(session.history_save_error).toBeUndefined()
+  expect(session.history_saved_cursor?.sequence).toBe(10)
+})
+
+
+test('cancel and interaction responses preserve authoritative user actions', () => {
+  const waiting = { ...runningSession(), status: 'waiting' as const }
+  const responded = apply(waiting, 'interactionResponded', { request_id: 'approval' })
+  expect(responded.status).toBe('working')
+  const cancelled = apply(responded, 'cancelRequested', null)
+  expect(cancelled.status).toBe('idle')
+  expect(cancelled.turns.at(-1)?.status).toBe('interrupted')
+  const exited = apply(apply(cancelled, 'turnFinished', { success: false }), 'processExited', null)
+  expect(exited.status).toBe('idle')
+  expect(exited.turns.at(-1)?.status).toBe('interrupted')
+})
+
+
+test('terminal subscriptions wait for the matching save outcome before removal', () => {
+  const state = { pendingExit: null }
+  let session = runningSession()
+  const exit = { ...event('processExited', null), sequence: 8 }
+  expect(reduceRuntimeEventAfterPersistence(session, exit, state, clock)).toBeNull()
+  const stale = reduceRuntimeEventAfterPersistence(session, {
+    ...event('historyPersistence', { error: null }), sequence: 7,
+  }, state, clock)!
+  expect(stale.removeRuntime).toBe(false)
+  session = stale.session
+  const saved = reduceRuntimeEventAfterPersistence(session, {
+    ...event('historyPersistence', { error: null }), sequence: 8,
+  }, state, clock)!
+  expect(saved.removeRuntime).toBe(true)
+  expect(saved.session.runtime_event_cursor?.sequence).toBe(8)
+  expect(saved.session.history_saved_cursor?.sequence).toBe(8)
+  expect(saved.session.turns.at(-1)?.status).toBe('failed')
+})
+
+
+test('a terminal save failure survives removal and ignores another runtime acknowledgment', () => {
+  const state = { pendingExit: null }
+  const session = { ...runningSession(), runtime_event_cursor: { runtime_id: 'runtime', epoch: 'epoch', sequence: 7 } }
+  expect(reduceRuntimeEventAfterPersistence(session, { ...event('processExited', null), sequence: 8 }, state, clock)).toBeNull()
+  const unrelated = reduceRuntimeEventAfterPersistence(session, {
+    ...event('historyPersistence', { error: null }), runtimeId: 'previous-runtime', sequence: 9,
+  }, state, clock)!
+  expect(unrelated.removeRuntime).toBe(false)
+  const failed = reduceRuntimeEventAfterPersistence(unrelated.session, {
+    ...event('historyPersistence', { error: 'disk full' }), sequence: 8,
+  }, state, clock)!
+  expect(failed.removeRuntime).toBe(true)
+  expect(failed.session.history_save_error).toBe('disk full')
+  expect(failed.session.history_saved_cursor).toBeUndefined()
+})
+
+test('an exit already covered by hydrated history does not wait for another acknowledgment', () => {
+  const session = { ...runningSession(), history_saved_cursor: { runtime_id: 'runtime', epoch: 'epoch', sequence: 8 } }
+  const result = reduceRuntimeEventAfterPersistence(session, {
+    ...event('processExited', null), sequence: 8,
+  }, { pendingExit: null }, clock)!
+  expect(result.removeRuntime).toBe(true)
+  expect(result.session.history_saved_cursor?.sequence).toBe(8)
+})
+
+
+test('hydrated pending interactions survive cursor-based attachment and matching replies', () => {
+  const waiting = apply(runningSession(), 'permission', {
+    requestId: 'approval', title: 'Run checks', detail: 'cargo test', options: [],
+  })
+  expect(waiting.pending_permission?.requestId).toBe('approval')
+  const restored = JSON.parse(JSON.stringify(waiting)) as AgentSession
+  const stale = apply(restored, 'interactionResponded', { request_id: 'old' })
+  expect(stale.pending_permission?.requestId).toBe('approval')
+  const responded = apply(stale, 'interactionResponded', { request_id: 'approval' })
+  expect(responded.pending_permission).toBeUndefined()
+  const asked = apply(responded, 'userInputRequested', {
+    requestId: 'question', questions: [{ id: 'q', header: 'Scope', question: 'Which files?', options: [], multiSelect: false }],
+  })
+  expect(asked.pending_user_input?.requestId).toBe('question')
+  expect(apply(asked, 'turnFinished', { success: true }).pending_user_input).toBeUndefined()
+})

@@ -75,6 +75,17 @@ describe('mobile runtime projection', () => {
     expect(runtimeEventAlreadyApplied(current, event)).toBe(true);
   });
 
+  test('applies a save acknowledgment sharing the last runtime sequence', () => {
+    const current = session({
+      runtime_event_cursor: { runtime_id: 'runtime', epoch: 'epoch', sequence: 4 },
+    });
+    const acknowledgment = {
+      sessionId: current.id, runtimeId: 'runtime', epoch: 'epoch', sequence: 4,
+      event: { kind: 'historyPersistence', payload: { error: 'disk full' } },
+    } satisfies SequencedEvent;
+    expect(shouldApplyRuntimeEvent(current, acknowledgment)).toBe(true);
+  });
+
   test('replays a pending control request after an app restart', () => {
     const current = session({
       status: 'waiting',

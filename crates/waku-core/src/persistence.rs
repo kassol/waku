@@ -956,7 +956,7 @@ impl StateStore {
         // WAL keeps a streaming save from blocking on readers, and NORMAL
         // sync is the right durability trade for per-second UI state.
         connection
-            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")
             .map_err(to_io_error)?;
         apply_migrations(&connection)?;
         Ok(connection)
@@ -1218,6 +1218,10 @@ impl StateStore {
         session.context_window = stored.context_window;
         session.context_usage = stored.context_usage;
         session.runtime_event_cursor = stored.runtime_event_cursor;
+        session.history_saved_cursor = stored.history_saved_cursor;
+        session.history_save_error = stored.history_save_error;
+        session.pending_permission = stored.pending_permission;
+        session.pending_user_input = stored.pending_user_input;
 
         let mut statement = connection
             .prepare(
@@ -1251,6 +1255,40 @@ impl StateStore {
     /// Persists whatever the app marked as changed, so a streaming turn writes
     /// one session row and a selection change writes no rows at all.
     pub fn save(&self, state: &mut PersistedState) -> io::Result<()> {
+        self.save_events(state, &[])
+    }
+
+    /// History and its event cursor are one transaction: an acknowledgment
+    /// cannot outlive the history it identifies.
+    pub fn save_events(
+        &self,
+        state: &mut PersistedState,
+        events: &[crate::SequencedEvent],
+    ) -> io::Result<()> {
+        // A failed projection stays in memory for retry with its raw events.
+        // An unrelated metadata save must never commit that projection alone.
+        let pending_sessions = state
+            .sessions
+            .iter()
+            .filter(|session| {
+                state.dirty_sessions.contains(&session.id)
+                    && session.history_save_error.is_some()
+                    && session.runtime_event_cursor.is_some_and(|cursor| {
+                        !events.iter().any(|event| {
+                            event.session_id == session.id
+                                && event.runtime_id == cursor.runtime_id
+                                && event.epoch == cursor.epoch
+                                && event.sequence == cursor.sequence
+                        })
+                    })
+            })
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
+        if events.is_empty() && !pending_sessions.is_empty() {
+            return Err(io::Error::other(
+                "history requires its pending events before saving",
+            ));
+        }
         // Only changed sessions can hold a new inline payload, so the blob walk
         // follows the same set rather than every transcript on every save.
         let dirty = state.dirty_sessions.clone();
@@ -1318,7 +1356,6 @@ impl StateStore {
                     )
                     .map_err(to_io_error)?;
             }
-            storage.saved_projects = projects_fingerprint;
         }
 
         // Only sessions the app reported as changed are written. A draft that
@@ -1334,6 +1371,9 @@ impl StateStore {
             .filter(|session| session.has_started())
         {
             live.insert(session.id);
+            if pending_sessions.contains(&session.id) {
+                continue;
+            }
             // A skeleton's empty transcript means "not fetched", not "empty".
             // Its promoted list columns may still have changed (for example,
             // an inactive sidebar row was renamed), so update only those and
@@ -1346,7 +1386,6 @@ impl StateStore {
                             rusqlite::params_from_iter(session_params(session)),
                         )
                         .map_err(to_io_error)?;
-                    storage.persisted_sessions.insert(session.id);
                 }
                 continue;
             }
@@ -1373,7 +1412,6 @@ impl StateStore {
                     storage.written_messages.get(&session.id).unwrap_or(&EMPTY),
                 )?,
             ));
-            storage.persisted_sessions.insert(session.id);
         }
 
         let removed = storage
@@ -1382,7 +1420,7 @@ impl StateStore {
             .copied()
             .filter(|id| !live.contains(id))
             .collect::<Vec<_>>();
-        for id in removed {
+        for id in &removed {
             let key = id.to_string();
             transaction
                 .execute("DELETE FROM sessions WHERE id = ?1", params![key])
@@ -1396,17 +1434,82 @@ impl StateStore {
             transaction
                 .execute("DELETE FROM messages WHERE session_id = ?1", params![key])
                 .map_err(to_io_error)?;
-            storage.persisted_sessions.remove(&id);
-            storage.written_messages.remove(&id);
+            transaction
+                .execute(
+                    "DELETE FROM session_events WHERE session_id = ?1",
+                    params![key],
+                )
+                .map_err(to_io_error)?;
         }
 
+        for event in events {
+            transaction.execute(
+                "INSERT INTO session_events(session_id, runtime_id, epoch, sequence, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![event.session_id.to_string(), event.runtime_id.to_string(), event.epoch.to_string(), event.sequence as i64, serde_json::to_string(event).map_err(to_io_error)?],
+            ).map_err(to_io_error)?;
+        }
         transaction.commit().map_err(to_io_error)?;
+        storage.saved_projects = projects_fingerprint;
+        storage.persisted_sessions = live;
+        for id in removed {
+            storage.written_messages.remove(&id);
+        }
         // Now that the rows are durable, and not before.
         for (session_id, fingerprints) in written_messages {
             storage.written_messages.insert(session_id, fingerprints);
         }
-        state.dirty_sessions.clear();
+        state.dirty_sessions = pending_sessions;
         Ok(())
+    }
+
+    pub fn replay_events(
+        &self,
+        session_id: Uuid,
+        runtime_id: Uuid,
+        epoch: Uuid,
+        after: u64,
+    ) -> io::Result<Vec<crate::SequencedEvent>> {
+        let after = i64::try_from(after).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "history cursor exceeds the supported range",
+            )
+        })?;
+        let connection = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(to_io_error)?;
+        let mut query = connection.prepare("SELECT data FROM session_events WHERE session_id = ?1 AND runtime_id = ?2 AND epoch = ?3 AND sequence > ?4 ORDER BY sequence LIMIT 512").map_err(to_io_error)?;
+        let rows = query
+            .query_map(
+                params![
+                    session_id.to_string(),
+                    runtime_id.to_string(),
+                    epoch.to_string(),
+                    after
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(to_io_error)?;
+        let mut page = Vec::new();
+        let mut bytes = 0;
+        for row in rows {
+            let data = row.map_err(to_io_error)?;
+            if data.len() > crate::protocol::MAX_WIRE_MESSAGE_BYTES - 1024 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "history event exceeds the transport limit",
+                ));
+            }
+            if !page.is_empty() && bytes + data.len() > crate::protocol::MAX_WIRE_MESSAGE_BYTES / 2
+            {
+                break;
+            }
+            bytes += data.len();
+            page.push(serde_json::from_str(&data).map_err(to_io_error)?);
+        }
+        Ok(page)
     }
 
     /// Builds a blob sweep.
@@ -1509,6 +1612,10 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         thread_goal: None,
         context_usage: None,
         runtime_event_cursor: None,
+        pending_permission: None,
+        pending_user_input: None,
+        history_saved_cursor: None,
+        history_save_error: None,
         provider_session_id: None,
         messages: Vec::new(),
         transcript_blocks: Vec::new(),
@@ -2164,6 +2271,168 @@ mod tests {
         );
 
         fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn pending_history_interactions_survive_database_reopen() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(directory.join("workspace"));
+        let session_id = state.sessions[0].id;
+        let runtime_id = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let wire = vec![
+            crate::WireDriverEvent::new("turnStarted", serde_json::Value::Null),
+            crate::WireDriverEvent::new(
+                "permission",
+                serde_json::json!({
+                    "requestId": "approval", "title": "Run checks", "detail": "cargo test", "options": []
+                }),
+            ),
+            crate::WireDriverEvent::new(
+                "userInputRequested",
+                serde_json::json!({
+                    "requestId": "question", "questions": [{ "id": "q", "header": "Scope", "question": "Which files?", "options": [], "multiSelect": false }]
+                }),
+            ),
+        ];
+        let mut reducer = waku_protocol::history::HistoryReducer::default();
+        let events = wire
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| {
+                reducer.apply(
+                    &mut state.sessions[0],
+                    waku_protocol::event_from_wire(event.clone()).unwrap(),
+                );
+                crate::SequencedEvent {
+                    session_id,
+                    runtime_id,
+                    epoch,
+                    sequence: index as u64 + 1,
+                    event,
+                }
+            })
+            .collect::<Vec<_>>();
+        let cursor = crate::model::RuntimeEventCursor {
+            runtime_id,
+            epoch,
+            sequence: 3,
+        };
+        state.sessions[0].runtime_event_cursor = Some(cursor);
+        state.sessions[0].history_saved_cursor = Some(cursor);
+        state.mark_session_dirty(session_id);
+        store.save_events(&mut state, &events).unwrap();
+        let reopened = StateStore::daemon(store.path().to_owned());
+        let restored = load_hydrated(&reopened);
+        assert_eq!(restored.sessions[0].history_saved_cursor, Some(cursor));
+        assert_eq!(
+            restored.sessions[0]
+                .pending_permission
+                .as_ref()
+                .unwrap()
+                .request_id,
+            "approval"
+        );
+        assert_eq!(
+            restored.sessions[0]
+                .pending_user_input
+                .as_ref()
+                .unwrap()
+                .questions[0]
+                .question,
+            "Which files?"
+        );
+        assert!(
+            reopened
+                .replay_events(session_id, runtime_id, epoch, 3)
+                .unwrap()
+                .is_empty()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_history_commit_can_retry_without_losing_rows_or_events() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(directory.join("workspace"));
+        state.sessions[0].begin_turn("keep this input");
+        let session_id = state.sessions[0].id;
+        let runtime_id = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let event = crate::SequencedEvent {
+            session_id,
+            runtime_id,
+            epoch,
+            sequence: 1,
+            event: crate::WireDriverEvent::new("turnStarted", serde_json::Value::Null),
+        };
+        // Force the transaction to fail after project/session rows were written.
+        let connection = store.open().unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_history BEFORE INSERT ON session_events BEGIN SELECT RAISE(ABORT, 'controlled write failure'); END;").unwrap();
+        assert!(
+            store
+                .save_events(&mut state, std::slice::from_ref(&event))
+                .is_err()
+        );
+        let reopened = StateStore::daemon(store.path().to_owned());
+        assert!(reopened.load().unwrap().sessions.is_empty());
+        assert!(
+            reopened
+                .replay_events(session_id, runtime_id, epoch, 0)
+                .unwrap()
+                .is_empty()
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_history")
+            .unwrap();
+        state.sessions[0].runtime_event_cursor = Some(crate::model::RuntimeEventCursor {
+            runtime_id,
+            epoch,
+            sequence: 1,
+        });
+        state.sessions[0].history_save_error = Some("controlled write failure".into());
+        state.mark_session_dirty(session_id);
+        assert!(store.save(&mut state).is_err());
+        assert!(reopened.load().unwrap().sessions.is_empty());
+        // Another runtime can recover without committing this failed projection.
+        let mut other = AgentSession::new(state.projects[0].id, ProviderKind::Codex);
+        other.begin_turn("another task");
+        let other_id = other.id;
+        state.sessions.push(other);
+        state.mark_session_dirty(other_id);
+        let other_event = crate::SequencedEvent {
+            session_id: other_id,
+            ..event.clone()
+        };
+        store.save_events(&mut state, &[other_event]).unwrap();
+        let intermediate = load_hydrated(&reopened);
+        assert_eq!(intermediate.sessions.len(), 1);
+        assert_eq!(intermediate.sessions[0].id, other_id);
+        assert!(state.dirty_sessions.contains(&session_id));
+        state.sessions[0].history_save_error = None;
+        store.save_events(&mut state, &[event]).unwrap();
+        let restored = load_hydrated(&reopened);
+        assert_eq!(restored.projects.len(), 1);
+        assert_eq!(
+            restored
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .unwrap()
+                .messages[0]
+                .content,
+            "keep this input"
+        );
+        assert_eq!(
+            reopened
+                .replay_events(session_id, runtime_id, epoch, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

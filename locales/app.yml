@@ -2153,3 +2153,10 @@ usage_error.unknown_error:
   en: unknown error
 usage_error.curl_no_status:
   en: curl returned no HTTP status line
+
+session.history_saved:
+  en: History saved
+session.history_pending:
+  en: Saving history…
+session.history_save_failed:
+  en: 'History not saved: %{error}'

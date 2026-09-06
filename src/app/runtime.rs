@@ -1,5 +1,9 @@
 use super::*;
 
+fn stream_save_delay(dirty: bool, saving: bool, elapsed: Duration) -> Option<Duration> {
+    (dirty && !saving).then(|| STREAM_SAVE_INTERVAL.saturating_sub(elapsed))
+}
+
 fn workspace_ack(
     workspace: &waku_client::WorkspaceClient,
     operation: waku_client::WorkspaceOperation,
@@ -10,21 +14,8 @@ fn workspace_ack(
     }
 }
 
-fn workspace_has_ref(
-    workspace: &waku_client::WorkspaceClient,
-    cwd: &Path,
-    git_ref: &str,
-) -> anyhow::Result<bool> {
-    match workspace.request(waku_client::WorkspaceOperation::HasRef {
-        cwd: cwd.to_path_buf(),
-        git_ref: git_ref.to_owned(),
-    })? {
-        waku_client::WorkspaceResult::Bool { value } => Ok(value),
-        _ => anyhow::bail!("the daemon returned an invalid checkpoint response"),
-    }
-}
-
 fn start_driver(mut request: DriverStartRequest, cwd: PathBuf) -> anyhow::Result<PreparedDriver> {
+    (request.save_state)()?;
     request.options.cwd = cwd;
     let (event_tx, events) = driver::event_channel(request.event_wake);
     let handle = driver::start_remote(
@@ -223,357 +214,36 @@ fn prepare_submission(
     })
 }
 
-/// Everything a past-message resend needs after the UI accepts it.
-///
-/// The request owns only thread-safe snapshots. Git, provider RPCs, process
-/// startup, and native transcript reads all happen in
-/// [`perform_message_rewind`] on the background executor.
+/// The daemon owns workspace restoration, provider rollback, and the saved
+/// transcript. The desktop sends this request on the background executor.
 struct MessageRewindRequest {
-    workspace_client: waku_client::WorkspaceClient,
+    client: waku_client::DaemonClient,
     session_id: Uuid,
-    provider: ProviderKind,
-    provider_cursor: Option<ProviderResumeCursor>,
-    session_title: String,
-    /// Cursor has no native branch API, so its background helper needs the
-    /// retained visible transcript. Other providers avoid cloning a long task
-    /// on the click path entirely.
-    cursor_source: Option<AgentSession>,
-    project_path: PathBuf,
-    retained_turn_count: usize,
-    previous_turn_count: usize,
-    rollback_turns: usize,
-    provider_turn_count: usize,
-    provider_resume_at: Option<String>,
-    binary: Option<PathBuf>,
-    driver: Option<DriverHandle>,
-    driver_start: Option<DriverStartRequest>,
+    turn_count: usize,
 }
 
 struct PreparedMessageRewind {
-    provider_rewind_cursor: Option<ProviderResumeCursor>,
-    claude_fork: Option<waku_client::provider_session::ProviderSessionFork>,
-    prepared_driver: Option<PreparedDriver>,
-    reset_native_session: bool,
+    session: AgentSession,
     cleanup_error: Option<String>,
 }
 
-fn perform_message_rewind(
-    mut request: MessageRewindRequest,
-) -> Result<PreparedMessageRewind, String> {
-    let session_id = request.session_id;
-    let turn_start_ref =
-        checkpoint::turn_start_ref(session_id, request.retained_turn_count.saturating_add(1));
-    let retained_ref = checkpoint::checkpoint_ref(session_id, request.retained_turn_count);
-    let restore_ref = if workspace_has_ref(
-        &request.workspace_client,
-        &request.project_path,
-        &turn_start_ref,
-    )
-    .map_err(|error| error.to_string())?
-    {
-        turn_start_ref
-    } else {
-        retained_ref
-    };
-    if !workspace_has_ref(
-        &request.workspace_client,
-        &request.project_path,
-        &restore_ref,
-    )
-    .map_err(|error| error.to_string())?
-    {
-        return Err(tr!("session.pre_turn_checkpoint_missing"));
-    }
-
-    let safety_ref = format!("refs/waku/revert-backup-{session_id}-{}", Uuid::new_v4());
-    workspace_ack(
-        &request.workspace_client,
-        waku_client::WorkspaceOperation::CaptureRef {
-            cwd: request.project_path.clone(),
-            git_ref: safety_ref.clone(),
-        },
-    )
-    .map_err(|error| tr!("errors.create_rewind_snapshot", error = error))?;
-    if let Err(error) = workspace_ack(
-        &request.workspace_client,
-        waku_client::WorkspaceOperation::RestoreRef {
-            cwd: request.project_path.clone(),
-            git_ref: restore_ref.clone(),
+fn perform_message_rewind(request: MessageRewindRequest) -> Result<PreparedMessageRewind, String> {
+    match request.client.request(
+        request.session_id,
+        Uuid::nil(),
+        waku_client::Command::RewindSessionToMessage {
+            turn_count: request.turn_count,
         },
     ) {
-        return Err(
-            match workspace_ack(
-                &request.workspace_client,
-                waku_client::WorkspaceOperation::RestoreRef {
-                    cwd: request.project_path.clone(),
-                    git_ref: safety_ref.clone(),
-                },
-            ) {
-                Ok(()) => {
-                    let _ = workspace_ack(
-                        &request.workspace_client,
-                        waku_client::WorkspaceOperation::DeleteRef {
-                            cwd: request.project_path.clone(),
-                            git_ref: safety_ref.clone(),
-                        },
-                    );
-                    tr!("errors.restore_checkpoint", error = error)
-                }
-                Err(restore_error) => tr!(
-                    "errors.restore_checkpoint_and_safety",
-                    error = error,
-                    restore_error = restore_error,
-                    safety_ref = safety_ref
-                ),
-            },
-        );
-    }
-
-    let provider_rewind = perform_provider_rewind(&mut request);
-    let (provider_rewind_cursor, claude_fork, prepared_driver) = match provider_rewind {
-        Ok(rewind) => rewind,
-        Err(error) => {
-            return Err(
-                match workspace_ack(
-                    &request.workspace_client,
-                    waku_client::WorkspaceOperation::RestoreRef {
-                        cwd: request.project_path.clone(),
-                        git_ref: safety_ref.clone(),
-                    },
-                ) {
-                    Ok(()) => {
-                        let _ = workspace_ack(
-                            &request.workspace_client,
-                            waku_client::WorkspaceOperation::DeleteRef {
-                                cwd: request.project_path.clone(),
-                                git_ref: safety_ref.clone(),
-                            },
-                        );
-                        tr!("errors.rollback_rejected_workspace_restored", error = error)
-                    }
-                    Err(restore_error) => tr!(
-                        "errors.rollback_and_safety_failed",
-                        error = error,
-                        restore_error = restore_error,
-                        safety_ref = safety_ref
-                    ),
-                },
-            );
-        }
-    };
-
-    let _ = workspace_ack(
-        &request.workspace_client,
-        waku_client::WorkspaceOperation::DeleteRef {
-            cwd: request.project_path.clone(),
-            git_ref: safety_ref,
-        },
-    );
-    let cleanup_error = workspace_ack(
-        &request.workspace_client,
-        waku_client::WorkspaceOperation::DeleteTurnRefsAfter {
-            cwd: request.project_path.clone(),
-            session_id,
-            retained_turn_count: request.retained_turn_count,
-            previous_turn_count: request.previous_turn_count,
-        },
-    )
-    .err()
-    .map(|error| error.to_string());
-
-    Ok(PreparedMessageRewind {
-        provider_rewind_cursor,
-        claude_fork,
-        prepared_driver,
-        reset_native_session: request.rollback_turns > 0
-            && request.retained_turn_count == 0
-            && matches!(
-                request.provider,
-                ProviderKind::Claude | ProviderKind::Cursor | ProviderKind::Grok
-            ),
-        cleanup_error,
-    })
-}
-
-type ProviderRewindResult = (
-    Option<ProviderResumeCursor>,
-    Option<waku_client::provider_session::ProviderSessionFork>,
-    Option<PreparedDriver>,
-);
-
-fn perform_provider_rewind(
-    request: &mut MessageRewindRequest,
-) -> anyhow::Result<ProviderRewindResult> {
-    let provider = request.provider;
-    let reset_native_session = request.rollback_turns > 0
-        && request.retained_turn_count == 0
-        && matches!(
-            provider,
-            ProviderKind::Claude | ProviderKind::Cursor | ProviderKind::Grok
-        );
-    if request.rollback_turns == 0 || reset_native_session {
-        return Ok((None, None, None));
-    }
-
-    match provider {
-        ProviderKind::Claude => {
-            let Some(ProviderResumeCursor::Claude {
-                session_id: native_session_id,
-                ..
-            }) = request.provider_cursor.as_ref()
-            else {
-                anyhow::bail!(tr!(
-                    "errors.provider_native_cursor_unavailable",
-                    provider = "Claude"
-                ));
-            };
-            let fork = request.workspace_client.fork_provider_session(
-                waku_client::provider_session::ProviderSessionForkRequest::Claude {
-                    session_id: native_session_id.clone(),
-                    resume_at: request.provider_resume_at.clone(),
-                    turn_count: request.provider_turn_count,
-                    title: tr!(
-                        "session.rewind_title",
-                        title = request.session_title.as_str()
-                    ),
-                },
-            )?;
-            Ok((None, Some(fork), None))
-        }
-        ProviderKind::OpenCode => {
-            let cursor = if let Some(driver) = request.driver.as_ref() {
-                driver.rollback(request.rollback_turns)?.ok_or_else(|| {
-                    anyhow::anyhow!("OpenCode returned no cursor for the rewound session")
-                })?
-            } else {
-                let Some(ProviderResumeCursor::OpenCode {
-                    session_id: native_session_id,
-                }) = request.provider_cursor.as_ref()
-                else {
-                    anyhow::bail!(tr!(
-                        "errors.provider_native_cursor_unavailable",
-                        provider = "OpenCode"
-                    ));
-                };
-                let binary = request.binary.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(tr!("errors.provider_not_found", provider = "OpenCode"))
-                })?;
-                request
-                    .workspace_client
-                    .fork_provider_session(
-                        waku_client::provider_session::ProviderSessionForkRequest::OpenCode {
-                            binary: binary.to_owned(),
-                            cwd: request.project_path.clone(),
-                            session_id: native_session_id.clone(),
-                            turn_count: request.provider_turn_count,
-                        },
-                    )?
-                    .cursor
-            };
-            Ok((Some(cursor), None, None))
-        }
-        ProviderKind::Amp => {
-            let Some(ProviderResumeCursor::Amp {
-                thread_id: native_thread_id,
-                fork_context,
-            }) = request.provider_cursor.as_ref()
-            else {
-                anyhow::bail!(tr!(
-                    "errors.provider_native_thread_cursor_unavailable",
-                    provider = "Amp"
-                ));
-            };
-            let binary = request.binary.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(tr!("errors.provider_not_found", provider = "Amp"))
-            })?;
-            let cursor = request
-                .workspace_client
-                .fork_provider_session(
-                    waku_client::provider_session::ProviderSessionForkRequest::Amp {
-                        binary: binary.to_owned(),
-                        cwd: request.project_path.clone(),
-                        thread_id: native_thread_id.clone(),
-                        fork_context: fork_context.clone(),
-                        turn_count: request.provider_turn_count,
-                    },
-                )?
-                .cursor;
-            Ok((Some(cursor), None, None))
-        }
-        ProviderKind::Cursor => {
-            let source = request.cursor_source.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(tr!(
-                    "errors.provider_waku_task_unavailable",
-                    provider = "Cursor"
-                ))
-            })?;
-            Ok((
-                Some(
-                    request
-                        .workspace_client
-                        .fork_provider_session(
-                            waku_client::provider_session::ProviderSessionForkRequest::Cursor {
-                                source: source.clone(),
-                                turn_count: request.retained_turn_count,
-                            },
-                        )?
-                        .cursor,
-                ),
-                None,
-                None,
-            ))
-        }
-        ProviderKind::Grok => {
-            let Some(ProviderResumeCursor::Grok {
-                session_id: native_session_id,
-            }) = request.provider_cursor.as_ref()
-            else {
-                anyhow::bail!(tr!(
-                    "errors.provider_native_cursor_unavailable",
-                    provider = "Grok"
-                ));
-            };
-            let binary = request.binary.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(tr!("errors.provider_not_found", provider = "Grok Build"))
-            })?;
-            let cursor = request
-                .workspace_client
-                .fork_provider_session(
-                    waku_client::provider_session::ProviderSessionForkRequest::Grok {
-                        binary: binary.to_owned(),
-                        cwd: request.project_path.clone(),
-                        session_id: native_session_id.clone(),
-                        turn_count: request.provider_turn_count,
-                    },
-                )?
-                .cursor;
-            Ok((Some(cursor), None, None))
-        }
-        ProviderKind::Codex | ProviderKind::DeepSeek | ProviderKind::OhMyPi | ProviderKind::Pi => {
-            let mut prepared_driver = None;
-            let driver = if let Some(driver) = request.driver.as_ref() {
-                driver.clone()
-            } else {
-                let start = request.driver_start.take().ok_or_else(|| {
-                    anyhow::anyhow!(tr!(
-                        "errors.provider_not_found",
-                        provider = provider.display_name()
-                    ))
-                })?;
-                let prepared = start_driver(start, request.project_path.clone())?;
-                let driver = prepared.handle.clone();
-                prepared_driver = Some(prepared);
-                driver
-            };
-            let cursor = driver.rollback(request.rollback_turns)?;
-            Ok((cursor, None, prepared_driver))
-        }
-        // Unreachable through the UI, which hides rewinding for providers that
-        // answer `supports_conversation_rollback` with false.
-        ProviderKind::Fx | ProviderKind::Kimi => Err(anyhow::anyhow!(tr!(
-            "errors.provider_turn_branching_unsupported",
-            provider = provider.display_name()
-        ))),
+        Ok(waku_client::ResponsePayload::SessionRewound {
+            session,
+            cleanup_warning,
+        }) => Ok(PreparedMessageRewind {
+            session,
+            cleanup_error: cleanup_warning,
+        }),
+        Ok(_) => Err("Waku daemon returned an invalid rewind response".into()),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -1071,6 +741,8 @@ impl Waku {
 
     pub(super) fn start_runtime_attachment(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
         if self.runtimes.contains_key(&session_id)
+            || self.submission_preparations.contains(&session_id)
+            || self.goal_runtime_starts.contains(&session_id)
             || !self.runtime_attach_pending.insert(session_id)
         {
             return;
@@ -1096,6 +768,13 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         if !self.runtime_attach_pending.remove(&session_id) {
+            return;
+        }
+        // Local preparation owns the current turn; a late attachment must not
+        // replace the prompt accepted while its history request was in flight.
+        if self.submission_preparations.contains(&session_id)
+            || self.goal_runtime_starts.contains(&session_id)
+        {
             return;
         }
         match result {
@@ -1231,7 +910,7 @@ impl Waku {
         self.state.sessions.iter().find(|session| session.id == id)
     }
 
-    fn active_turn_finished_event(
+    pub(super) fn active_turn_finished_event(
         &self,
         session_id: Uuid,
         outcome: crate::analytics::TurnOutcome,
@@ -1254,7 +933,7 @@ impl Waku {
     }
 
     /// Completes a persisted turn and emits its anonymous outcome exactly
-    /// once. All production turn-settlement paths go through this seam.
+    /// once for local actions. Provider events settle through the shared history reducer.
     pub(super) fn finish_active_turn_with_analytics(
         &mut self,
         session_id: Uuid,
@@ -1595,22 +1274,45 @@ impl Waku {
     }
 
     pub(super) fn save(&mut self) {
-        self.last_stream_save = Instant::now();
-        let daemon_error = self
-            .daemon
-            .update_settings(self.state.daemon_settings())
-            .err()
-            .map(|error| error.to_string());
-        let app_error = self
-            .store
-            .save(&mut self.state)
-            .err()
-            .map(|error| error.to_string());
-        if let Some(error) = daemon_error.or(app_error) {
-            self.show_toast(tr!("errors.save_local_state", error = error));
-        } else {
-            self.stream_state_dirty = false;
+        if self.state_save_pending {
+            self.state_save_requested = true;
+            return;
         }
+        self.last_stream_save = Instant::now();
+        if let Err(error) = self.daemon.update_settings(self.state.daemon_settings()) {
+            self.show_toast(tr!("errors.save_local_state", error = error));
+        }
+        self.state_save_pending = true;
+        self.stream_state_dirty = false;
+        let save = self.store.prepare_save(&self.state);
+        let results = self.state_save_tx.clone();
+        let wake = self.event_wake_tx.clone();
+        self.state_save_executor
+            .spawn(async move {
+                let result = save();
+                let _ = results.send(result);
+                let _ = wake.try_send(());
+            })
+            .detach();
+    }
+
+    fn drain_state_save_events(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.state_save_events.try_recv() {
+            self.state_save_pending = false;
+            match result {
+                Ok(receipt) => self.state.acknowledge_save(receipt),
+                Err(error) => {
+                    self.stream_state_dirty = true;
+                    self.show_toast(tr!("errors.save_local_state", error = error));
+                }
+            }
+            if std::mem::take(&mut self.state_save_requested) {
+                self.save();
+            }
+            changed = true;
+        }
+        changed
     }
 
     fn checkpoint_capture_pending(&self, session_id: Uuid, turn_count: usize) -> bool {
@@ -2211,75 +1913,7 @@ impl Waku {
             cx.notify();
             return;
         }
-        let Some(project_path) = self
-            .workspace_path_for_session(&source)
-            .map(std::path::Path::to_path_buf)
-        else {
-            self.show_toast(tr!("errors.task_project_not_found"));
-            cx.notify();
-            return;
-        };
-        let provider_turn_count = source
-            .turns
-            .iter()
-            .take(retained_turn_count)
-            .filter(|turn| turn.provider_turn_started)
-            .count();
-        let provider_resume_at = retained_turn_count
-            .checked_sub(1)
-            .and_then(|index| source.turns.get(index))
-            .and_then(|turn| turn.provider_resume_at.clone());
-        let driver = self
-            .runtimes
-            .get(&session_id)
-            .map(|runtime| runtime.driver.clone());
-        let needs_binary = rollback_turns > 0
-            && (matches!(source.provider, ProviderKind::Amp)
-                || (source.provider == ProviderKind::OpenCode && driver.is_none())
-                || (source.provider == ProviderKind::Grok && retained_turn_count > 0));
-        let binary = needs_binary
-            .then(|| {
-                self.probes
-                    .iter()
-                    .find(|probe| probe.provider == source.provider)
-                    .and_then(|probe| probe.path.clone())
-            })
-            .flatten();
-        if needs_binary && binary.is_none() {
-            self.show_toast(tr!(
-                "errors.provider_not_found",
-                provider = source.provider.display_name()
-            ));
-            cx.notify();
-            return;
-        }
-        let driver_start = if rollback_turns > 0
-            && matches!(
-                source.provider,
-                ProviderKind::Codex
-                    | ProviderKind::DeepSeek
-                    | ProviderKind::OhMyPi
-                    | ProviderKind::Pi
-            )
-            && driver.is_none()
-        {
-            match self.driver_start_request_for_session(&source, project_path.clone()) {
-                Ok(request) => Some(request),
-                Err(error) => {
-                    self.show_toast(error.to_string());
-                    cx.notify();
-                    return;
-                }
-            }
-        } else {
-            None
-        };
         let previous_status = source.status;
-        let previous_turn_count = source.turns.len();
-        let provider = source.provider;
-        let provider_cursor = source.provider_cursor.clone();
-        let session_title = source.display_title().to_owned();
-        let cursor_source = (provider == ProviderKind::Cursor).then(|| source.clone());
         let edited_message_id = edit.message_id;
         let Some(edited_message_index) = source
             .turns
@@ -2298,21 +1932,9 @@ impl Waku {
             return;
         };
         let request = MessageRewindRequest {
-            workspace_client: waku_client::WorkspaceClient::new(self.daemon.client()),
+            client: self.daemon.client(),
             session_id,
-            provider,
-            provider_cursor,
-            session_title,
-            cursor_source,
-            previous_turn_count,
-            project_path,
-            retained_turn_count,
-            rollback_turns,
-            provider_turn_count,
-            provider_resume_at,
-            binary,
-            driver,
-            driver_start,
+            turn_count,
         };
 
         // Optimistically leave edit mode and show the replacement bubble at
@@ -2414,10 +2036,7 @@ impl Waku {
             }
         };
         let PreparedMessageRewind {
-            provider_rewind_cursor,
-            claude_fork,
-            mut prepared_driver,
-            reset_native_session,
+            session: rewound_session,
             cleanup_error,
         } = prepared;
         let retained_turn_count = turn_count.saturating_sub(1);
@@ -2444,63 +2063,13 @@ impl Waku {
             Vec::new()
         };
         if let Some(session) = self.state.session_mut(session_id) {
-            if let Some(fork) = &claude_fork {
-                for turn in session.turns.iter_mut().take(retained_turn_count) {
-                    if let Some(remapped) = turn
-                        .provider_resume_at
-                        .as_ref()
-                        .and_then(|message_id| fork.message_ids.get(message_id))
-                        .cloned()
-                    {
-                        turn.provider_resume_at = Some(remapped);
-                    }
-                }
-                session.provider_cursor = Some(fork.cursor.clone());
-            } else if reset_native_session {
-                session.provider_cursor = None;
-            } else if let Some(cursor) = provider_rewind_cursor.clone() {
-                session.provider_cursor = Some(cursor);
-            }
-            session.truncate_after_turn(retained_turn_count);
-            session.status = SessionStatus::Idle;
+            waku_protocol::history::apply_rewound_history(session, rewound_session);
         }
 
-        if let Some(prepared) = prepared_driver.as_mut() {
-            // Startup announces the source cursor before a cold driver-backed
-            // rollback finishes. It is stale now; do not let it overwrite the
-            // rewound cursor after this driver is installed.
-            while prepared.events.try_recv().is_ok() {}
-        }
-        if let Some(prepared) = prepared_driver {
-            self.install_prepared_driver(session_id, prepared);
-        }
-        if claude_fork.is_some()
-            || reset_native_session
-            || (matches!(
-                provider,
-                ProviderKind::Amp
-                    | ProviderKind::Cursor
-                    | ProviderKind::DeepSeek
-                    | ProviderKind::OpenCode
-                    | ProviderKind::Grok
-            ) && provider_rewind_cursor.is_some())
-        {
-            // Headless drivers retain their original native session ID. Recreate
-            // them lazily so the next prompt resumes the fork instead.
-            if let Some(runtime) = self.runtimes.remove(&session_id) {
-                runtime.driver.close();
-            }
-            self.mark_background_work_lost(session_id);
-        } else if let Some(runtime) = self.runtimes.get_mut(&session_id) {
-            runtime
-                .pending_events
-                .retain(|event| matches!(event, DriverEvent::BackgroundWork(_)));
-            runtime.stream_remeasure_pending = false;
-            runtime.stream_phase = None;
-            runtime.pending_permission = None;
-            runtime.pending_user_input = None;
-            runtime.pending_computer_approval = None;
-        }
+        // The daemon retired the source runtime before saving the rewind.
+        // Drop its subscription and resume the returned cursor on submission.
+        self.runtimes.remove(&session_id);
+        self.mark_background_work_lost(session_id);
         self.invalidate_checkpoint_refs();
         if self
             .message_edit
@@ -2715,6 +2284,35 @@ impl Waku {
             },
             event_wake: self.event_wake_tx.clone(),
             daemon: self.daemon.clone(),
+            save_state: {
+                let daemon = self.daemon.clone();
+                let session = session.clone();
+                let projects = self
+                    .state
+                    .projects
+                    .iter()
+                    .filter(|project| project.id == session.project_id)
+                    .cloned()
+                    .collect();
+                Box::new(move || {
+                    match daemon
+                        .client()
+                        .request(
+                            Uuid::nil(),
+                            Uuid::nil(),
+                            waku_client::Command::SaveTaskState {
+                                projects,
+                                live_session_ids: vec![session.id],
+                                sessions: vec![session],
+                            },
+                        )
+                        .map_err(std::io::Error::other)?
+                    {
+                        waku_client::ResponsePayload::TaskStateSaved { .. } => Ok(()),
+                        _ => Err(std::io::Error::other("invalid task save response")),
+                    }
+                })
+            },
         })
     }
 
@@ -2887,6 +2485,16 @@ impl Waku {
         prepared: PreparedDriver,
     ) -> DriverHandle {
         let handle = prepared.handle.clone();
+        let session = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .filter(|session| session.status == SessionStatus::Waiting);
+        let pending_permission = session.and_then(|session| session.pending_permission.clone());
+        let pending_user_input = session
+            .and_then(|session| session.pending_user_input.clone())
+            .map(|request| PendingUserInput::new(request.request_id, request.questions));
         self.runtimes.insert(
             session_id,
             SessionRuntime {
@@ -2898,8 +2506,8 @@ impl Waku {
                 stream_phase: None,
                 park_announced: false,
                 stream_remeasure_pending: false,
-                pending_permission: None,
-                pending_user_input: None,
+                pending_permission,
+                pending_user_input,
                 pending_computer_approval: None,
                 computer_use_previews: Vec::new(),
                 computer_session_grants: HashSet::new(),
@@ -3501,7 +3109,8 @@ impl Waku {
     pub(super) fn drain_event_pump(&mut self, cx: &mut Context<Self>) -> EventPumpSchedule {
         // `|` on purpose: a busy provider must not starve the other result
         // queues just because its own drain reported a change first.
-        if self.drain_driver_events(cx)
+        if self.drain_state_save_events()
+            | self.drain_driver_events(cx)
             | self.drain_provider_probe_events()
             | self.drain_provider_version_events()
             | self.drain_provider_detection_events()
@@ -3528,8 +3137,17 @@ impl Waku {
             .any(|runtime| !runtime.pending_events.is_empty() || runtime.stream_remeasure_pending)
         {
             EventPumpSchedule::StreamFrame
-        } else if let Some(delay) = self.background_output_refresh_delay() {
-            EventPumpSchedule::BackgroundOutput(delay)
+        } else if let Some(delay) = self
+            .background_output_refresh_delay()
+            .into_iter()
+            .chain(stream_save_delay(
+                self.stream_state_dirty || self.state.has_dirty_sessions(),
+                self.state_save_pending,
+                self.last_stream_save.elapsed(),
+            ))
+            .min()
+        {
+            EventPumpSchedule::WakeAfter(delay)
         } else {
             EventPumpSchedule::Idle
         }
@@ -3666,12 +3284,44 @@ impl Waku {
         if selected_changed {
             self.remeasure_transcript_tail();
         }
-        if self.stream_state_dirty
-            && (force_save || self.last_stream_save.elapsed() >= STREAM_SAVE_INTERVAL)
+        if (self.stream_state_dirty && force_save)
+            || stream_save_delay(
+                self.stream_state_dirty || self.state.has_dirty_sessions(),
+                self.state_save_pending,
+                self.last_stream_save.elapsed(),
+            ) == Some(Duration::ZERO)
         {
             self.save();
         }
         changed || selected_changed
+    }
+}
+
+#[cfg(test)]
+mod stream_save_tests {
+    use super::*;
+
+    #[test]
+    fn stream_tail_schedules_its_final_save_without_another_event() {
+        let since_last_save = STREAM_SAVE_INTERVAL - Duration::from_millis(250);
+        let delay = stream_save_delay(true, false, since_last_save)
+            .expect("a dirty tail must keep the event pump scheduled");
+        assert_eq!(delay, Duration::from_millis(250));
+        assert_eq!(
+            stream_save_delay(true, false, since_last_save + delay),
+            Some(Duration::ZERO),
+            "the timer wake must make the save due even without provider events",
+        );
+        assert_eq!(stream_save_delay(false, false, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn in_flight_save_completion_wakes_the_pump_without_polling() {
+        assert_eq!(stream_save_delay(true, true, STREAM_SAVE_INTERVAL), None);
+        assert_eq!(
+            stream_save_delay(true, false, STREAM_SAVE_INTERVAL),
+            Some(Duration::ZERO),
+        );
     }
 }
 
@@ -3736,6 +3386,117 @@ mod version_tests {
         assert_eq!(
             parse_cli_version("cursor-agent 2025.09.12-4f8d8e2"),
             Some("2025.09.12-4f8d8e2".to_owned())
+        );
+    }
+}
+
+#[cfg(test)]
+mod rewind_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use waku_client::{ClientMessage, ResponseOutcome, ResponsePayload, ServerMessage};
+
+    fn rewind_with_response(
+        session_id: Uuid,
+        outcome: ResponseOutcome,
+    ) -> (Result<PreparedMessageRewind, String>, waku_client::Request) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let peer = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let hello: ClientMessage =
+                serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            assert!(matches!(hello, ClientMessage::Hello { .. }));
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&ServerMessage::Hello {
+                        protocol_version: waku_client::PROTOCOL_VERSION,
+                        daemon_version: "test".into(),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .unwrap();
+            let ClientMessage::Request(request) =
+                serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap()
+            else {
+                panic!("expected a rewind request");
+            };
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&ServerMessage::Response {
+                        request_id: request.request_id,
+                        outcome,
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .unwrap();
+            request
+        });
+        let client = waku_client::DaemonClient::connect(&address, "test".into()).unwrap();
+        let result = perform_message_rewind(MessageRewindRequest {
+            client,
+            session_id,
+            turn_count: 2,
+        });
+        (result, peer.join().unwrap())
+    }
+
+    #[test]
+    fn message_rewind_uses_the_daemon_history_command() {
+        let mut rewound = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        rewound.provider_cursor = Some(ProviderResumeCursor::Codex {
+            thread_id: "rewound-thread".into(),
+        });
+        rewound.begin_turn("retained prompt");
+        rewound.push_message(MessageRole::Assistant, "retained response");
+        rewound.finish_active_turn(TurnStatus::Completed);
+        let session_id = rewound.id;
+        let expected = serde_json::to_value(&rewound).unwrap();
+        let (result, request) = rewind_with_response(
+            session_id,
+            ResponseOutcome::Ok {
+                payload: ResponsePayload::SessionRewound {
+                    session: rewound,
+                    cleanup_warning: Some("stale checkpoint refs".into()),
+                },
+            },
+        );
+        let prepared = result.expect("rewind must return the daemon's saved transcript");
+        assert_eq!(serde_json::to_value(prepared.session).unwrap(), expected);
+        assert_eq!(
+            prepared.cleanup_error.as_deref(),
+            Some("stale checkpoint refs")
+        );
+        assert_eq!(request.session_id, session_id);
+        assert!(matches!(
+            request.command,
+            waku_client::Command::RewindSessionToMessage { turn_count: 2 }
+        ));
+    }
+
+    #[test]
+    fn message_rewind_returns_daemon_failure_to_the_edit_recovery_path() {
+        let (result, _) = rewind_with_response(
+            Uuid::new_v4(),
+            ResponseOutcome::Error {
+                error: waku_client::RpcError {
+                    message: "provider rejected rewind; original worktree restored".into(),
+                },
+            },
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a rejected rewind must preserve the edit for retry"),
+        };
+        assert_eq!(
+            error,
+            "provider rejected rewind; original worktree restored"
         );
     }
 }

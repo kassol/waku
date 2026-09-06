@@ -352,6 +352,8 @@ pub fn run() {
                             WindowBackgroundAppearance::Opaque
                         },
                         app_id: Some(APP_ID.to_owned()),
+                        // Keep macOS development rebuilds from taking keyboard focus.
+                        focus: !cfg!(all(debug_assertions, target_os = "macos")),
                         // GPUI defaults to compositor/server decorations. If a
                         // Wayland compositor declines them, it reports the
                         // client fallback and Waku renders that frame itself.
@@ -396,7 +398,9 @@ pub fn run() {
                         window,
                         crate::theme::Theme::current(cx).is_dark,
                     );
-                    cx.activate(true);
+                    if !cfg!(all(debug_assertions, target_os = "macos")) {
+                        cx.activate(true);
+                    }
                 })
                 .ok();
 

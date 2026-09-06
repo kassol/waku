@@ -12,7 +12,7 @@
  * fetched only when a session is opened.
  */
 
-import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const projects = sqliteTable("projects", {
   id: text("id").primaryKey(),
@@ -89,3 +89,12 @@ export const sessionDetails = sqliteTable("session_details", {
   sessionId: text("session_id").primaryKey(),
   data: text("data").notNull(),
 });
+
+/** Ordered provider events committed with the readable history. No pruning yet. */
+export const sessionEvents = sqliteTable("session_events", {
+  sessionId: text("session_id").notNull(),
+  runtimeId: text("runtime_id").notNull(),
+  epoch: text("epoch").notNull(),
+  sequence: integer("sequence").notNull(),
+  data: text("data").notNull(),
+}, (table) => [primaryKey({ columns: [table.sessionId, table.runtimeId, table.epoch, table.sequence] })]);

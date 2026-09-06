@@ -29,6 +29,7 @@ use waku_protocol::provider_session::{ProviderSessionFork, ProviderSessionForkRe
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
     terminals: Mutex<HashMap<Uuid, (Uuid, crate::terminal::DaemonTerminal)>>,
+    forwarders: Mutex<HashMap<Uuid, (Uuid, std::thread::JoinHandle<()>)>>,
     settings: DaemonSettingsStore,
     task_store: StateStore,
     task_state: Mutex<PersistedState>,
@@ -39,6 +40,8 @@ pub struct WakuBackend {
     checkpoint_capture_locks: Mutex<HashMap<(PathBuf, Uuid, usize), Arc<Mutex<()>>>>,
     usage_rates_dir: std::path::PathBuf,
     default_cwd: std::path::PathBuf,
+    history: Mutex<HashMap<(Uuid, Uuid), waku_protocol::history::HistoryReducer>>,
+    pending_history: Mutex<HashMap<(Uuid, Uuid), Vec<crate::SequencedEvent>>>,
 }
 
 impl WakuBackend {
@@ -62,6 +65,9 @@ impl WakuBackend {
             .to_owned();
         Ok(Self {
             sessions: Mutex::new(HashMap::new()),
+            forwarders: Mutex::new(HashMap::new()),
+            history: Mutex::new(HashMap::new()),
+            pending_history: Mutex::new(HashMap::new()),
             terminals: Mutex::new(HashMap::new()),
             settings,
             task_store,
@@ -74,6 +80,63 @@ impl WakuBackend {
             usage_rates_dir,
             default_cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         })
+    }
+
+    /// Stop the provider and wait until its final event has reached persistence.
+    fn close_runtime(&self, session_id: Uuid, runtime_id: Option<Uuid>) -> anyhow::Result<()> {
+        let removed = {
+            let mut sessions = self.sessions.lock();
+            if sessions
+                .get(&session_id)
+                .is_some_and(|(active, _)| runtime_id.is_none_or(|id| id == *active))
+            {
+                sessions.remove(&session_id)
+            } else {
+                None
+            }
+        };
+        drop(removed);
+        let forwarder = {
+            let mut forwarders = self.forwarders.lock();
+            if forwarders
+                .get(&session_id)
+                .is_some_and(|(active, _)| runtime_id.is_none_or(|id| id == *active))
+            {
+                forwarders.remove(&session_id)
+            } else {
+                None
+            }
+        };
+        if let Some((_, forwarder)) = forwarder {
+            forwarder
+                .join()
+                .map_err(|_| anyhow!("the provider event forwarder panicked"))?;
+        }
+        let pending = self
+            .pending_history
+            .lock()
+            .iter()
+            .filter(|((session, runtime), events)| {
+                *session == session_id
+                    && runtime_id.is_none_or(|id| id == *runtime)
+                    && !events.is_empty()
+            })
+            .map(|(_, events)| events.clone())
+            .collect::<Vec<_>>();
+        for events in pending {
+            self.persist_events(&events)?;
+        }
+        if let Some(error) = self
+            .task_state
+            .lock()
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.history_save_error.as_ref())
+        {
+            bail!("could not save the stopped task: {error}");
+        }
+        Ok(())
     }
 
     /// Capture and persist one ending checkpoint exactly once per daemon.
@@ -176,6 +239,68 @@ fn migrate_projectless_state(
 }
 
 impl Backend for WakuBackend {
+    fn persist_events(&self, events: &[crate::SequencedEvent]) -> anyhow::Result<bool> {
+        let Some(first) = events.first() else {
+            return Ok(true);
+        };
+        let decoded = events
+            .iter()
+            .map(|event| waku_protocol::event_from_wire(event.event.clone()))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut state = self.task_state.lock();
+        let Some(index) = state
+            .sessions
+            .iter()
+            .position(|session| session.id == first.session_id)
+        else {
+            bail!(
+                "cannot save history for unknown session {}",
+                first.session_id
+            );
+        };
+        self.task_store.hydrate(&mut state.sessions[index])?;
+        let mut history = self.history.lock();
+        let reducer = history
+            .entry((first.session_id, first.runtime_id))
+            .or_default();
+        let previous_saved = state.sessions[index].history_saved_cursor;
+        let mut pending_history = self.pending_history.lock();
+        let pending = pending_history
+            .entry((first.session_id, first.runtime_id))
+            .or_default();
+        for (event, decoded) in events.iter().zip(decoded) {
+            let session = &mut state.sessions[index];
+            if session.runtime_event_cursor.is_some_and(|cursor| {
+                cursor.runtime_id == event.runtime_id
+                    && cursor.epoch == event.epoch
+                    && cursor.sequence >= event.sequence
+            }) {
+                continue;
+            }
+            reducer.apply(session, decoded);
+            let cursor = crate::model::RuntimeEventCursor {
+                runtime_id: event.runtime_id,
+                epoch: event.epoch,
+                sequence: event.sequence,
+            };
+            session.runtime_event_cursor = Some(cursor);
+            pending.push(event.clone());
+        }
+        if pending.is_empty() {
+            return Ok(true);
+        }
+        state.sessions[index].history_saved_cursor = state.sessions[index].runtime_event_cursor;
+        state.sessions[index].history_save_error = None;
+        state.mark_session_dirty(first.session_id);
+        if let Err(error) = self.task_store.save_events(&mut state, pending) {
+            state.sessions[index].history_saved_cursor = previous_saved;
+            state.sessions[index].history_save_error = Some(error.to_string());
+            return Err(error.into());
+        }
+        pending.clear();
+        Ok(true)
+    }
+
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
         let session_id = request.session_id;
         let runtime_id = request.runtime_id;
@@ -290,6 +415,14 @@ impl Backend for WakuBackend {
                 crate::skills::trash_skills(&dirs).map_err(|error| anyhow!(error))?;
                 Ok(ResponsePayload::Ack)
             }
+            Command::ReplayEvents { cursor } => Ok(ResponsePayload::EventReplay {
+                events: self.task_store.replay_events(
+                    cursor.session_id,
+                    cursor.runtime_id,
+                    cursor.epoch,
+                    cursor.sequence,
+                )?,
+            }),
             Command::LoadTaskState => {
                 let state = self.task_state.lock();
                 Ok(ResponsePayload::TaskState {
@@ -342,11 +475,41 @@ impl Backend for WakuBackend {
                         .iter_mut()
                         .find(|existing| existing.id == session.id)
                     {
-                        if session_projection_precedes(
-                            existing,
-                            &session,
-                            active_runtimes.get(&session.id).copied(),
-                        ) {
+                        // Startup catalogs are skeletons. Read the authoritative
+                        // cursor before accepting any full client projection.
+                        self.task_store.hydrate(existing)?;
+                        if existing.runtime_event_cursor.is_some()
+                            || session_projection_precedes(
+                                existing,
+                                &session,
+                                active_runtimes.get(&session.id).copied(),
+                            )
+                        {
+                            if existing.runtime_event_cursor == session.runtime_event_cursor {
+                                existing.queued_messages = session.queued_messages.clone();
+                            }
+                            // Presentation belongs to the submitting client; it may
+                            // arrive after the provider echoed an accepted steer.
+                            for incoming in &session.messages {
+                                if incoming.role != crate::model::MessageRole::User {
+                                    continue;
+                                }
+                                if let Some(message) =
+                                    existing.messages.iter_mut().find(|message| {
+                                        message.id == incoming.id
+                                            || (message.role == crate::model::MessageRole::User
+                                                && message.turn_id == incoming.turn_id
+                                                && message.content == incoming.content)
+                                    })
+                                {
+                                    if incoming.display_content.is_some() {
+                                        message.display_content = incoming.display_content.clone();
+                                    }
+                                    if !incoming.attachments.is_empty() {
+                                        message.attachments = incoming.attachments.clone();
+                                    }
+                                }
+                            }
                             merge_stale_session_metadata(existing, session);
                         } else {
                             preserve_daemon_checkpoints(existing, &mut session);
@@ -381,6 +544,7 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::TaskStateSaved { sessions })
             }
             Command::RemoveSession => {
+                self.close_runtime(session_id, None)?;
                 {
                     let mut state = self.task_state.lock();
                     self.removed_session_ids.lock().insert(session_id);
@@ -406,8 +570,6 @@ impl Backend for WakuBackend {
                     }
                     self.task_store.save(&mut state)?;
                 }
-                let removed = self.sessions.lock().remove(&session_id);
-                drop(removed);
                 Ok(ResponsePayload::Ack)
             }
             Command::HydrateSession { session_id } => {
@@ -710,8 +872,11 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             Command::Start { options } => {
-                let previous = self.sessions.lock().remove(&session_id);
-                drop(previous);
+                self.close_runtime(session_id, None)?;
+                self.history.lock().retain(|(id, _), _| *id != session_id);
+                self.pending_history
+                    .lock()
+                    .retain(|(id, _), pending| *id != session_id || !pending.is_empty());
                 let provider = decode_enum(&options.provider)?;
                 let options = DriverStartOptions {
                     binary: options.binary,
@@ -733,39 +898,63 @@ impl Backend for WakuBackend {
                 let (event_sender, event_receiver) = driver::event_channel(wake);
                 let handle = driver::start_local(provider, options, event_sender)?;
                 let supports_steer = handle.supports_steer();
-                std::thread::Builder::new()
+                let forwarder = std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
                     .spawn(move || {
                         while let Ok(event) = event_receiver.recv() {
-                            let wire = event_to_wire(event).unwrap_or_else(|error| {
-                                WireDriverEvent::new(
-                                    "error",
-                                    Value::String(format!(
-                                        "could not encode daemon event: {error}"
-                                    )),
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_millis(120);
+                            let mut batch = vec![event];
+                            while batch.len() < 128
+                                && matches!(
+                                    batch.last(),
+                                    Some(
+                                        DriverEvent::TextDelta(_) | DriverEvent::ReasoningDelta(_)
+                                    )
                                 )
-                            });
-                            if events.send(wire).is_err() {
+                            {
+                                let remaining =
+                                    deadline.saturating_duration_since(std::time::Instant::now());
+                                match event_receiver.recv_timeout(remaining) {
+                                    Ok(event) => batch.push(event),
+                                    Err(_) => break,
+                                }
+                            }
+                            let exited = batch
+                                .iter()
+                                .any(|event| matches!(event, DriverEvent::ProcessExited));
+                            let wire = batch
+                                .into_iter()
+                                .map(|event| {
+                                    event_to_wire(event).unwrap_or_else(|error| {
+                                        WireDriverEvent::new(
+                                            "error",
+                                            Value::String(format!(
+                                                "could not encode daemon event: {error}"
+                                            )),
+                                        )
+                                    })
+                                })
+                                .collect();
+                            if let Err(error) = events.send_batch(wire) {
+                                eprintln!("could not save session {session_id}: {error:#}");
+                            }
+                            if exited {
                                 break;
                             }
                         }
                     })
                     .context("could not start daemon event forwarding thread")?;
+                self.forwarders
+                    .lock()
+                    .insert(session_id, (runtime_id, forwarder));
                 self.sessions
                     .lock()
                     .insert(session_id, (runtime_id, handle));
                 Ok(ResponsePayload::Started { supports_steer })
             }
             Command::CloseSession => {
-                let removed = {
-                    let mut sessions = self.sessions.lock();
-                    sessions
-                        .get(&session_id)
-                        .is_some_and(|(active_runtime_id, _)| *active_runtime_id == runtime_id)
-                        .then(|| sessions.remove(&session_id))
-                        .flatten()
-                };
-                drop(removed);
+                self.close_runtime(session_id, Some(runtime_id))?;
                 Ok(ResponsePayload::Ack)
             }
             command => {
@@ -800,9 +989,23 @@ impl Backend for WakuBackend {
                         message_id: message_id.unwrap_or_else(Uuid::new_v4),
                     })?)?;
                 }
-                handle_driver_command(&driver, command)
+                let history_result = match &command {
+                    Command::Cancel => events.send(event_to_wire(DriverEvent::CancelRequested)?),
+                    Command::Respond { request_id, .. }
+                    | Command::RespondUserInput { request_id, .. } => {
+                        events.send(event_to_wire(DriverEvent::InteractionResponded {
+                            request_id: request_id.clone(),
+                        })?)
+                    }
+                    _ => Ok(()),
+                };
+                handle_driver_command(&driver, command, history_result)
             }
         }
+    }
+
+    fn prepare_start(&self, session_id: Uuid) -> anyhow::Result<()> {
+        self.close_runtime(session_id, None)
     }
 
     fn shutdown(&self) {
@@ -844,14 +1047,16 @@ fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSess
     if incoming.updated_at >= existing.updated_at {
         existing.title = incoming.title;
         existing.project_id = incoming.project_id;
-        existing.workspace = incoming.workspace;
         existing.provider = incoming.provider;
         existing.model = incoming.model;
-        existing.runtime_mode = incoming.runtime_mode;
-        existing.reasoning_effort = incoming.reasoning_effort;
-        existing.service_tier = incoming.service_tier;
-        existing.context_window = incoming.context_window;
-        existing.agent_preset = incoming.agent_preset;
+        if incoming.detail_loaded {
+            existing.workspace = incoming.workspace;
+            existing.runtime_mode = incoming.runtime_mode;
+            existing.reasoning_effort = incoming.reasoning_effort;
+            existing.service_tier = incoming.service_tier;
+            existing.context_window = incoming.context_window;
+            existing.agent_preset = incoming.agent_preset;
+        }
         existing.updated_at = incoming.updated_at;
         existing.last_reply_at = incoming.last_reply_at.or(existing.last_reply_at);
     }
@@ -1083,8 +1288,7 @@ impl WakuBackend {
         // Every provider resumes from the newly stored cursor on the next
         // prompt. Dropping a resident source driver also prevents its late
         // events from racing the rewound transcript.
-        let removed = self.sessions.lock().remove(&session_id);
-        drop(removed);
+        self.close_runtime(session_id, None)?;
 
         let mut rewound = source.clone();
         if !message_ids.is_empty() {
@@ -1107,18 +1311,24 @@ impl WakuBackend {
         rewound.truncate_after_turn(retained_turn_count);
         rewound.status = SessionStatus::Idle;
 
+        Ok((self.save_rewound_session(rewound)?, cleanup_warning))
+    }
+
+    fn save_rewound_session(&self, rewound: AgentSession) -> anyhow::Result<AgentSession> {
+        let session_id = rewound.id;
         let mut state = self.task_state.lock();
         let existing = state
             .sessions
             .iter_mut()
             .find(|session| session.id == session_id)
             .ok_or_else(|| anyhow!("the task was removed while it was being rewound"))?;
-        *existing = rewound.clone();
+        waku_protocol::history::apply_rewound_history(existing, rewound);
+        let rewound = existing.clone();
         state.mark_session_dirty(session_id);
         self.task_store
             .save(&mut state)
             .context("could not save the rewound task")?;
-        Ok((rewound, cleanup_warning))
+        Ok(rewound)
     }
 
     fn fork_provider_response(
@@ -1646,7 +1856,9 @@ fn fork_provider_session(
 fn handle_driver_command(
     driver: &DriverHandle,
     command: Command,
+    history_result: anyhow::Result<()>,
 ) -> anyhow::Result<ResponsePayload> {
+    // Stop and approval responses must reach the provider even when saving fails.
     match command {
         Command::Prompt { prompt, .. } => driver.prompt(prompt),
         Command::Steer { prompt } => driver.steer(prompt),
@@ -1719,6 +1931,7 @@ fn handle_driver_command(
         | Command::SetSkillsEnabled { .. }
         | Command::TrashSkills { .. }
         | Command::LoadTaskState
+        | Command::ReplayEvents { .. }
         | Command::SaveTaskState { .. }
         | Command::RemoveSession
         | Command::HydrateSession { .. }
@@ -1746,6 +1959,7 @@ fn handle_driver_command(
             bail!("daemon received a command in the wrong dispatch path")
         }
     }
+    history_result?;
     Ok(ResponsePayload::Ack)
 }
 
@@ -1770,7 +1984,7 @@ pub fn encode_enum<T: Serialize>(value: T) -> anyhow::Result<String> {
 
 fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
     let (kind, payload) = match event {
-        DriverEvent::RuntimeEventCursorAdvanced(_) => {
+        DriverEvent::RuntimeEventCursorAdvanced(_) | DriverEvent::HistoryPersistence { .. } => {
             bail!("client-only runtime cursors cannot be sent by the daemon")
         }
         DriverEvent::Connected { provider_cursor } => {
@@ -1868,6 +2082,10 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
             json!({ "success": success, "summary": summary }),
         ),
         DriverEvent::Error(error) => ("error", Value::String(error)),
+        DriverEvent::CancelRequested => ("cancelRequested", Value::Null),
+        DriverEvent::InteractionResponded { request_id } => {
+            ("interactionResponded", json!({ "request_id": request_id }))
+        }
         DriverEvent::ProcessExited => ("processExited", Value::Null),
     };
     Ok(WireDriverEvent::new(kind, payload))
@@ -1961,6 +2179,12 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
             }
         }
         "error" => DriverEvent::Error(serde_json::from_value(payload)?),
+        "cancelRequested" => DriverEvent::CancelRequested,
+        "interactionResponded" => DriverEvent::InteractionResponded {
+            request_id: serde_json::from_value(
+                payload.get("request_id").cloned().unwrap_or(Value::Null),
+            )?,
+        },
         "processExited" => DriverEvent::ProcessExited,
         kind => bail!("daemon sent an unsupported driver event {kind:?}"),
     })
@@ -2036,6 +2260,93 @@ struct TurnFinishedWire {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewind_commit_retains_metadata_saved_while_the_provider_was_rewinding() {
+        let directory =
+            std::env::temp_dir().join(format!("waku-rewind-metadata-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state.db");
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(directory.join("settings.json")).unwrap(),
+            StateStore::daemon(path.clone()),
+        )
+        .unwrap();
+        let project = crate::model::Project::from_path(directory.join("workspace"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.begin_turn("retained prompt");
+        session.finish_active_turn(crate::model::TurnStatus::Completed);
+        session.begin_turn("replaced prompt");
+        session.finish_active_turn(crate::model::TurnStatus::Completed);
+        let session_id = session.id;
+        let mut rewound = session.clone();
+        rewound.truncate_after_turn(1);
+        rewound.status = SessionStatus::Idle;
+        session.set_title("new title while rewinding");
+        session.model = Some("new-model".into());
+        {
+            let mut state = backend.task_state.lock();
+            state.projects.push(project);
+            state.push_session(session);
+            backend.task_store.save(&mut state).unwrap();
+        }
+
+        let saved = backend.save_rewound_session(rewound).unwrap();
+        assert_eq!(saved.title, "new title while rewinding");
+        assert_eq!(saved.model.as_deref(), Some("new-model"));
+        assert_eq!(saved.turns.len(), 1);
+        let store = StateStore::daemon(path);
+        let mut restored = store.load().unwrap().sessions.remove(0);
+        store.hydrate(&mut restored).unwrap();
+        assert_eq!(restored.id, session_id);
+        assert_eq!(restored.title, saved.title);
+        assert_eq!(restored.model, saved.model);
+        assert_eq!(restored.turns.len(), 1);
+        assert_eq!(restored.messages.len(), 1);
+        drop(store);
+        drop(backend);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn history_failure_does_not_block_provider_control() {
+        #[derive(Default)]
+        struct Control(Mutex<Vec<&'static str>>);
+        impl crate::driver::DriverControl for Control {
+            fn prompt(&self, _: String) {
+                panic!("unexpected prompt")
+            }
+            fn cancel(&self) {
+                self.0.lock().push("cancel");
+            }
+            fn respond(&self, _: String, _: String) {
+                self.0.lock().push("respond");
+            }
+            fn respond_user_input(&self, _: String, _: Vec<crate::model::UserInputAnswer>) {
+                self.0.lock().push("input");
+            }
+            fn rollback(&self, _: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
+                unreachable!()
+            }
+        }
+        let control = Arc::new(Control::default());
+        let driver = DriverHandle::from_control(control.clone());
+        for command in [
+            Command::Cancel,
+            Command::Respond {
+                request_id: "permission".into(),
+                option_id: "allow".into(),
+            },
+            Command::RespondUserInput {
+                request_id: "question".into(),
+                answers: vec![],
+            },
+        ] {
+            let result = handle_driver_command(&driver, command, Err(anyhow!("disk full")));
+            assert!(result.unwrap_err().to_string().contains("disk full"));
+        }
+        assert_eq!(*control.0.lock(), vec!["cancel", "respond", "input"]);
+    }
 
     #[test]
     fn stale_runtime_projection_keeps_newer_transcript_cursor() {

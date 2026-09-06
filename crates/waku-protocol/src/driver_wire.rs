@@ -22,7 +22,7 @@ pub fn encode_enum<T: Serialize>(value: T) -> anyhow::Result<String> {
 
 pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
     let (kind, payload) = match event {
-        DriverEvent::RuntimeEventCursorAdvanced(_) => {
+        DriverEvent::RuntimeEventCursorAdvanced(_) | DriverEvent::HistoryPersistence { .. } => {
             bail!("client-only runtime cursors cannot be sent by the daemon")
         }
         DriverEvent::Connected { provider_cursor } => {
@@ -120,6 +120,10 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
             json!({ "success": success, "summary": summary }),
         ),
         DriverEvent::Error(error) => ("error", Value::String(error)),
+        DriverEvent::CancelRequested => ("cancelRequested", Value::Null),
+        DriverEvent::InteractionResponded { request_id } => {
+            ("interactionResponded", json!({ "request_id": request_id }))
+        }
         DriverEvent::ProcessExited => ("processExited", Value::Null),
     };
     Ok(WireDriverEvent::new(kind, payload))
@@ -213,6 +217,12 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
             }
         }
         "error" => DriverEvent::Error(serde_json::from_value(payload)?),
+        "cancelRequested" => DriverEvent::CancelRequested,
+        "interactionResponded" => DriverEvent::InteractionResponded {
+            request_id: serde_json::from_value(
+                payload.get("request_id").cloned().unwrap_or(Value::Null),
+            )?,
+        },
         "processExited" => DriverEvent::ProcessExited,
         kind => bail!("daemon sent an unsupported driver event {kind:?}"),
     })

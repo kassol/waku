@@ -8,7 +8,7 @@ import type {
   SequencedEvent,
   UserInputAnswer,
 } from '@waku/client';
-import { reduceRuntimeEvent } from '@waku/client/event-reducer';
+import { reduceRuntimeEvent, reduceRuntimeEventAfterPersistence } from '@waku/client/event-reducer';
 import { writeProviderProbeCache } from '@waku/client/provider-probe-cache';
 import * as Crypto from 'expo-crypto';
 import {
@@ -62,6 +62,7 @@ export interface MobileRuntime {
 }
 
 interface RuntimeEntry extends MobileRuntime {
+  pendingExit: SequencedEvent | null;
   lastDriverError: string | null;
   unsubscribe: () => void;
   /** Buffered runtime events awaiting the next commit. */
@@ -315,12 +316,17 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       starting,
       running: sessionIsRunning(session),
       lastDriverError: null,
+      pendingExit: null,
       unsubscribe: () => {},
       pending: [],
       flushTimer: null,
       lastFlushAt: 0,
     };
     entries.current.set(session.id, entry);
+    if (session.runtime_event_cursor?.runtime_id === runtimeId) {
+      setPermissions((current) => ({ ...current, [session.id]: session.pending_permission ?? undefined }));
+      setUserInputs((current) => ({ ...current, [session.id]: session.pending_user_input ?? undefined }));
+    }
     cacheSession(session);
     setRuntimes((current) => ({ ...current, [session.id]: publicRuntime(entry) }));
 
@@ -382,7 +388,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           }));
         }
       }
-      const result = reduceRuntimeEvent(state.current, event, clock, entry.lastDriverError);
+      const result = reduceRuntimeEventAfterPersistence(state.current, event, entry, clock, entry.lastDriverError);
+      if (!result) return;
       state.current = result.session;
       state.mutated = true;
       if (result.permission !== undefined) {
@@ -470,7 +477,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       if (entry.flushTimer) return;
       const wait = Math.max(0, STREAM_COMMIT_MS - (Date.now() - entry.lastFlushAt));
       entry.flushTimer = setTimeout(flush, wait);
-    });
+    }, session.runtime_event_cursor?.runtime_id === runtimeId ? session.runtime_event_cursor : undefined);
     const teardown = () => {
       if (entry.flushTimer) {
         clearTimeout(entry.flushTimer);

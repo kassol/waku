@@ -12,7 +12,37 @@ fn should_render_empty_state(session: Option<&AgentSession>) -> bool {
         .unwrap_or(true)
 }
 
+fn history_is_saved(session: &AgentSession, local_pending: bool) -> Option<bool> {
+    if local_pending {
+        return Some(false);
+    }
+    let cursor = session.runtime_event_cursor?;
+    Some(session.history_saved_cursor.is_some_and(|saved| {
+        saved.runtime_id == cursor.runtime_id
+            && saved.epoch == cursor.epoch
+            && saved.sequence >= cursor.sequence
+    }))
+}
+
 impl Waku {
+    fn render_history_persistence(&self) -> Option<Div> {
+        let session = self.selected_session()?;
+        let message = if let Some(error) = &session.history_save_error {
+            tr!("session.history_save_failed", error = error)
+        } else {
+            if history_is_saved(
+                session,
+                self.submission_preparations.contains(&session.id)
+                    || self.state.is_session_dirty(session.id),
+            )? {
+                tr!("session.history_saved")
+            } else {
+                tr!("session.history_pending")
+            }
+        };
+        Some(div().px_4().py_1().text_size(px(12.0)).child(message))
+    }
+
     pub(super) fn render_panel_resize_handle(
         &self,
         id: &'static str,
@@ -366,6 +396,7 @@ impl Render for Waku {
                             .cached(StyleRefinement::default().flex_1().min_h(px(0.0)).w_full())
                             .into_any_element()
                     })
+                    .children(self.render_history_persistence())
                     .children(permission)
                     .when(self.selected_project().is_some(), |element| {
                         element
@@ -424,6 +455,22 @@ impl Render for Waku {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_submission_stays_pending_even_with_a_saved_previous_cursor() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        assert_eq!(history_is_saved(&session, false), None);
+        assert_eq!(history_is_saved(&session, true), Some(false));
+        let cursor = crate::model::RuntimeEventCursor {
+            runtime_id: Uuid::new_v4(),
+            epoch: Uuid::new_v4(),
+            sequence: 3,
+        };
+        session.runtime_event_cursor = Some(cursor);
+        session.history_saved_cursor = Some(cursor);
+        assert_eq!(history_is_saved(&session, true), Some(false));
+        assert_eq!(history_is_saved(&session, false), Some(true));
+    }
 
     #[test]
     fn unloaded_history_never_renders_the_new_task_prompt() {

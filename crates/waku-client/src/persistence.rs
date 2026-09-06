@@ -5,7 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -404,22 +404,36 @@ pub struct PersistedState {
     #[serde(skip)]
     daemon_settings_extra: BTreeMap<String, serde_json::Value>,
     #[serde(skip)]
-    dirty_sessions: HashSet<Uuid>,
+    dirty_sessions: HashMap<Uuid, u64>,
+    #[serde(skip)]
+    dirty_generation: u64,
 }
 
 impl PersistedState {
     pub fn session_mut(&mut self, id: Uuid) -> Option<&mut AgentSession> {
         let session = self.sessions.iter_mut().find(|session| session.id == id)?;
-        self.dirty_sessions.insert(id);
+        self.dirty_generation += 1;
+        self.dirty_sessions.insert(id, self.dirty_generation);
         Some(session)
     }
 
+    pub fn has_dirty_sessions(&self) -> bool {
+        !self.dirty_sessions.is_empty()
+    }
+
+    pub fn is_session_dirty(&self, id: Uuid) -> bool {
+        self.dirty_sessions.contains_key(&id)
+    }
+
     pub fn mark_session_dirty(&mut self, id: Uuid) {
-        self.dirty_sessions.insert(id);
+        self.dirty_generation += 1;
+        self.dirty_sessions.insert(id, self.dirty_generation);
     }
 
     pub fn push_session(&mut self, session: AgentSession) {
-        self.dirty_sessions.insert(session.id);
+        self.dirty_generation += 1;
+        self.dirty_sessions
+            .insert(session.id, self.dirty_generation);
         self.sessions.push(session);
     }
 
@@ -459,7 +473,8 @@ impl PersistedState {
             disabled_providers: Vec::new(),
             provider_binary_overrides: HashMap::new(),
             daemon_settings_extra: BTreeMap::new(),
-            dirty_sessions: HashSet::new(),
+            dirty_sessions: HashMap::new(),
+            dirty_generation: 0,
         }
     }
 
@@ -677,7 +692,9 @@ impl PersistedState {
                         session.provider_cursor.is_some(),
                     )
             {
-                self.dirty_sessions.insert(session.id);
+                self.dirty_generation += 1;
+                self.dirty_sessions
+                    .insert(session.id, self.dirty_generation);
             }
         }
         self.version = STATE_VERSION;
@@ -795,6 +812,21 @@ pub fn load_or_create_app_settings() -> io::Result<AppSettings> {
     Ok(settings)
 }
 
+/// The captured session revisions whose write was acknowledged by the daemon.
+pub struct SaveReceipt {
+    revisions: HashMap<Uuid, u64>,
+}
+
+impl PersistedState {
+    pub fn acknowledge_save(&mut self, receipt: SaveReceipt) {
+        for (id, revision) in receipt.revisions {
+            if self.dirty_sessions.get(&id) == Some(&revision) {
+                self.dirty_sessions.remove(&id);
+            }
+        }
+    }
+}
+
 /// Desktop state store: app files stay local, task data crosses RPC.
 pub struct StateStore {
     path: PathBuf,
@@ -808,6 +840,8 @@ pub struct StateStore {
     /// after a transient RPC failure must never turn the next ordinary save
     /// into a destructive replacement of the daemon database.
     task_state_loaded: AtomicBool,
+    save_generation: AtomicU64,
+    saved_generation: Arc<Mutex<u64>>,
 }
 
 impl StateStore {
@@ -836,6 +870,8 @@ impl StateStore {
             daemon,
             remote_default_cwd: Mutex::new(None),
             task_state_loaded: AtomicBool::new(false),
+            save_generation: AtomicU64::new(0),
+            saved_generation: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -999,36 +1035,64 @@ impl StateStore {
         }
     }
 
-    pub fn save(&self, state: &mut PersistedState) -> io::Result<()> {
-        self.write_app_settings(&state.app_settings())?;
-        self.write_app_state(&state.app_state())?;
-        if !self.task_state_loaded.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "task state was not loaded; refusing to overwrite daemon data",
-            ));
+    /// Capture on the UI thread; run the returned write on a background executor.
+    pub fn prepare_save(
+        &self,
+        state: &PersistedState,
+    ) -> impl FnOnce() -> io::Result<SaveReceipt> + Send + 'static {
+        let revisions = state.dirty_sessions.clone();
+        let settings = state.app_settings();
+        let app_state = state.app_state();
+        let settings_path = self.app_settings_path.clone();
+        let state_path = self.app_state_path.clone();
+        let loaded = self.task_state_loaded.load(Ordering::Acquire);
+        let generation = self.save_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let saved_generation = self.saved_generation.clone();
+        let daemon = self.daemon.clone();
+        let command = Command::SaveTaskState {
+            projects: state.projects.clone(),
+            live_session_ids: state.sessions.iter().map(|session| session.id).collect(),
+            sessions: state
+                .sessions
+                .iter()
+                .filter(|session| state.dirty_sessions.contains_key(&session.id))
+                .cloned()
+                .collect(),
+        };
+        move || {
+            let mut saved = saved_generation.lock();
+            if generation < *saved {
+                return Ok(SaveReceipt {
+                    revisions: HashMap::new(),
+                });
+            }
+            if !loaded {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "task state was not loaded; refusing to overwrite daemon data",
+                ));
+            }
+            write_json_atomically(&settings_path, &settings)?;
+            write_json_atomically(&state_path, &app_state)?;
+            match daemon
+                .client()
+                .request(Uuid::nil(), Uuid::nil(), command)
+                .map_err(to_io_error)?
+            {
+                ResponsePayload::TaskStateSaved { .. } => {
+                    *saved = generation;
+                    Ok(SaveReceipt { revisions })
+                }
+                _ => Err(io::Error::other(
+                    "Waku daemon returned an invalid task save response",
+                )),
+            }
         }
-        let dirty_ids = state.dirty_sessions.clone();
-        let sessions = state
-            .sessions
-            .iter()
-            .filter(|session| dirty_ids.contains(&session.id))
-            .cloned()
-            .collect();
-        let live_session_ids = state.sessions.iter().map(|session| session.id).collect();
-        self.daemon
-            .client()
-            .notify(
-                Uuid::nil(),
-                Uuid::nil(),
-                Command::SaveTaskState {
-                    projects: state.projects.clone(),
-                    live_session_ids,
-                    sessions,
-                },
-            )
-            .map_err(to_io_error)?;
-        state.dirty_sessions.clear();
+    }
+
+    pub fn save(&self, state: &mut PersistedState) -> io::Result<()> {
+        let receipt = self.prepare_save(state)()?;
+        state.acknowledge_save(receipt);
         Ok(())
     }
 
@@ -1120,6 +1184,132 @@ fn restore_task_state_skeletons(sessions: &mut [AgentSession]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_confirmation_clears_only_the_captured_revision() {
+        let mut state = PersistedState::empty();
+        let session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let id = session.id;
+        state.push_session(session);
+        let first = SaveReceipt {
+            revisions: state.dirty_sessions.clone(),
+        };
+        state.session_mut(id).unwrap().title = "Newer title".into();
+        state.acknowledge_save(first);
+        assert!(state.is_session_dirty(id));
+        assert!(state.has_dirty_sessions());
+        let latest = SaveReceipt {
+            revisions: state.dirty_sessions.clone(),
+        };
+        state.acknowledge_save(latest);
+        assert!(!state.is_session_dirty(id));
+        assert!(!state.has_dirty_sessions());
+    }
+
+    #[test]
+    fn task_save_waits_for_ack_retains_failure_and_rejects_stale_snapshot() {
+        use waku_protocol::{
+            ClientMessage, PROTOCOL_VERSION, ResponseOutcome, RpcError, ServerMessage,
+        };
+        let root = std::env::temp_dir().join(format!("waku-save-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("ws://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let send = |socket: &mut tungstenite::WebSocket<std::net::TcpStream>,
+                        message: ServerMessage| {
+                socket
+                    .send(tungstenite::Message::Text(
+                        serde_json::to_string(&message).unwrap().into(),
+                    ))
+                    .unwrap();
+            };
+            let _hello = socket.read().unwrap();
+            send(
+                &mut socket,
+                ServerMessage::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_version: "test".into(),
+                },
+            );
+            let mut saves = 0;
+            loop {
+                let message = socket.read().unwrap();
+                let ClientMessage::Request(request) =
+                    serde_json::from_str(message.to_text().unwrap()).unwrap()
+                else {
+                    continue;
+                };
+                let outcome = match request.command {
+                    Command::GetSettings => ResponseOutcome::Ok {
+                        payload: ResponsePayload::Settings {
+                            settings: DaemonSettings::default(),
+                        },
+                    },
+                    Command::SaveTaskState { .. } => {
+                        saves += 1;
+                        if saves == 1 {
+                            ResponseOutcome::Error {
+                                error: RpcError {
+                                    message: "disk full".into(),
+                                },
+                            }
+                        } else {
+                            ResponseOutcome::Ok {
+                                payload: ResponsePayload::TaskStateSaved {
+                                    sessions: Vec::new(),
+                                },
+                            }
+                        }
+                    }
+                    _ => panic!("unexpected command"),
+                };
+                send(
+                    &mut socket,
+                    ServerMessage::Response {
+                        request_id: request.request_id,
+                        outcome,
+                    },
+                );
+                if saves == 2 {
+                    break;
+                }
+            }
+        });
+        let daemon = DaemonSupervisor::connect(&address, "test".into()).unwrap();
+        let mut store = StateStore::remote(daemon);
+        store.app_settings_path = root.join("app.json");
+        store.app_state_path = root.join("state.json");
+        store.task_state_loaded.store(true, Ordering::Release);
+        let mut state = PersistedState::fresh(root.join("project"));
+        let session = state.new_session(state.projects[0].id, ProviderKind::Codex);
+        let session_id = session.id;
+        state.push_session(session);
+        assert!(
+            store
+                .save(&mut state)
+                .unwrap_err()
+                .to_string()
+                .contains("disk full")
+        );
+        assert!(state.dirty_sessions.contains_key(&session_id));
+        let stale = store.prepare_save(&state);
+        state.sidebar_width = 310.0;
+        store.save(&mut state).unwrap();
+        assert!(state.dirty_sessions.is_empty());
+        stale().unwrap();
+        let saved: AppState =
+            serde_json::from_slice(&fs::read(&store.app_state_path).unwrap()).unwrap();
+        assert_eq!(saved.sidebar_width, 310.0);
+        server.join().unwrap();
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn desktop_settings_paths_are_build_specific() {

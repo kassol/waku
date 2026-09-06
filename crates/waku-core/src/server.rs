@@ -56,6 +56,16 @@ impl Drop for ConnectionPermit {
 pub trait Backend: Send + Sync + 'static {
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload>;
 
+    /// Commit ordered provider events and their readable history together.
+    fn persist_events(&self, _events: &[SequencedEvent]) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Drain a previous provider before the hub replaces its runtime identity.
+    fn prepare_start(&self, _session_id: Uuid) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn shutdown(&self) {}
 }
 
@@ -68,8 +78,12 @@ pub struct EventSink {
 
 impl EventSink {
     pub fn send(&self, event: WireDriverEvent) -> anyhow::Result<()> {
-        self.hub.emit(self.session_id, self.runtime_id, event, true);
-        Ok(())
+        self.send_batch(vec![event])
+    }
+
+    pub fn send_batch(&self, events: Vec<WireDriverEvent>) -> anyhow::Result<()> {
+        self.hub
+            .emit_batch(self.session_id, self.runtime_id, events, true)
     }
 
     /// Broadcast a live-only event without retaining it in the replay journal.
@@ -91,6 +105,7 @@ struct HubState {
     active_runtimes: HashMap<Uuid, Uuid>,
     next_sequences: HashMap<(Uuid, Uuid), u64>,
     journal: HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>,
+    history_persistence: HashMap<(Uuid, Uuid), ServerMessage>,
     responses: VecDeque<(Uuid, ResponseOutcome)>,
     catalog_projects: HashMap<Uuid, ProjectCatalogEntry>,
     catalog_sessions: HashMap<Uuid, SessionCatalogEntry>,
@@ -143,6 +158,7 @@ impl From<&AgentSession> for SessionCatalogEntry {
 struct Hub {
     epoch: Uuid,
     state: Mutex<HubState>,
+    backend: Option<Weak<dyn Backend>>,
 }
 
 impl Default for Hub {
@@ -150,6 +166,7 @@ impl Default for Hub {
         Self {
             epoch: Uuid::new_v4(),
             state: Mutex::new(HubState::default()),
+            backend: None,
         }
     }
 }
@@ -193,6 +210,32 @@ impl Hub {
         state
             .journal
             .retain(|(candidate, _), _| *candidate != session_id);
+        state
+            .history_persistence
+            .retain(|(candidate, _), _| *candidate != session_id);
+    }
+
+    /// A successful drain may retry the last failed commit without a new event.
+    fn confirm_drained_history(&self, session_id: Uuid, runtime_id: Option<Uuid>) {
+        let mut state = self.state.lock();
+        let confirmations = state
+            .history_persistence
+            .iter_mut()
+            .filter(|((session, runtime), _)| {
+                *session == session_id && runtime_id.is_none_or(|id| id == *runtime)
+            })
+            .filter_map(|(_, status)| {
+                let ServerMessage::HistoryPersistence { error, .. } = status else {
+                    return None;
+                };
+                error.take().map(|_| status.clone())
+            })
+            .collect::<Vec<_>>();
+        for status in confirmations {
+            state
+                .subscribers
+                .retain(|_, subscriber| subscriber.send(status.clone()).is_ok());
+        }
     }
 
     fn end_runtime(&self, session_id: Uuid, runtime_id: Option<Uuid>) {
@@ -209,36 +252,89 @@ impl Hub {
         state
             .journal
             .retain(|(candidate, _), _| *candidate != session_id);
+        state
+            .history_persistence
+            .retain(|(candidate, _), _| *candidate != session_id);
     }
 
     fn emit(&self, session_id: Uuid, runtime_id: Uuid, event: WireDriverEvent, replayable: bool) {
+        let _ = self.emit_batch(session_id, runtime_id, vec![event], replayable);
+    }
+
+    fn emit_batch(
+        &self,
+        session_id: Uuid,
+        runtime_id: Uuid,
+        events: Vec<WireDriverEvent>,
+        replayable: bool,
+    ) -> anyhow::Result<()> {
+        // This lock serializes prompt acceptance, provider output and replay.
+        // All callers run outside the UI; no event can pass a pending commit.
         let mut state = self.state.lock();
         if state.active_runtimes.get(&session_id) != Some(&runtime_id) {
-            return;
+            return Ok(());
         }
-        let sequence = state
-            .next_sequences
-            .entry((session_id, runtime_id))
-            .or_default();
-        *sequence = sequence.saturating_add(1);
-        let event = SequencedEvent {
-            session_id,
-            runtime_id,
-            epoch: self.epoch,
-            sequence: *sequence,
-            event,
-        };
-        if replayable {
-            let journal = state.journal.entry((session_id, runtime_id)).or_default();
-            journal.push_back(event.clone());
+        let mut sequenced = Vec::with_capacity(events.len());
+        for event in events {
+            let sequence = state
+                .next_sequences
+                .entry((session_id, runtime_id))
+                .or_default();
+            *sequence = sequence.saturating_add(1);
+            let event = SequencedEvent {
+                session_id,
+                runtime_id,
+                epoch: self.epoch,
+                sequence: *sequence,
+                event,
+            };
+            if replayable {
+                state
+                    .journal
+                    .entry((session_id, runtime_id))
+                    .or_default()
+                    .push_back(event.clone());
+            }
+            state.subscribers.retain(|_, subscriber| {
+                subscriber.send(ServerMessage::Event(event.clone())).is_ok()
+            });
+            sequenced.push(event);
+        }
+        let mut persistence_error = None;
+        if replayable && let Some(backend) = self.backend.as_ref().and_then(Weak::upgrade) {
+            let result = backend.persist_events(&sequenced);
+            if let Some(last) = sequenced.last() {
+                match &result {
+                    Ok(true) | Err(_) => {
+                        let message = ServerMessage::HistoryPersistence {
+                            session_id,
+                            runtime_id,
+                            epoch: self.epoch,
+                            sequence: last.sequence,
+                            error: result.as_ref().err().map(|error| format!("{error:#}")),
+                        };
+                        state
+                            .history_persistence
+                            .insert((session_id, runtime_id), message.clone());
+                        state
+                            .subscribers
+                            .retain(|_, subscriber| subscriber.send(message.clone()).is_ok());
+                    }
+                    Ok(false) => {}
+                }
+            }
+            persistence_error = result.err();
+        }
+        if let Some(error) = persistence_error {
+            return Err(error);
+        }
+        if let Some(journal) = state.journal.get_mut(&(session_id, runtime_id)) {
+            // Durable history is replayed from SQLite; this is only a hot tail.
             while journal.len() > MAX_REPLAY_EVENTS_PER_SESSION {
                 journal.pop_front();
             }
         }
-        let message = ServerMessage::Event(event);
-        state
-            .subscribers
-            .retain(|_, subscriber| subscriber.send(message.clone()).is_ok());
+        Ok(())
     }
 
     fn subscribe(&self, resume_from: &[ReplayCursor], sender: Sender<ServerMessage>) -> u64 {
@@ -255,6 +351,9 @@ impl Hub {
                 .unwrap_or_default();
             for event in events.iter().filter(|event| event.sequence > sequence) {
                 let _ = sender.send(ServerMessage::Event(event.clone()));
+            }
+            if let Some(status) = state.history_persistence.get(&(session_id, runtime_id)) {
+                let _ = sender.send(status.clone());
             }
         }
         let id = state.next_subscriber_id;
@@ -471,7 +570,10 @@ pub fn serve(
     listener
         .set_nonblocking(true)
         .context("could not configure Waku daemon listener")?;
-    let hub = Arc::new(Hub::default());
+    let hub = Arc::new(Hub {
+        backend: Some(Arc::downgrade(&backend)),
+        ..Hub::default()
+    });
     let dispatcher = Arc::new(RequestDispatcher::new(backend.clone(), hub.clone()));
     let options = Arc::new(options);
     let active_connections = Arc::new(AtomicUsize::new(0));
@@ -731,9 +833,15 @@ fn run_runtime_mailbox(
         );
         let closes_runtime = matches!(
             &dispatched.request.command,
-            Command::CloseSession | Command::CloseTerminal | Command::RemoveSession
+            Command::CloseSession
+                | Command::CloseTerminal
+                | Command::RemoveSession
+                | Command::RewindSessionToMessage { .. }
         );
-        let removes_session = matches!(&dispatched.request.command, Command::RemoveSession);
+        let removes_session = matches!(
+            &dispatched.request.command,
+            Command::RemoveSession | Command::RewindSessionToMessage { .. }
+        );
         let handled = handle_request(
             dispatched.request,
             dispatched.outgoing,
@@ -761,6 +869,10 @@ fn run_runtime_mailbox(
                 if (removes_session || active_runtime_id == Some(runtime_id))
                     && matches!(&handled.outcome, ResponseOutcome::Ok { .. })
                 {
+                    hub.confirm_drained_history(
+                        session_id,
+                        (!removes_session).then_some(runtime_id),
+                    );
                     hub.end_runtime(session_id, (!removes_session).then_some(runtime_id));
                     active_runtime_id = None;
                 }
@@ -849,10 +961,20 @@ fn handle_request(
     {
         (cached, false)
     } else {
-        if starts_runtime {
+        let prepared = if matches!(&request.command, Command::Start { .. }) {
+            backend.prepare_start(session_id)
+        } else {
+            Ok(())
+        };
+        if starts_runtime && prepared.is_ok() {
+            if matches!(&request.command, Command::Start { .. }) {
+                hub.confirm_drained_history(session_id, None);
+            }
             hub.begin_runtime(session_id, runtime_id);
         }
-        let outcome = match backend.handle(request, hub.event_sink(session_id, runtime_id)) {
+        let outcome = match prepared
+            .and_then(|_| backend.handle(request, hub.event_sink(session_id, runtime_id)))
+        {
             Ok(payload) => ResponseOutcome::Ok { payload },
             Err(error) => ResponseOutcome::Error {
                 error: RpcError::from(error),
@@ -1062,6 +1184,40 @@ mod tests {
                 _ => Ok(ResponsePayload::Ack),
             }
         }
+    }
+
+    #[test]
+    fn drained_history_retry_confirms_the_same_cursor_without_another_event() {
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        hub.begin_runtime(session_id, runtime_id);
+        let (sender, receiver) = unbounded();
+        hub.subscribe(&[], sender);
+        hub.state.lock().history_persistence.insert(
+            (session_id, runtime_id),
+            ServerMessage::HistoryPersistence {
+                session_id,
+                runtime_id,
+                epoch: hub.epoch,
+                sequence: 7,
+                error: Some("disk full".into()),
+            },
+        );
+        hub.confirm_drained_history(session_id, Some(Uuid::new_v4()));
+        assert!(receiver.try_recv().is_err());
+        hub.confirm_drained_history(session_id, Some(runtime_id));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ServerMessage::HistoryPersistence {
+                sequence: 7,
+                error: None,
+                ..
+            }
+        ));
+        assert!(hub.state.lock().next_sequences.is_empty());
+        hub.confirm_drained_history(session_id, Some(runtime_id));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -1391,6 +1547,373 @@ mod tests {
         stale_client.shutdown();
         server.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    struct HistoryBackend {
+        inner: WakuBackend,
+        sink: Mutex<Option<EventSink>>,
+    }
+
+    impl Backend for HistoryBackend {
+        fn persist_events(&self, events: &[SequencedEvent]) -> anyhow::Result<bool> {
+            self.inner.persist_events(events)
+        }
+        fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
+            if matches!(request.command, Command::Start { .. }) {
+                *self.sink.lock() = Some(events);
+                return Ok(ResponsePayload::Started {
+                    supports_steer: false,
+                });
+            }
+            self.inner.handle(request, events)
+        }
+    }
+
+    #[test]
+    fn daemon_preserves_unviewed_provider_history_across_database_reopen() {
+        let root = std::env::temp_dir().join(format!("waku-history-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = Arc::new(HistoryBackend {
+            inner: WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(root.join("app.db")),
+            )
+            .unwrap(),
+            sink: Mutex::new(None),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server_backend = backend.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                server_backend,
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+            let project = Project::from_path(root.join("workspace"));
+            let session = AgentSession::new(project.id, ProviderKind::Codex);
+            let session_id = session.id;
+            client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::SaveTaskState {
+                        projects: vec![project],
+                        live_session_ids: vec![session_id],
+                        sessions: vec![session],
+                    },
+                )
+                .unwrap();
+            let runtime_id = Uuid::new_v4();
+            client
+                .request(
+                    session_id,
+                    runtime_id,
+                    Command::Start {
+                        options: WireDriverStartOptions {
+                            provider: "codex".into(),
+                            binary: "unused".into(),
+                            cwd: root.clone(),
+                            mode: "fullAccess".into(),
+                            model: None,
+                            reasoning_effort: None,
+                            service_tier: None,
+                            context_window: None,
+                            agent_preset: None,
+                            computer_use_enabled: false,
+                            provider_cursor: None,
+                        },
+                    },
+                )
+                .unwrap();
+            let sink = backend.sink.lock().clone().unwrap();
+            // No session subscription or desktop reducer participates in this turn.
+            for event in [
+                WireDriverEvent::new(
+                    "promptSubmitted",
+                    json!({"message":"inspect", "turnId":Uuid::new_v4(), "messageId":Uuid::new_v4()}),
+                ),
+                WireDriverEvent::new("turnStarted", json!(null)),
+                WireDriverEvent::new("textDelta", json!("before")),
+                WireDriverEvent::new(
+                    "activity",
+                    json!({"id":"tool", "kind":"command", "title":"read", "detail":null, "complete":true}),
+                ),
+                WireDriverEvent::new("textDelta", json!("after")),
+                WireDriverEvent::new("turnFinished", json!({"success":true,"summary":null})),
+            ] {
+                sink.send(event).unwrap();
+            }
+            let ResponsePayload::Session {
+                session: Some(mut stale),
+            } = client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::HydrateSession { session_id },
+                )
+                .unwrap()
+            else {
+                panic!("missing saved session");
+            };
+            let saved_cursor = stale.runtime_event_cursor.unwrap();
+            stale.updated_at += 100;
+            stale.title = "renamed".into();
+            stale.messages.clear();
+            stale.transcript_blocks.clear();
+            stale.turns.clear();
+            // Even an equal cursor and a newer metadata timestamp cannot
+            // authorize a client to replace daemon-owned history.
+            client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::SaveTaskState {
+                        projects: Vec::new(),
+                        live_session_ids: vec![session_id],
+                        sessions: vec![stale],
+                    },
+                )
+                .unwrap();
+            let late = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+            let replay = late.subscribe(session_id, runtime_id);
+            let mut replayed = Vec::new();
+            loop {
+                let event = replay.recv_timeout(Duration::from_secs(2)).unwrap();
+                if event.event.kind == "historyPersistence" {
+                    assert_eq!(event.sequence, 6);
+                    break;
+                }
+                replayed.push(event.sequence);
+            }
+            assert_eq!(replayed, [1, 2, 3, 4, 5, 6]);
+            let resumed = DaemonClient::connect_with_resume(
+                &address.to_string(),
+                "secret".into(),
+                vec![ReplayCursor {
+                    session_id,
+                    runtime_id,
+                    epoch: saved_cursor.epoch,
+                    sequence: saved_cursor.sequence,
+                }],
+            )
+            .unwrap();
+            let resumed_events = resumed.subscribe(session_id, runtime_id);
+            let acknowledgment = resumed_events.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(acknowledgment.event.kind, "historyPersistence");
+            assert_eq!(acknowledgment.sequence, 6);
+            assert!(
+                resumed_events
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err()
+            );
+            let store = StateStore::daemon(root.join("app.db"));
+            let mut loaded = store.load().unwrap();
+            let restored = loaded
+                .sessions
+                .iter_mut()
+                .find(|item| item.id == session_id)
+                .expect("daemon must save a session even when no viewer reduces its events");
+            store.hydrate(restored).unwrap();
+            assert_eq!(
+                restored
+                    .messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>(),
+                ["inspect", "before", "after"]
+            );
+            assert_eq!(restored.transcript_blocks[0].after_message, 2);
+            assert_eq!(restored.title, "renamed");
+            assert_eq!(
+                restored.turns[0].status,
+                crate::model::TurnStatus::Completed
+            );
+            assert_eq!(restored.runtime_event_cursor.unwrap().sequence, 6);
+            assert_eq!(restored.history_saved_cursor, restored.runtime_event_cursor);
+            // Cross the old in-memory replay limit with real persisted events.
+            sink.send(WireDriverEvent::new("turnStarted", json!(null)))
+                .unwrap();
+            sink.send_batch(
+                (0..4_200)
+                    .map(|_| WireDriverEvent::new("textDelta", json!("x")))
+                    .collect(),
+            )
+            .unwrap();
+            let tail_client = DaemonClient::connect_with_resume(
+                &address.to_string(),
+                "secret".into(),
+                vec![ReplayCursor {
+                    session_id,
+                    runtime_id,
+                    epoch: saved_cursor.epoch,
+                    sequence: saved_cursor.sequence,
+                }],
+            )
+            .unwrap();
+            let tail = tail_client.subscribe(session_id, runtime_id);
+            let mut sequences = Vec::new();
+            loop {
+                let event = tail.recv_timeout(Duration::from_secs(5)).unwrap();
+                if event.event.kind == "historyPersistence" {
+                    break;
+                }
+                sequences.push(event.sequence);
+            }
+            assert_eq!(sequences.len(), 4_201);
+            assert_eq!(sequences.first(), Some(&7));
+            assert_eq!(sequences.last(), Some(&4_207));
+            sink.send(WireDriverEvent::new("textDelta", json!("tail")))
+                .unwrap();
+            assert_eq!(
+                tail.recv_timeout(Duration::from_secs(2)).unwrap().sequence,
+                4_208
+            );
+            assert_eq!(
+                tail.recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .event
+                    .kind,
+                "historyPersistence"
+            );
+            let ResponsePayload::Session {
+                session: Some(current),
+            } = client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::HydrateSession { session_id },
+                )
+                .unwrap()
+            else {
+                panic!("missing current history");
+            };
+            assert_eq!(
+                current.messages.last().unwrap().content,
+                format!("{}tail", "x".repeat(4_200))
+            );
+            let fault = rusqlite::Connection::open(root.join("app.db")).unwrap();
+            fault.execute_batch("CREATE TRIGGER fail_history BEFORE INSERT ON session_events BEGIN SELECT RAISE(ABORT, 'controlled history failure'); END;").unwrap();
+            assert!(
+                sink.send(WireDriverEvent::new("textDelta", json!(" unsaved")))
+                    .is_err()
+            );
+            assert_eq!(
+                tail.recv_timeout(Duration::from_secs(2)).unwrap().sequence,
+                4_209
+            );
+            let failed = tail.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(failed.event.kind, "historyPersistence");
+            assert!(
+                failed.event.payload["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("controlled history failure")
+            );
+            let failure_store = StateStore::daemon(root.join("app.db"));
+            let mut failure_state = failure_store.load().unwrap();
+            let durable = failure_state
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == session_id)
+                .unwrap();
+            failure_store.hydrate(durable).unwrap();
+            assert_eq!(
+                durable.messages.last().unwrap().content,
+                format!("{}tail", "x".repeat(4_200))
+            );
+            assert_eq!(durable.history_saved_cursor.unwrap().sequence, 4_208);
+            fault.execute_batch("DROP TRIGGER fail_history").unwrap();
+            sink.send(WireDriverEvent::new("textDelta", json!(" recovered")))
+                .unwrap();
+            assert_eq!(
+                tail.recv_timeout(Duration::from_secs(2)).unwrap().sequence,
+                4_210
+            );
+            let recovered = tail.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(recovered.event.payload["error"].is_null());
+            let ResponsePayload::Session {
+                session: Some(current),
+            } = client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::HydrateSession { session_id },
+                )
+                .unwrap()
+            else {
+                panic!("missing recovered history");
+            };
+            assert_eq!(
+                current.messages.last().unwrap().content,
+                format!("{}tail unsaved recovered", "x".repeat(4_200))
+            );
+            assert_eq!(current.history_saved_cursor.unwrap().sequence, 4_210);
+            let reopened_backend = WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(root.join("app.db")),
+            )
+            .unwrap();
+            let mut stale = current.clone();
+            stale.runtime_event_cursor = None;
+            stale.history_saved_cursor = None;
+            stale.updated_at += 100;
+            stale.messages.clear();
+            stale.turns.clear();
+            stale.transcript_blocks.clear();
+            reopened_backend
+                .handle(
+                    Request {
+                        request_id: Uuid::new_v4(),
+                        session_id: Uuid::nil(),
+                        runtime_id: Uuid::nil(),
+                        command: Command::SaveTaskState {
+                            projects: Vec::new(),
+                            live_session_ids: vec![session_id],
+                            sessions: vec![stale],
+                        },
+                    },
+                    sink.clone(),
+                )
+                .unwrap();
+            let ResponsePayload::Session {
+                session: Some(reopened),
+            } = reopened_backend
+                .handle(
+                    Request {
+                        request_id: Uuid::new_v4(),
+                        session_id: Uuid::nil(),
+                        runtime_id: Uuid::nil(),
+                        command: Command::HydrateSession { session_id },
+                    },
+                    sink,
+                )
+                .unwrap()
+            else {
+                panic!("missing history after backend reopen");
+            };
+            assert_eq!(
+                reopened.messages.last().unwrap().content,
+                current.messages.last().unwrap().content
+            );
+            assert_eq!(reopened.history_saved_cursor, current.history_saved_cursor);
+        }));
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+        result.unwrap();
     }
 
     #[test]
@@ -1892,6 +2415,56 @@ mod tests {
         assert_eq!(event.sequence, 1);
         assert_eq!(event.event.kind, "new");
         assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn replacing_runtime_drains_old_history_before_changing_its_identity() {
+        struct DrainingBackend(EventSink);
+        impl Backend for DrainingBackend {
+            fn prepare_start(&self, _: Uuid) -> anyhow::Result<()> {
+                self.0.send(WireDriverEvent::new(
+                    "processExited",
+                    serde_json::Value::Null,
+                ))
+            }
+            fn handle(&self, _: Request, _: EventSink) -> anyhow::Result<ResponsePayload> {
+                Ok(ResponsePayload::Started {
+                    supports_steer: false,
+                })
+            }
+        }
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let old_runtime = Uuid::new_v4();
+        let new_runtime = Uuid::new_v4();
+        let (outgoing, received) = unbounded();
+        hub.subscribe(&[], outgoing.clone());
+        hub.begin_runtime(session_id, old_runtime);
+        let backend = Arc::new(DrainingBackend(hub.event_sink(session_id, old_runtime)));
+        let result = handle_request(
+            Request {
+                request_id: Uuid::new_v4(),
+                session_id,
+                runtime_id: new_runtime,
+                command: Command::Start {
+                    options: test_start_options(),
+                },
+            },
+            outgoing,
+            0,
+            backend,
+            hub.clone(),
+        );
+        assert!(matches!(result.outcome, ResponseOutcome::Ok { .. }));
+        let ServerMessage::Event(exit) = received.recv().unwrap() else {
+            panic!("missing final old-runtime event")
+        };
+        assert_eq!(exit.runtime_id, old_runtime);
+        assert_eq!(exit.event.kind, "processExited");
+        assert_eq!(
+            hub.state.lock().active_runtimes.get(&session_id),
+            Some(&new_runtime)
+        );
     }
 
     #[test]

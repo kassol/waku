@@ -3,6 +3,8 @@ import type {
   ActivityKind,
   AgentSession,
   ProviderResumeCursor,
+  PendingPermission,
+  UserInputRequest,
   ReportedCommand,
   SequencedEvent,
   ThreadGoal,
@@ -10,23 +12,8 @@ import type {
   TurnStatus,
 } from './generated'
 
-export interface PendingPermission {
-  requestId: string
-  title: string
-  detail: string
-  options: Array<{ id: string; label: string; allow: boolean }>
-}
-
-export interface PendingUserInput {
-  requestId: string
-  questions: Array<{
-    id: string
-    header: string
-    question: string
-    options: Array<{ label: string; description?: string }>
-    multiSelect: boolean
-  }>
-}
+export type { PendingPermission } from './generated'
+export type PendingUserInput = UserInputRequest
 
 export interface RuntimeEventResult {
   session: AgentSession
@@ -63,6 +50,22 @@ export function reduceRuntimeEvent(
     removeRuntime: false,
   }
 
+  if (kind === 'historyPersistence') {
+    const error = (payload as { error?: string | null }).error ?? null
+    const applied = session.runtime_event_cursor
+    const saved = session.history_saved_cursor
+    const belongsToCurrent = !applied || (applied.runtime_id === wire.runtimeId && applied.epoch === wire.epoch)
+    const notOlder = !saved || saved.runtime_id !== wire.runtimeId || saved.epoch !== wire.epoch || saved.sequence <= wire.sequence
+    if (belongsToCurrent && notOlder) {
+      if (error) session.history_save_error = error
+      else {
+        session.history_saved_cursor = { runtime_id: wire.runtimeId, epoch: wire.epoch, sequence: wire.sequence }
+        if (!applied || wire.sequence >= applied.sequence) session.history_save_error = undefined
+      }
+    }
+    return result
+  }
+
   session.runtime_event_cursor = {
     runtime_id: wire.runtimeId,
     epoch: wire.epoch,
@@ -70,6 +73,22 @@ export function reduceRuntimeEvent(
   }
 
   switch (kind) {
+    case 'cancelRequested':
+      result.settled = settleTurn(session, 'interrupted', 'Stopped.', clock)
+      if (result.settled) session.status = 'idle'
+      result.permission = null
+      result.userInput = null
+      break
+    case 'interactionResponded': {
+      const requestId = asRecord(payload)?.request_id
+      if (session.pending_permission?.requestId === requestId) delete session.pending_permission
+      if (session.pending_user_input?.requestId === requestId) delete session.pending_user_input
+      if (activeTurn(session) && session.status === 'waiting'
+        && !session.pending_permission && !session.pending_user_input) session.status = 'working'
+      result.permission = session.pending_permission ?? null
+      result.userInput = session.pending_user_input ?? null
+      break
+    }
     case 'connected':
       session.provider_cursor = (payload as ProviderResumeCursor | null) ?? null
       if (
@@ -194,6 +213,7 @@ export function reduceRuntimeEvent(
           ? value.options.filter(isPermissionOption)
           : [],
       }
+      session.pending_permission = result.permission
       session.status = 'waiting'
       break
     }
@@ -205,6 +225,7 @@ export function reduceRuntimeEvent(
         : []
       if (!questions.length) break
       result.userInput = { requestId: value.requestId, questions }
+      session.pending_user_input = result.userInput
       session.status = 'waiting'
       break
     }
@@ -298,6 +319,12 @@ export function reduceRuntimeEvent(
       break
   }
 
+  if (['cancelRequested', 'turnParked', 'turnFinished', 'processExited'].includes(kind)) {
+    delete session.pending_permission
+    delete session.pending_user_input
+    result.permission = null
+    result.userInput = null
+  }
   session.updated_at = clock.nowSeconds()
   return result
 }
@@ -629,4 +656,30 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
+}
+
+/** Retain a terminal subscription until the daemon reports its save outcome. */
+export function reduceRuntimeEventAfterPersistence(
+  current: AgentSession,
+  wire: SequencedEvent,
+  state: { pendingExit: SequencedEvent | null },
+  clock: ReducerClock = defaultClock,
+  processExitError: string | null = null,
+): RuntimeEventResult | null {
+  if (wire.event.kind === 'processExited') {
+    const saved = current.history_saved_cursor
+    if (!saved || saved.runtime_id !== wire.runtimeId || saved.epoch !== wire.epoch || saved.sequence < wire.sequence) {
+      state.pendingExit = wire
+      return null
+    }
+  }
+  const result = reduceRuntimeEvent(current, wire, clock, processExitError)
+  const exit = state.pendingExit
+  if (wire.event.kind === 'historyPersistence' && exit
+    && wire.runtimeId === exit.runtimeId && wire.epoch === exit.epoch
+    && wire.sequence >= exit.sequence) {
+    state.pendingExit = null
+    return reduceRuntimeEvent(result.session, exit, clock, processExitError)
+  }
+  return result
 }

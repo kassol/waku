@@ -13,6 +13,21 @@ fn new_task_runtime_mode(current: Option<&AgentSession>, remembered: RuntimeMode
         .unwrap_or(remembered)
 }
 
+/// Fill a catalog entry only while it still needs its transcript. A runtime
+/// attachment may already have hydrated it and applied newer provider events.
+fn apply_session_hydration(sessions: &mut [AgentSession], hydrated: AgentSession) -> bool {
+    let Some(existing) = sessions
+        .iter_mut()
+        .find(|session| session.id == hydrated.id)
+    else {
+        return false;
+    };
+    if !existing.detail_loaded {
+        *existing = hydrated;
+    }
+    true
+}
+
 impl Waku {
     pub(crate) fn open_task_from_notification(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
         self.select_session(session_id, cx);
@@ -125,24 +140,14 @@ impl Waku {
                 waku.session_hydrations.remove(&session_id);
                 match result {
                     Ok(session) => {
-                        let replaced = if let Some(existing) = waku
-                            .state
-                            .sessions
-                            .iter_mut()
-                            .find(|existing| existing.id == session_id)
-                        {
-                            *existing = session;
-                            true
-                        } else {
-                            false
-                        };
+                        let available = apply_session_hydration(&mut waku.state.sessions, session);
                         let pending = waku
                             .pending_session_activation
                             .filter(|pending| pending.session_id == session_id);
                         if pending.is_some() {
                             waku.pending_session_activation = None;
                         }
-                        if replaced && let Some(pending) = pending {
+                        if available && let Some(pending) = pending {
                             waku.finish_session_activation(session_id, pending.transition, cx);
                         } else if waku.state.selected_session == Some(session_id) {
                             waku.reset_visible_state();
@@ -1642,6 +1647,50 @@ impl Waku {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_hydration_preserves_the_reply_and_saved_cursor_received_while_loading() {
+        use crate::model::RuntimeEventCursor;
+        use waku_protocol::history::HistoryReducer;
+
+        let mut loaded = AgentSession::new(Uuid::new_v4(), ProviderKind::Claude);
+        let mut history = HistoryReducer::default();
+        history.apply(&mut loaded, DriverEvent::TurnStarted);
+        history.apply(&mut loaded, DriverEvent::TextDelta("Initial reply".into()));
+        let mut catalog = vec![loaded.list_projection()];
+        catalog[0].detail_loaded = false;
+        assert!(apply_session_hydration(&mut catalog, loaded.clone()));
+        assert_eq!(catalog[0].messages[0].content, "Initial reply");
+        assert!(catalog[0].detail_loaded);
+
+        history.apply(
+            &mut catalog[0],
+            DriverEvent::TextDelta(" and new output".into()),
+        );
+        let cursor = RuntimeEventCursor {
+            runtime_id: Uuid::new_v4(),
+            epoch: Uuid::new_v4(),
+            sequence: 2,
+        };
+        history.apply(
+            &mut catalog[0],
+            DriverEvent::RuntimeEventCursorAdvanced(cursor),
+        );
+        history.apply(
+            &mut catalog[0],
+            DriverEvent::HistoryPersistence {
+                cursor,
+                error: None,
+            },
+        );
+        assert!(apply_session_hydration(&mut catalog, loaded));
+        assert_eq!(
+            catalog[0].messages[0].content,
+            "Initial reply and new output"
+        );
+        assert_eq!(catalog[0].runtime_event_cursor, Some(cursor));
+        assert_eq!(catalog[0].history_saved_cursor, Some(cursor));
+    }
 
     #[test]
     fn new_task_carries_the_current_tasks_access_mode() {

@@ -10,7 +10,6 @@ import {
 
 const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 const OPEN = 1;
-const MAX_BUFFERED_EVENTS_PER_RUNTIME = 4096;
 
 export type EventListener = (event: SequencedEvent) => void;
 export type WakuConnectionState = "disconnected" | "connecting" | "connected";
@@ -113,6 +112,7 @@ export class WakuClient {
   private taskStateListeners = new Set<(revision: number) => void>();
   private connectionStateListeners = new Set<ConnectionStateListener>();
   private sequences = new Map<string, LastSequence>();
+  private resumeSequences = new Map<string, LastSequence>();
   private connectionGeneration = 0;
   private rejectConnect?: (error: Error) => void;
   private receivedAt = 0;
@@ -168,6 +168,7 @@ export class WakuClient {
       return Promise.reject(new Error("Waku client is already connecting"));
     }
 
+    this.resumeSequences = new Map(this.sequences);
     this.setConnectionState("connecting");
     const generation = ++this.connectionGeneration;
     let socket: WebSocketLike;
@@ -345,21 +346,69 @@ export class WakuClient {
     this.requireSocket().send(JSON.stringify(message));
   }
 
-  subscribe(sessionId: string, runtimeId: string, listener: EventListener): () => void {
+  subscribe(sessionId: string, runtimeId: string, listener: EventListener, cursor?: LastSequence): () => void {
     const key = subscriptionKey(sessionId, runtimeId);
+    let applied = cursor ?? this.resumeSequences.get(key);
+    let replaying = false;
+    let active = true;
+    const backlog: SequencedEvent[] = [];
+    const deliver = (event: SequencedEvent) => {
+      if (!active) return;
+      if (event.event.kind !== "historyPersistence") {
+        if (applied?.epoch === event.epoch && event.sequence <= applied.sequence) return;
+        applied = { epoch: event.epoch, sequence: event.sequence };
+      }
+      listener(event);
+    };
+    const missing = (event: SequencedEvent) => event.event.kind === "historyPersistence" ? event.sequence : event.sequence - 1;
+    const previous = (event: SequencedEvent) => applied?.epoch === event.epoch ? applied.sequence : 0;
+    const replay = async () => {
+      try {
+        while (active && backlog.length) {
+          const event = backlog[0]!;
+          while (active && previous(event) < missing(event) && !event.event.kind.startsWith("terminal")) {
+            const response = await this.request({ type: "replayEvents", cursor: { sessionId, runtimeId, epoch: event.epoch, sequence: previous(event) } }, sessionId, runtimeId);
+            if (response.type !== "eventReplay" || response.events[0]?.sequence !== previous(event) + 1) throw new Error("saved history replay is incomplete");
+            for (const entry of response.events) { if (entry.sequence > missing(event)) break; deliver(entry); }
+          }
+          deliver(event);
+          backlog.shift();
+        }
+      } catch (error) {
+        if (this.connected) {
+          const event = backlog[0];
+          if (active) listener({ sessionId, runtimeId, epoch: applied?.epoch ?? event?.epoch ?? NIL_UUID, sequence: applied?.sequence ?? 0, event: { kind: "error", payload: asError(error).message } });
+          backlog.length = 0;
+        }
+      } finally { replaying = false; }
+    };
+    const receive: EventListener = (event) => {
+      if (replaying) { backlog.push(event); return; }
+      if (previous(event) < missing(event) && !event.event.kind.startsWith("terminal")) {
+        backlog.push(event);
+        replaying = true;
+        void replay();
+      } else deliver(event);
+    };
     let listeners = this.subscriptions.get(key);
-    if (!listeners) {
-      listeners = new Set();
-      this.subscriptions.set(key, listeners);
-    }
-    listeners.add(listener);
+    if (!listeners) { listeners = new Set(); this.subscriptions.set(key, listeners); }
+    listeners.add(receive);
+    const resumeReplay = (state: WakuConnectionState) => {
+      if (state === "connected" && active && backlog.length && !replaying) {
+        replaying = true;
+        void replay();
+      }
+    };
+    this.connectionStateListeners.add(resumeReplay);
     const buffered = this.pendingEvents.get(key);
     if (buffered) {
       this.pendingEvents.delete(key);
-      for (const event of buffered) listener(event);
+      for (const event of buffered) receive(event);
     }
     return () => {
-      listeners?.delete(listener);
+      active = false;
+      this.connectionStateListeners.delete(resumeReplay);
+      listeners?.delete(receive);
       if (listeners?.size === 0) this.subscriptions.delete(key);
     };
   }
@@ -436,9 +485,22 @@ export class WakuClient {
       } else {
         const buffered = this.pendingEvents.get(key) ?? [];
         buffered.push(message);
-        if (buffered.length > MAX_BUFFERED_EVENTS_PER_RUNTIME) {
-          buffered.splice(0, buffered.length - MAX_BUFFERED_EVENTS_PER_RUNTIME);
+        if (message.event.kind.startsWith("terminal") && buffered.length > 4096) buffered.splice(0, buffered.length - 4096);
+        this.pendingEvents.set(key, buffered);
+      }
+      return;
+    }
+    if (message.type === "historyPersistence") {
+      const event: SequencedEvent = { ...message, event: { kind: "historyPersistence", payload: { error: message.error } } };
+      const key = subscriptionKey(message.sessionId, message.runtimeId);
+      const listeners = this.subscriptions.get(key);
+      if (listeners?.size) for (const listener of listeners) listener(event);
+      else {
+        const buffered = this.pendingEvents.get(key) ?? [];
+        if (message.error === null) {
+          while (buffered.length >= 4096 && buffered[0]?.epoch === message.epoch && buffered[0].sequence <= message.sequence) buffered.shift();
         }
+        buffered.push(event);
         this.pendingEvents.set(key, buffered);
       }
       return;

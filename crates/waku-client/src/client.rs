@@ -21,7 +21,6 @@ use waku_protocol::{
 
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_BUFFERED_EVENTS_PER_RUNTIME: usize = 4096;
 
 enum Outgoing {
     Message(ClientMessage),
@@ -36,6 +35,7 @@ struct ClientInner {
     task_state_subscribers: Mutex<Vec<Sender<u64>>>,
     last_sequences: Mutex<HashMap<(Uuid, Uuid), LastSequence>>,
     disconnected: AtomicBool,
+    resume_sequences: HashMap<(Uuid, Uuid), LastSequence>,
 }
 
 #[derive(Clone, Copy)]
@@ -59,7 +59,7 @@ impl DaemonClient {
         token: String,
         resume_from: Vec<ReplayCursor>,
     ) -> anyhow::Result<Self> {
-        let last_sequences = resume_from
+        let last_sequences: HashMap<_, _> = resume_from
             .iter()
             .map(|cursor| {
                 (
@@ -110,6 +110,7 @@ impl DaemonClient {
             sessions: Mutex::new(HashMap::new()),
             pending_events: Mutex::new(HashMap::new()),
             task_state_subscribers: Mutex::new(Vec::new()),
+            resume_sequences: last_sequences.clone(),
             last_sequences: Mutex::new(last_sequences),
             disconnected: AtomicBool::new(false),
         });
@@ -122,18 +123,131 @@ impl DaemonClient {
     }
 
     pub fn subscribe(&self, session_id: Uuid, runtime_id: Uuid) -> Receiver<SequencedEvent> {
-        let (events, receiver) = unbounded();
+        let cursor = self
+            .inner
+            .resume_sequences
+            .get(&(session_id, runtime_id))
+            .map(|cursor| waku_protocol::model::RuntimeEventCursor {
+                runtime_id,
+                epoch: cursor.epoch,
+                sequence: cursor.sequence,
+            });
+        self.subscribe_after(session_id, runtime_id, cursor)
+    }
+
+    /// Register live delivery before filling a missing persisted prefix. The
+    /// caller receives one ordered stream, while replay stays off its thread.
+    pub fn subscribe_after(
+        &self,
+        session_id: Uuid,
+        runtime_id: Uuid,
+        cursor: Option<waku_protocol::model::RuntimeEventCursor>,
+    ) -> Receiver<SequencedEvent> {
+        let (live, incoming) = unbounded();
+        let (output, receiver) = unbounded();
         let key = (session_id, runtime_id);
-        let mut sessions = self.inner.sessions.lock();
-        sessions.insert(key, events.clone());
-        // Keep the subscription lock while draining the pre-subscription
-        // replay queue. The socket thread takes these locks in the same order,
-        // so a new live event cannot overtake older replayed events here.
-        if let Some(buffered) = self.inner.pending_events.lock().remove(&key) {
-            for event in buffered {
-                let _ = events.send(event);
+        {
+            let mut sessions = self.inner.sessions.lock();
+            sessions.insert(key, live.clone());
+            if let Some(buffered) = self.inner.pending_events.lock().remove(&key) {
+                for event in buffered {
+                    let _ = live.send(event);
+                }
             }
         }
+        drop(live);
+        let client = self.clone();
+        std::thread::spawn(move || {
+            let mut applied = cursor.map(|cursor| LastSequence {
+                epoch: cursor.epoch,
+                sequence: cursor.sequence,
+            });
+            while let Ok(event) = incoming.recv() {
+                let previous = applied
+                    .filter(|previous| previous.epoch == event.epoch)
+                    .map_or(0, |previous| previous.sequence);
+                let persistence = event.event.kind == "historyPersistence";
+                let missing_until = if persistence {
+                    event.sequence
+                } else {
+                    event.sequence.saturating_sub(1)
+                };
+                if missing_until > previous && !event.event.kind.starts_with("terminal") {
+                    let mut after = previous;
+                    while after < missing_until {
+                        let replay = client.request(
+                            session_id,
+                            runtime_id,
+                            Command::ReplayEvents {
+                                cursor: ReplayCursor {
+                                    session_id,
+                                    runtime_id,
+                                    epoch: event.epoch,
+                                    sequence: after,
+                                },
+                            },
+                        );
+                        let page = match replay {
+                            Ok(ResponsePayload::EventReplay { events }) => events,
+                            other => {
+                                if client.is_disconnected() {
+                                    return;
+                                }
+                                let error = match other {
+                                    Err(error) => error.to_string(),
+                                    _ => "daemon returned invalid history replay".into(),
+                                };
+                                let _ = output.send(SequencedEvent {
+                                    event: waku_protocol::WireDriverEvent::new(
+                                        "error",
+                                        serde_json::json!(error),
+                                    ),
+                                    ..event
+                                });
+                                return;
+                            }
+                        };
+                        if page.first().is_none_or(|entry| entry.sequence != after + 1) {
+                            let _ = output.send(SequencedEvent {
+                                event: waku_protocol::WireDriverEvent::new(
+                                    "error",
+                                    serde_json::json!("saved history replay is incomplete"),
+                                ),
+                                ..event
+                            });
+                            return;
+                        }
+                        for replayed in page
+                            .into_iter()
+                            .take_while(|entry| entry.sequence <= missing_until)
+                        {
+                            after = replayed.sequence;
+                            applied = Some(LastSequence {
+                                epoch: replayed.epoch,
+                                sequence: after,
+                            });
+                            if output.send(replayed).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                let previous = applied
+                    .filter(|previous| previous.epoch == event.epoch)
+                    .map_or(0, |previous| previous.sequence);
+                if persistence || event.sequence > previous {
+                    if !persistence {
+                        applied = Some(LastSequence {
+                            epoch: event.epoch,
+                            sequence: event.sequence,
+                        });
+                    }
+                    if output.send(event).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
         receiver
     }
 
@@ -317,11 +431,51 @@ fn run_client(
                             } else {
                                 let mut pending = inner.pending_events.lock();
                                 let buffered = pending.entry(key).or_default();
+                                let ephemeral = event.event.kind.starts_with("terminal");
                                 buffered.push_back(event);
-                                while buffered.len() > MAX_BUFFERED_EVENTS_PER_RUNTIME {
+                                if ephemeral {
+                                    while buffered.len() > 4096 {
+                                        buffered.pop_front();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ServerMessage::HistoryPersistence {
+                        session_id,
+                        runtime_id,
+                        epoch,
+                        sequence,
+                        error,
+                    } => {
+                        let saved = error.is_none();
+                        let event = SequencedEvent {
+                            session_id,
+                            runtime_id,
+                            epoch,
+                            sequence,
+                            event: waku_protocol::WireDriverEvent::new(
+                                "historyPersistence",
+                                serde_json::json!({ "error": error }),
+                            ),
+                        };
+                        let key = (session_id, runtime_id);
+                        let sessions = inner.sessions.lock();
+                        if let Some(events) = sessions.get(&key) {
+                            let _ = events.send(event);
+                        } else {
+                            let mut pending = inner.pending_events.lock();
+                            let buffered = pending.entry(key).or_default();
+                            if saved {
+                                while buffered.len() >= 4096
+                                    && buffered.front().is_some_and(|entry| {
+                                        entry.epoch == epoch && entry.sequence <= sequence
+                                    })
+                                {
                                     buffered.pop_front();
                                 }
                             }
+                            buffered.push_back(event);
                         }
                     }
                     ServerMessage::TaskStateChanged { revision } => {

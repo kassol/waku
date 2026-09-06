@@ -43,6 +43,7 @@ import {
 } from './provider-probe-cache'
 import {
   reduceRuntimeEvent,
+  reduceRuntimeEventAfterPersistence,
   type PendingPermission,
   type PendingUserInput,
 } from './event-reducer'
@@ -54,6 +55,7 @@ interface RuntimeSummary {
 }
 
 interface RuntimeEntry extends RuntimeSummary {
+  pendingExit: SequencedEvent | null
   lastDriverError: string | null
   unsubscribe: () => void
 }
@@ -443,9 +445,14 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         supportsSteer: false,
         starting: true,
         lastDriverError: null,
+        pendingExit: null,
         unsubscribe: () => {},
       }
       entries.current.set(session.id, entry)
+      if (session.runtime_event_cursor?.runtime_id === runtimeId) {
+        setPermissions((current) => ({ ...current, [session.id]: session.pending_permission ?? undefined }))
+        setUserInputs((current) => ({ ...current, [session.id]: session.pending_user_input ?? undefined }))
+      }
       setRuntimes((current) => ({ ...current, [session.id]: publicRuntime(entry) }))
       const unsubscribe = client.subscribe(session.id, runtimeId, (event) => {
         const key = daemonKeys.session(config.address, session.id)
@@ -509,7 +516,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             toast.error(translate(localeRef.current, 'session.steer_rejected_plain'))
           }
         }
-        const result = reduceRuntimeEvent(current, event, undefined, entry.lastDriverError)
+        const result = reduceRuntimeEventAfterPersistence(current, event, entry, undefined, entry.lastDriverError)
+        if (!result) return
         cacheSession(result.session)
         scheduleProjectionPersist(session.id)
         if (result.permission !== undefined) {
@@ -551,7 +559,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           finishSettledTurn(result.session)
         }
         if (result.removeRuntime) removeRuntime(session.id)
-      })
+      }, session.runtime_event_cursor?.runtime_id === runtimeId ? session.runtime_event_cursor : undefined)
       if (entries.current.get(session.id) === entry) {
         entry.unsubscribe = unsubscribe
       } else {
@@ -1403,10 +1411,13 @@ function mergeSessionSummary(previous: AgentSession, next: AgentSession): AgentS
     provider_cursor: next.provider_cursor,
     context_usage: next.context_usage,
     runtime_event_cursor: next.runtime_event_cursor,
+    history_saved_cursor: next.history_saved_cursor,
+    history_save_error: next.history_save_error,
   }
 }
 
 function runtimeEventAlreadyApplied(session: AgentSession, event: SequencedEvent) {
+  if (event.event.kind === 'historyPersistence') return false
   const cursor = session.runtime_event_cursor
   return Boolean(
     cursor

@@ -99,7 +99,9 @@ fn connect_remote(
         .name(format!("waku-daemon-session-{session_id}"))
         .spawn(move || {
             let mut client = thread_initial_client;
-            let mut remote_events = client.subscribe(session_id, runtime_id);
+            let mut replay_cursor = replay_cursor;
+            let mut pending_exit = None;
+            let mut remote_events = client.subscribe_after(session_id, runtime_id, replay_cursor);
             loop {
                 let disconnected = loop {
                     select! {
@@ -108,7 +110,8 @@ fn connect_remote(
                             let Ok(sequenced) = sequenced else {
                                 break true;
                             };
-                            if replay_cursor.is_some_and(|cursor| {
+                            let persistence = sequenced.event.kind == "historyPersistence";
+                            if !persistence && replay_cursor.is_some_and(|cursor| {
                                 cursor.runtime_id == sequenced.runtime_id
                                     && cursor.epoch == sequenced.epoch
                                     && cursor.sequence >= sequenced.sequence
@@ -120,13 +123,27 @@ fn connect_remote(
                                 epoch: sequenced.epoch,
                                 sequence: sequenced.sequence,
                             };
+                            if persistence {
+                                let error = sequenced.event.payload.get("error").and_then(serde_json::Value::as_str).map(str::to_owned);
+                                let exit_saved = pending_exit.as_ref().is_some_and(|(_, exit_cursor): &(DriverEvent, RuntimeEventCursor)| exit_cursor.runtime_id == cursor.runtime_id && exit_cursor.epoch == cursor.epoch && exit_cursor.sequence <= cursor.sequence);
+                                if exit_saved && forwarding_events.send(DriverEvent::RuntimeEventCursorAdvanced(cursor)).is_err() { return; }
+                                if forwarding_events.send(DriverEvent::HistoryPersistence { cursor, error }).is_err() { return; }
+                                if exit_saved && let Some((event, _)) = pending_exit.take() {
+                                    let _ = forwarding_events.send(event);
+                                    break false;
+                                }
+                                continue;
+                            }
                             let event = match waku_client::event_from_wire(sequenced.event) {
                                 Ok(event) => event,
                                 Err(error) => DriverEvent::Error(format!(
                                     "Waku daemon sent an invalid event: {error}"
                                 )),
                             };
-                            let process_exited = matches!(&event, DriverEvent::ProcessExited);
+                            if matches!(&event, DriverEvent::ProcessExited) {
+                                pending_exit = Some((event, cursor));
+                                continue;
+                            }
                             if forwarding_events.send(event).is_err()
                                 || forwarding_events
                                     .send(DriverEvent::RuntimeEventCursorAdvanced(cursor))
@@ -134,9 +151,8 @@ fn connect_remote(
                             {
                                 return;
                             }
-                            if process_exited {
-                                break false;
-                            }
+                            replay_cursor = Some(cursor);
+
                         }
                     }
                 };
@@ -174,7 +190,7 @@ fn connect_remote(
                     }) if attached_runtime_id == runtime_id => {
                         *forwarding_client.lock() = replacement.clone();
                         client = replacement;
-                        remote_events = client.subscribe(session_id, runtime_id);
+                        remote_events = client.subscribe_after(session_id, runtime_id, replay_cursor);
                     }
                     Ok(waku_client::ResponsePayload::SessionRuntime { .. }) => {
                         let _ = forwarding_events.send(DriverEvent::ProcessExited);

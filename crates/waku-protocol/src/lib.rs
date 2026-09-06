@@ -2,7 +2,7 @@
 
 //! Waku's shared, versioned wire contract.
 //!
-//! This crate contains serializable data only. It performs no provider,
+//! This crate contains serializable data and pure projection logic. It performs no provider,
 //! database, workspace, Git, attachment, or transport I/O, so native and web
 //! clients can depend on it without pulling in the daemon implementation.
 
@@ -33,6 +33,7 @@ pub mod composer;
 pub mod computer_use;
 mod driver_wire;
 pub mod git;
+pub mod history;
 pub mod i18n;
 pub mod identity;
 pub mod model;
