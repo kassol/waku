@@ -3,6 +3,7 @@ import type { AgentSession } from "./AgentSession";
 import type { AttachmentUpload } from "./AttachmentUpload";
 import type { ComposerDraftChange } from "./ComposerDraftChange";
 import type { ComposerDrafts } from "./ComposerDrafts";
+import type { CreationWorkspace } from "./CreationWorkspace";
 import type { DaemonSettings } from "./DaemonSettings";
 import type { GoalOperation } from "./GoalOperation";
 import type { Project } from "./Project";
@@ -19,7 +20,7 @@ import type { WireSessionOptions } from "./WireSessionOptions";
 import type { WorkspaceOperation } from "./WorkspaceOperation";
 import type { JsonValue } from "./serde_json/JsonValue";
 
-export type Command = { "type": "createSession", provider: ProviderKind, prompt: string, model: string | null, title: string | null, runtimeMode: RuntimeMode | null, } | { "type": "prepareShutdown" } | { "type": "shutdownDaemon" } | { "type": "attachSession" } | { "type": "start", options: WireDriverStartOptions, } | { "type": "prompt", prompt: string,
+export type Command = { "type": "createSession", provider: ProviderKind, prompt: string, model: string | null, title: string | null, runtimeMode: RuntimeMode | null, idempotencyKey: string | null, workspace: CreationWorkspace, } | { "type": "prepareShutdown" } | { "type": "shutdownDaemon" } | { "type": "attachSession" } | { "type": "start", options: WireDriverStartOptions, } | { "type": "prompt", prompt: string,
 /**
  * The ids the submitting client already gave this turn and its user
  * message. The daemon republishes them with the submission so every

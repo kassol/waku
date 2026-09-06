@@ -843,6 +843,21 @@ struct Storage {
     saved_app_state: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct CreationRecord {
+    pub id: Uuid,
+    pub manager_session_id: Uuid,
+    pub idempotency_key: Option<String>,
+    pub command: crate::protocol::Command,
+    pub project_id: Uuid,
+    pub session: Option<AgentSession>,
+    pub runtime_id: Option<Uuid>,
+    pub workspace_path: Option<PathBuf>,
+    pub branch: Option<String>,
+    pub stage: crate::protocol::CreationStage,
+    pub outcome: Option<crate::protocol::ResponseOutcome>,
+}
+
 pub struct StateStore {
     path: PathBuf,
     /// Client-local navigation and layout state stored beside the preview
@@ -960,6 +975,55 @@ impl StateStore {
             .map_err(to_io_error)?;
         apply_migrations(&connection)?;
         Ok(connection)
+    }
+
+    pub(crate) fn claim_creation(
+        &self,
+        record: CreationRecord,
+    ) -> io::Result<(CreationRecord, bool)> {
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(to_io_error)?;
+        if let Some(key) = &record.idempotency_key {
+            let existing: Option<String> = transaction.query_row(
+                "SELECT data FROM session_creations WHERE manager_session_id = ?1 AND idempotency_key = ?2",
+                params![record.manager_session_id.to_string(), key], |row| row.get(0),
+            ).optional().map_err(to_io_error)?;
+            if let Some(data) = existing {
+                return Ok((serde_json::from_str(&data).map_err(to_io_error)?, false));
+            }
+        }
+        transaction.execute("INSERT INTO session_creations(id, manager_session_id, idempotency_key, data, complete) VALUES(?1, ?2, ?3, ?4, 0)", params![record.id.to_string(), record.manager_session_id.to_string(), record.idempotency_key, serde_json::to_string(&record).map_err(to_io_error)?]).map_err(to_io_error)?;
+        transaction.commit().map_err(to_io_error)?;
+        Ok((record, true))
+    }
+
+    pub(crate) fn unfinished_creations(&self) -> io::Result<Vec<CreationRecord>> {
+        let connection = self.open()?;
+        let mut query = connection
+            .prepare("SELECT data FROM session_creations WHERE complete = 0")
+            .map_err(to_io_error)?;
+        query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(to_io_error)?
+            .map(|data| serde_json::from_str(&data.map_err(to_io_error)?).map_err(to_io_error))
+            .collect()
+    }
+
+    pub(crate) fn save_creation(&self, record: &CreationRecord) -> io::Result<()> {
+        let connection = self.open()?;
+        connection
+            .execute(
+                "UPDATE session_creations SET data = ?2, complete = ?3 WHERE id = ?1",
+                params![
+                    record.id.to_string(),
+                    serde_json::to_string(record).map_err(to_io_error)?,
+                    record.outcome.is_some()
+                ],
+            )
+            .map_err(to_io_error)?;
+        Ok(())
     }
 
     pub fn load_or_fresh(&self, cwd: PathBuf) -> PersistedState {

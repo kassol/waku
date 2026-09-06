@@ -20,6 +20,9 @@ struct SpawnArguments {
     model: Option<String>,
     title: Option<String>,
     runtime_mode: Option<RuntimeMode>,
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    workspace: crate::protocol::CreationWorkspace,
 }
 
 pub fn run_stdio(
@@ -91,7 +94,7 @@ pub fn run_stdio(
             Ok(json!({}))
         } else if method == "tools/list" {
             Ok(
-                json!({"tools":[{"name":"waku_spawn_session","description":"Create a direct Codex child in a new Git worktree. No automatic retry after a lost response.","inputSchema":{"type":"object","properties":{"provider":{"type":"string","enum":["codex"]},"prompt":{"type":"string","minLength":1},"model":{"type":"string"},"title":{"type":"string"},"runtime_mode":{"type":"string","enum":["ask","autoAcceptEdits","auto","fullAccess"]}},"required":["provider","prompt"],"additionalProperties":false}}]}),
+                json!({"tools":[{"name":"waku_spawn_session","description":"Create a direct Codex child. workspace defaults to worktree; inherit uses the parent directory and local uses the project checkout. Reuse idempotency_key with the same arguments to recover the same result after disconnect or restart. Without a key retries are not deduplicated; never automatically resend an uncertain creation.","inputSchema":{"type":"object","properties":{"idempotency_key":{"type":"string","minLength":1},"workspace":{"type":"string","enum":["worktree","inherit","local"],"default":"worktree"},"provider":{"type":"string","enum":["codex"]},"prompt":{"type":"string","minLength":1},"model":{"type":"string"},"title":{"type":"string"},"runtime_mode":{"type":"string","enum":["ask","autoAcceptEdits","auto","fullAccess"]}},"required":["provider","prompt"],"additionalProperties":false}}]}),
             )
         } else if method == "tools/call" {
             if message["params"]["name"] != "waku_spawn_session" {
@@ -115,6 +118,8 @@ pub fn run_stdio(
                                     model: args.model,
                                     title: args.title,
                                     runtime_mode: args.runtime_mode,
+                                    idempotency_key: args.idempotency_key,
+                                    workspace: args.workspace,
                                 },
                             }),
                         )?;
@@ -125,6 +130,7 @@ pub fn run_stdio(
                             } if returned == request_id => {
                                 let (text, failed) = match outcome {
                                     ResponseOutcome::Ok { payload: ResponsePayload::SessionCreated { session, workspace_path, branch, .. } } => (json!({"session_id":session.id,"workspace_path":workspace_path,"branch":branch}).to_string(), false),
+                                    ResponseOutcome::Ok { payload: failure @ ResponsePayload::SessionCreationFailed { .. } } => (serde_json::to_string(&failure)?, true),
                                     ResponseOutcome::Error { error } => (error.message, true),
                                     _ => bail!("unexpected steward response"),
                                 };

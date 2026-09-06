@@ -77,6 +77,10 @@ pub trait Backend: Send + Sync + 'static {
         bail!("steward sessions are unavailable")
     }
 
+    fn authorize_cached_creation(&self, _child: &AgentSession) -> anyhow::Result<()> {
+        bail!("cached child creation is unavailable")
+    }
+
     fn shutdown(&self) {}
 }
 
@@ -87,6 +91,7 @@ pub struct EventSink {
     hub: Arc<Hub>,
     creation_started: Option<Sender<Result<(), String>>>,
     pub(crate) scoped_project: Option<Uuid>,
+    scoped_principal: Option<Uuid>,
 }
 
 pub(crate) struct ChildCreationGuard {
@@ -105,6 +110,15 @@ impl Drop for ChildCreationGuard {
 }
 
 impl EventSink {
+    pub(crate) fn validate_steward_runtime(&self) -> anyhow::Result<()> {
+        if self.scoped_principal.is_some_and(|principal| {
+            !self.hub.state.lock().capabilities.contains_key(&principal)
+        }) {
+            bail!("steward runtime is no longer active");
+        }
+        Ok(())
+    }
+
     pub(crate) fn mcp_config(&self, project_id: Uuid) -> anyhow::Result<Option<String>> {
         let Some(address) = self.hub.address else {
             return Ok(None);
@@ -347,6 +361,7 @@ impl Hub {
             hub: self.clone(),
             creation_started: None,
             scoped_project: None,
+            scoped_principal: None,
         }
     }
 
@@ -615,7 +630,7 @@ impl Hub {
             drop(state);
             let _ = outgoing.send(ServerMessage::Response {
                 request_id,
-                outcome,
+                outcome: self.validate_cached_creation(outcome),
             });
             return false;
         }
@@ -636,14 +651,30 @@ impl Hub {
     }
 
     fn cached_response_as(&self, principal: Uuid, request_id: Uuid) -> Option<ResponseOutcome> {
-        self.state
+        let outcome = self
+            .state
             .lock()
             .responses
             .iter()
             .rev()
             .find_map(|(cached_id, outcome)| {
                 (*cached_id == (principal, request_id)).then(|| outcome.clone())
-            })
+            });
+        outcome.map(|outcome| self.validate_cached_creation(outcome))
+    }
+
+    fn validate_cached_creation(&self, outcome: ResponseOutcome) -> ResponseOutcome {
+        if let ResponseOutcome::Ok {
+            payload: ResponsePayload::SessionCreated { session, .. },
+        } = &outcome
+            && let Some(backend) = self.backend.as_ref().and_then(Weak::upgrade)
+            && let Err(error) = backend.authorize_cached_creation(session)
+        {
+            return ResponseOutcome::Error {
+                error: RpcError::from(error),
+            };
+        }
+        outcome
     }
 
     fn cache_response(&self, request_id: Uuid, outcome: ResponseOutcome) {
@@ -1390,6 +1421,7 @@ fn handle_request_as(
             let outcome = match prepared.and_then(|_| {
                 let mut events = hub.event_sink(session_id, runtime_id);
                 events.scoped_project = scope.as_ref().map(|scope| scope.project_id);
+                events.scoped_principal = scope.as_ref().map(|scope| scope.principal);
                 if let Some(scope) = &scope {
                     if !hub.state.lock().capabilities.contains_key(&scope.principal) {
                         bail!("steward runtime is no longer active");

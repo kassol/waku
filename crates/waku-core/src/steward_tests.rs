@@ -115,6 +115,8 @@ fn spawn_command(prompt: &str) -> Command {
         model: None,
         title: None,
         runtime_mode: None,
+        idempotency_key: None,
+        workspace: crate::protocol::CreationWorkspace::Worktree,
     }
 }
 
@@ -463,5 +465,56 @@ fn scoped_inflight_uuid_cannot_join_a_desktop_request() {
         client
             .request(parent.id, runtime, Command::CloseSession)
             .unwrap();
+    });
+}
+
+#[test]
+fn mcp_spawn_advertises_and_deduplicates_explicit_workspace_requests() {
+    with_creation_daemon(|client, _observer, root, project_path, address| {
+        let (parent, _, config, runtime) = start_steward(&client, root, project_path);
+        let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+            .as_str()
+            .unwrap();
+        let arguments = json!({"provider":"codex", "prompt":"write fixture result", "workspace":"local", "idempotency_key":"mcp-key"});
+        let input = [json!({"jsonrpc":"2.0","id":0,"method":"initialize"}),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"waku_spawn_session","arguments":arguments}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"waku_spawn_session","arguments":arguments}}),
+        ].iter().map(|value| format!("{value}\n")).collect::<String>();
+        let mut output = Vec::new();
+        crate::mcp::run_stdio(
+            Cursor::new(input),
+            &mut output,
+            &address.to_string(),
+            token,
+            parent.id,
+            runtime,
+        )
+        .unwrap();
+        let replies = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let properties = &replies[1]["result"]["tools"][0]["inputSchema"]["properties"];
+        assert_eq!(
+            properties["workspace"]["enum"],
+            json!(["worktree", "inherit", "local"])
+        );
+        assert_eq!(properties["idempotency_key"]["type"], "string");
+        assert_eq!(replies[2]["result"]["isError"], false);
+        assert_eq!(replies[2]["result"], replies[3]["result"]);
+        let created: serde_json::Value =
+            serde_json::from_str(replies[2]["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(created["workspace_path"], project_path.to_str().unwrap());
+        assert!(created["branch"].is_null());
+        assert_eq!(
+            std::fs::read_to_string(project_path.join("child-calls.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     });
 }

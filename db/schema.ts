@@ -12,7 +12,7 @@
  * fetched only when a session is opened.
  */
 
-import { index, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const projects = sqliteTable("projects", {
   id: text("id").primaryKey(),
@@ -102,3 +102,15 @@ export const sessionEvents = sqliteTable("session_events", {
   /** Unix seconds when history was preserved; NULL events cannot be pruned. */
   savedAt: integer("saved_at"),
 }, (table) => [primaryKey({ columns: [table.sessionId, table.runtimeId, table.epoch, table.sequence] })]);
+
+/** A durable claim precedes creation effects and survives transport retries. */
+export const sessionCreations = sqliteTable("session_creations", {
+  id: text("id").primaryKey(),
+  managerSessionId: text("manager_session_id").notNull(),
+  idempotencyKey: text("idempotency_key"),
+  data: text("data").notNull(),
+  complete: integer("complete", { mode: "boolean" }).notNull(),
+}, (table) => [
+  uniqueIndex("session_creations_by_manager_key").on(table.managerSessionId, table.idempotencyKey),
+  index("session_creations_incomplete").on(table.complete),
+]);

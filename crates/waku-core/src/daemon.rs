@@ -27,8 +27,12 @@ use crate::persistence::{ComposerDraftStore, PersistedState, StateStore};
 use crate::settings::DaemonSettingsStore;
 use waku_protocol::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
 
+#[path = "creation.rs"]
+mod creation;
+
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
+    creation_locks: Mutex<HashMap<(Uuid, String), std::sync::Weak<Mutex<()>>>>,
     work_gate: RwLock<()>,
     quitting: AtomicBool,
     saving_failed: AtomicBool,
@@ -92,6 +96,7 @@ impl WakuBackend {
         if recovered {
             task_store.save(&mut task_state)?;
         }
+        creation::recover(&task_store, &mut task_state)?;
         let composer_drafts = ComposerDraftStore::for_state_path(task_store.path());
         let attachments = AttachmentStore::new(
             task_store
@@ -107,6 +112,7 @@ impl WakuBackend {
             .to_owned();
         Ok(Self {
             sessions: Mutex::new(HashMap::new()),
+            creation_locks: Mutex::new(HashMap::new()),
             work_gate: RwLock::new(()),
             quitting: AtomicBool::new(false),
             saving_failed: AtomicBool::new(false),
@@ -452,6 +458,32 @@ impl Backend for WakuBackend {
         Ok(())
     }
 
+    fn authorize_cached_creation(&self, child: &AgentSession) -> anyhow::Result<()> {
+        let mut state = self.task_state.lock();
+        if !state
+            .projects
+            .iter()
+            .any(|project| project.id == child.project_id)
+        {
+            bail!("the parent project is unavailable");
+        }
+        let parent = state
+            .sessions
+            .iter_mut()
+            .find(|parent| Some(parent.id) == child.parent_session_id)
+            .ok_or_else(|| anyhow!("the parent session is unavailable"))?;
+        if parent.project_id != child.project_id {
+            bail!("the previous creation belongs to a different steward project");
+        }
+        self.task_store.hydrate(parent)?;
+        if !parent.has_started()
+            || !matches!(parent.provider, ProviderKind::Claude | ProviderKind::Codex)
+        {
+            bail!("the parent must be an existing Claude or Codex session");
+        }
+        validate_child_mode(parent.provider, parent.runtime_mode, child.runtime_mode)
+    }
+
     fn prepare_start(
         &self,
         session_id: Uuid,
@@ -509,171 +541,8 @@ impl WakuBackend {
         let session_id = request.session_id;
         let runtime_id = request.runtime_id;
         match request.command {
-            Command::CreateSession {
-                provider,
-                prompt,
-                model,
-                title,
-                runtime_mode,
-            } => {
-                if provider != ProviderKind::Codex {
-                    bail!("child creation currently supports Codex only");
-                }
-                if prompt.trim().is_empty() {
-                    bail!("a child session requires a nonempty prompt");
-                }
-                let (parent, project) = {
-                    let mut state = self.task_state.lock();
-                    let parent = state
-                        .sessions
-                        .iter_mut()
-                        .find(|session| session.id == session_id)
-                        .ok_or_else(|| anyhow!("the parent session is unavailable"))?;
-                    if events
-                        .scoped_project
-                        .is_some_and(|project| project != parent.project_id)
-                    {
-                        bail!("steward project is no longer available");
-                    }
-                    self.task_store.hydrate(parent)?;
-                    if !parent.has_started()
-                        || !matches!(parent.provider, ProviderKind::Claude | ProviderKind::Codex)
-                    {
-                        bail!("the parent must be an existing Claude or Codex session");
-                    }
-                    let parent = parent.clone();
-                    let project = state
-                        .projects
-                        .iter()
-                        .find(|project| project.id == parent.project_id)
-                        .ok_or_else(|| anyhow!("the parent project is unavailable"))?
-                        .clone();
-                    (parent, project)
-                };
-                if project.is_projectless() {
-                    bail!("child worktrees require a Git project");
-                }
-                let mode = runtime_mode.unwrap_or(parent.runtime_mode);
-                validate_child_mode(parent.provider, parent.runtime_mode, mode)?;
-                let binary = self.provider_binary(provider)?;
-                let mut child = AgentSession::new(project.id, provider);
-                child.parent_session_id = Some(parent.id);
-                child.runtime_mode = mode;
-                child.model = model.clone();
-                child.set_title_from_prompt(&prompt);
-                if let Some(title) = title {
-                    child.set_title(title);
-                }
-                let worktree_root = self
-                    .task_store
-                    .path()
-                    .parent()
-                    .ok_or_else(|| anyhow!("the task database has no workspace directory"))?
-                    .join("worktrees");
-                let worktree = crate::worktree::create_in(
-                    &project.path,
-                    &worktree_root,
-                    project.id,
-                    child.id,
-                    &prompt,
-                    None,
-                )?;
-                child.workspace = crate::model::SessionWorkspace::Worktree {
-                    path: worktree.path.clone(),
-                    branch: worktree.branch.clone(),
-                };
-                let turn_id = child.begin_turn(prompt.clone());
-                let message_id = child.messages.last().expect("begin_turn adds its input").id;
-                child.status = SessionStatus::Connecting;
-                let child_id = child.id;
-                // Reserve the lifecycle before this child can appear in a
-                // catalog. Other clients may attach, but cannot replace or
-                // remove its provider while the first prompt is being accepted.
-                let _creation = events.reserve_child(child_id);
-                {
-                    let mut state = self.task_state.lock();
-                    let current_parent = state
-                        .sessions
-                        .iter()
-                        .find(|session| session.id == parent.id)
-                        .ok_or_else(|| {
-                            anyhow!("the parent was removed during worktree creation")
-                        })?;
-                    validate_child_mode(
-                        current_parent.provider,
-                        current_parent.runtime_mode,
-                        mode,
-                    )?;
-                    state.push_session(child.clone());
-                    if let Err(error) = self.task_store.save(&mut state) {
-                        self.saving_failed.store(true, Ordering::Release);
-                        state.sessions.retain(|session| session.id != child_id);
-                        return Err(error).with_context(|| {
-                            format!(
-                                "could not save child {child_id}; worktree retained at {}",
-                                worktree.path.display()
-                            )
-                        });
-                    }
-                }
-                let child_runtime = Uuid::new_v4();
-                let (child_events, creation_started) = events.begin_child(child_id, child_runtime);
-                let start = self.handle_accepted(Request {
-                    request_id: Uuid::new_v4(), session_id: child_id, runtime_id: child_runtime,
-                    command: Command::Start { options: crate::WireDriverStartOptions {
-                        provider: "codex".into(), binary, cwd: worktree.path.clone(), mode: serde_json::to_value(mode)?.as_str().unwrap().to_owned(),
-                        model, reasoning_effort: None, service_tier: None, context_window: None, agent_preset: None,
-                        computer_use_enabled: false, provider_cursor: None,
-                    } },
-                }, child_events.clone()).and_then(|_| self.handle_accepted(Request {
-                    request_id: Uuid::new_v4(), session_id: child_id, runtime_id: child_runtime,
-                    command: Command::Prompt { prompt, turn_id: Some(turn_id), message_id: Some(message_id) },
-                }, child_events.clone())).and_then(|_| {
-                    creation_started.recv_timeout(std::time::Duration::from_secs(60))
-                        .context("timed out waiting for the child provider to accept its first prompt")?
-                        .map_err(anyhow::Error::msg)
-                });
-                if let Err(error) = start {
-                    let message = format!(
-                        "could not start child {child_id} in {}: {error:#}",
-                        worktree.path.display()
-                    );
-                    let saved = child_events.send_batch(vec![
-                        event_to_wire(DriverEvent::Error(message.clone()))?,
-                        event_to_wire(DriverEvent::TurnFinished {
-                            success: false,
-                            summary: Some(message.clone()),
-                        })?,
-                    ]);
-                    let stopped = self.close_runtime(child_id, Some(child_runtime));
-                    if saved.is_ok() && stopped.is_ok() {
-                        child_events.end_runtime();
-                    }
-                    return Err(anyhow!(
-                        "{message}; history save: {}; provider stop: {}",
-                        saved
-                            .err()
-                            .map_or("saved".into(), |error| error.to_string()),
-                        stopped
-                            .err()
-                            .map_or("stopped".into(), |error| error.to_string())
-                    ));
-                }
-                let session = self
-                    .task_state
-                    .lock()
-                    .sessions
-                    .iter()
-                    .find(|session| session.id == child_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("the child was removed while starting"))?;
-                Ok(ResponsePayload::SessionCreated {
-                    session,
-                    runtime_id: child_runtime,
-                    turn_id,
-                    workspace_path: worktree.path,
-                    branch: worktree.branch,
-                })
+            command @ Command::CreateSession { .. } => {
+                self.create_session(session_id, command, events)
             }
             Command::AttachSession => {
                 let sessions = self.sessions.lock();
