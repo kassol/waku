@@ -7,6 +7,8 @@ mod claude;
 mod codex;
 #[cfg(test)]
 mod codex_lifecycle_tests;
+#[cfg(test)]
+mod native_input_tests;
 mod computer_use;
 mod deepseek;
 mod opencode;
