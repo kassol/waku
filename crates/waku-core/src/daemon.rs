@@ -27,6 +27,9 @@ use crate::persistence::{ComposerDraftStore, PersistedState, StateStore};
 use crate::settings::DaemonSettingsStore;
 use waku_protocol::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
 
+#[path = "steward.rs"]
+mod steward;
+
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
     work_gate: RwLock<()>,
@@ -374,6 +377,9 @@ impl Backend for WakuBackend {
     }
 
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
+        if let Command::StewardQuery { query } = &request.command {
+            return self.steward_query(request.session_id, query, &events);
+        }
         if matches!(
             request.command,
             Command::PrepareShutdown | Command::ShutdownDaemon
@@ -2437,7 +2443,8 @@ fn handle_driver_command(
             let cursor = Some(serde_json::to_value(driver.fork(turns_to_remove)?)?);
             return Ok(ResponsePayload::Cursor { cursor });
         }
-        Command::CreateSession { .. }
+        Command::StewardQuery { .. }
+        | Command::CreateSession { .. }
         | Command::PrepareShutdown
         | Command::ShutdownDaemon
         | Command::AttachSession

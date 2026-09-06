@@ -132,6 +132,18 @@ fn creates_codex_child_in_isolated_worktree_and_restores_its_history() {
 fn with_creation_daemon(
     test: impl FnOnce(DaemonClient, DaemonClient, &Path, &Path, std::net::SocketAddr),
 ) {
+    with_creation_daemon_seed(
+        |_, _| (),
+        |client, observer, root, project, address, ()| {
+            test(client, observer, root, project, address)
+        },
+    );
+}
+
+fn with_creation_daemon_seed<T>(
+    seed: impl FnOnce(&Path, &Path) -> T,
+    test: impl FnOnce(DaemonClient, DaemonClient, &Path, &Path, std::net::SocketAddr, T),
+) {
     let root = std::env::temp_dir().join(format!("waku-create-{}", Uuid::new_v4()));
     let project_path = root.join("project");
     std::fs::create_dir_all(&project_path).unwrap();
@@ -159,6 +171,7 @@ fn with_creation_daemon(
         .provider_binary_overrides
         .insert(ProviderKind::Codex, binary.to_string_lossy().into());
     settings.replace(config).unwrap();
+    let fixture = seed(&root, &project_path);
     let backend =
         Arc::new(WakuBackend::new(settings, StateStore::daemon(root.join("app.db"))).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -182,7 +195,7 @@ fn with_creation_daemon(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let client = DaemonClient::connect(&address.to_string(), "fixture".into()).unwrap();
         let observer = DaemonClient::connect(&address.to_string(), "fixture".into()).unwrap();
-        test(client, observer, &root, &project_path, address);
+        test(client, observer, &root, &project_path, address, fixture);
     }));
     stopping.store(true, Ordering::Release);
     server.join().unwrap();

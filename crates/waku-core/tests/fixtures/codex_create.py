@@ -35,7 +35,12 @@ for line in sys.stdin:
                 calls.write(json.dumps(request['params']) + '\n')
         send({'id': request_id, 'result': {'turn': {'id': 'fixture-turn'}}})
         send({'method': 'turn/started', 'params': {'turn': {'id': 'fixture-turn'}}})
-        send({'method': 'item/agentMessage/delta', 'params': {'delta': 'Child finished.'}})
+        if prompt == 'stream query result':
+            for _ in range(100):
+                send({'method': 'item/agentMessage/delta', 'params': {'delta': 'x'}})
+                time.sleep(0.01)
+        else:
+            send({'method': 'item/agentMessage/delta', 'params': {'delta': 'Child finished.'}})
         send({'method': 'turn/completed', 'params': {'turn': {'id': 'fixture-turn', 'status': 'completed'}}})
     else:
         send({'id': request_id, 'result': {}})
