@@ -46,14 +46,12 @@ pub fn complete(success: bool, cx: &mut App) {
             });
         }
     }
-    #[cfg(target_os = "macos")]
-    native::complete(success);
-    #[cfg(not(target_os = "macos"))]
     if success {
+        #[cfg(target_os = "macos")]
+        native::allow_termination();
+        // GPUI queues termination after this update releases its App borrow.
         cx.quit();
     }
-    #[cfg(target_os = "macos")]
-    let _ = cx;
 }
 
 #[cfg(target_os = "macos")]
@@ -61,10 +59,11 @@ mod native {
     use objc2::runtime::{AnyClass, AnyObject, Sel};
     use objc2::{MainThreadMarker, msg_send, sel};
     use objc2_app_kit::NSApplication;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::ffi::{c_char, c_void};
     thread_local! {
         static REQUESTS: RefCell<Option<smol::channel::Sender<()>>> = const { RefCell::new(None) };
+        static TERMINATION_ALLOWED: Cell<bool> = const { Cell::new(false) };
     }
     unsafe extern "C" {
         fn class_addMethod(
@@ -75,12 +74,18 @@ mod native {
         ) -> bool;
     }
     extern "C" fn should_terminate(_: *mut AnyObject, _: Sel, _: *mut AnyObject) -> usize {
+        if TERMINATION_ALLOWED.with(|allowed| allowed.replace(false)) {
+            return 1; // NSTerminateNow: history is saved and the owned daemon exited.
+        }
         REQUESTS.with(|requests| {
             if let Some(sender) = requests.borrow().as_ref() {
                 let _ = sender.try_send(());
             }
         });
-        2 // NSTerminateLater: reply only after the owned daemon exits safely.
+        // NSTerminateLater enters a nested run loop. When Quit runs on the
+        // main dispatch queue, that blocks GPUI's queued save/exit tasks.
+        // Return to the main loop and request termination again after saving.
+        0 // NSTerminateCancel
     }
     pub fn install(sender: smol::channel::Sender<()>) {
         let mtm =
@@ -101,8 +106,8 @@ mod native {
             );
         }
     }
-    pub fn complete(success: bool) {
-        let mtm = MainThreadMarker::new().expect("quit reply must run on the main thread");
-        NSApplication::sharedApplication(mtm).replyToApplicationShouldTerminate(success);
+    pub fn allow_termination() {
+        MainThreadMarker::new().expect("quit approval must run on the main thread");
+        TERMINATION_ALLOWED.with(|allowed| allowed.set(true));
     }
 }
