@@ -1,5 +1,13 @@
 # Waku development guidance
 
+## Fork workflow
+
+- Before planning the steward feature, syncing upstream, or building or running
+  a test app, read [the project handoff](docs/waku-project-handoff.md) for the
+  current decisions, implementation boundary, and installed-app isolation rules.
+- Fetch updates only from `upstream` (`egoist/waku`). Push development changes
+  only to `origin` (`kassol/waku`); do not send contributions or messages upstream.
+
 ## Development runtime
 
 - Assume `bun ./scripts/dev.ts` is already running and owns the current
