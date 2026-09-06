@@ -23,6 +23,23 @@ pub(super) fn composer_submit_action(
     }
 }
 
+fn user_input_card(request_id: &str, theme: Theme) -> Stateful<Div> {
+    div()
+        .id(SharedString::from(format!("user-input-{request_id}")))
+        .w_full()
+        .max_w(px(CONTENT_MAX_WIDTH))
+        .mx_auto()
+        .px(px(14.0))
+        .pt(px(12.0))
+        .pb(px(10.0))
+        .rounded(px(13.0))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.composer)
+        .tab_index(0)
+        .tab_stop(false)
+}
+
 impl Waku {
     // ── Permission ─────────────────────────────────────────────────────────
 
@@ -40,6 +57,10 @@ impl Waku {
         for option in &permission.options {
             let request_id = request_id.clone();
             let option_id = option.id.clone();
+            let focus = self.transcript_control_focus(
+                format!("permission-{}-{}", permission.request_id, option.id),
+                cx,
+            );
             let allow = option.allow;
             buttons = buttons.child(
                 div()
@@ -47,6 +68,8 @@ impl Waku {
                         "permission-{}-{}",
                         permission.request_id, option.id
                     )))
+                    .track_focus(&focus)
+                    .tab_index(0)
                     .h(px(28.0))
                     .px(px(13.0))
                     .rounded(px(7.0))
@@ -69,6 +92,7 @@ impl Waku {
                             .hover(|element| element.bg(theme.overlay).text_color(theme.text))
                     })
                     .active(|element| element.opacity(0.8))
+                    .focus_visible(|element| element.border_1().border_color(theme.accent))
                     .child(SharedString::from(option.label.clone()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.respond_permission(request_id.clone(), option_id.clone(), cx);
@@ -144,7 +168,6 @@ impl Waku {
         for (index, option) in question.options.iter().enumerate() {
             let is_selected = selected.iter().any(|answer| answer == &option.label);
             let click_label = option.label.clone();
-            let key_label = option.label.clone();
             let focus = self.transcript_control_focus(
                 format!("user-input-{request_id}-{question_index}-option-{index}"),
                 cx,
@@ -207,20 +230,16 @@ impl Waku {
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_user_input_option(click_label.clone(), cx);
-                    }))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            this.select_user_input_option(key_label.clone(), cx);
-                            cx.stop_propagation();
-                        }
                     })),
             );
         }
 
-        let next_focus = self.transcript_control_focus(
-            format!("user-input-{request_id}-{question_index}-continue"),
-            cx,
-        );
+        let next_focus = self
+            .transcript_control_focus(
+                format!("user-input-{request_id}-{question_index}-continue"),
+                cx,
+            )
+            .tab_stop(can_continue);
         let back = (question_index > 0).then(|| {
             let focus = self.transcript_control_focus(
                 format!("user-input-{request_id}-{question_index}-back"),
@@ -247,12 +266,6 @@ impl Waku {
                 .active(|style| style.opacity(0.8))
                 .child(tr!("user_input.back"))
                 .on_click(cx.listener(|this, _, _, cx| this.previous_user_input(cx)))
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                        this.previous_user_input(cx);
-                        cx.stop_propagation();
-                    }
-                }))
         });
         let continue_button = div()
             .id(SharedString::from(format!(
@@ -285,12 +298,6 @@ impl Waku {
                     .hover(|style| style.opacity(0.9))
                     .active(|style| style.opacity(0.8))
                     .on_click(cx.listener(|this, _, _, cx| this.advance_user_input(cx)))
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            this.advance_user_input(cx);
-                            cx.stop_propagation();
-                        }
-                    }))
             })
             .child(if is_last {
                 tr!("user_input.submit")
@@ -317,21 +324,7 @@ impl Waku {
         });
 
         div().flex_none().px(px(20.0)).pb(px(8.0)).child(
-            div()
-                .id(SharedString::from(format!("user-input-{request_id}")))
-                .w_full()
-                .max_w(px(CONTENT_MAX_WIDTH))
-                .mx_auto()
-                .px(px(14.0))
-                .pt(px(12.0))
-                .pb(px(10.0))
-                .rounded(px(13.0))
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.composer)
-                .tab_index(0)
-                .tab_group()
-                .tab_stop(false)
+            user_input_card(&request_id, theme)
                 .child(
                     div()
                         .flex()
@@ -3920,4 +3913,96 @@ pub(super) fn visible_picker_models(
         });
     }
     models
+}
+
+#[cfg(test)]
+mod user_input_focus_tests {
+    use super::*;
+
+    struct AnswerCard {
+        header: FocusHandle,
+        yes: FocusHandle,
+        submit: FocusHandle,
+        composer: FocusHandle,
+        selected: bool,
+        activations: usize,
+    }
+
+    impl Render for AnswerCard {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .on_key_down(crate::ui::navigate_tab)
+                .child(div().size(px(20.0)).track_focus(&self.header))
+                .child(
+                    user_input_card("question", Theme::dark())
+                        .child(
+                            div()
+                                .id("answer-option")
+                                .size(px(20.0))
+                                .track_focus(&self.yes)
+                                .tab_index(0)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.selected = !this.selected;
+                                    this.activations += 1;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(div().size(px(20.0)).track_focus(&self.submit).tab_index(0)),
+                )
+                .child(div().size(px(20.0)).track_focus(&self.composer))
+        }
+    }
+
+    #[gpui::test]
+    fn answer_card_precedes_composer_in_both_tab_directions(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| AnswerCard {
+            header: cx.focus_handle().tab_stop(true),
+            yes: cx.focus_handle().tab_stop(true),
+            submit: cx.focus_handle().tab_stop(true),
+            composer: cx.focus_handle().tab_stop(true),
+            selected: false,
+            activations: 0,
+        });
+        let (yes, submit, composer) = cx.read_entity(&view, |view, _| {
+            (view.yes.clone(), view.submit.clone(), view.composer.clone())
+        });
+        cx.update(|window, cx| window.focus(&composer, cx));
+        cx.simulate_keystrokes("shift-tab");
+        assert!(cx.update(|window, _| submit.is_focused(window)));
+        cx.simulate_keystrokes("shift-tab");
+        assert!(cx.update(|window, _| yes.is_focused(window)));
+        cx.simulate_keystrokes("tab");
+        assert!(cx.update(|window, _| submit.is_focused(window)));
+        cx.simulate_keystrokes("tab");
+        assert!(cx.update(|window, _| composer.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn answer_option_toggles_once_per_complete_keyboard_press(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| AnswerCard {
+            header: cx.focus_handle().tab_stop(true),
+            yes: cx.focus_handle().tab_stop(true),
+            submit: cx.focus_handle().tab_stop(true),
+            composer: cx.focus_handle().tab_stop(true),
+            selected: false,
+            activations: 0,
+        });
+        let yes = cx.read_entity(&view, |view, _| view.yes.clone());
+        cx.update(|window, cx| window.focus(&yes, cx));
+        for (index, key) in ["space", "enter"].into_iter().enumerate() {
+            let keystroke = gpui::Keystroke::parse(key).unwrap();
+            cx.simulate_event(KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            assert_eq!(cx.read_entity(&view, |view, _| view.activations), index);
+            cx.simulate_event(gpui::KeyUpEvent { keystroke });
+            assert_eq!(
+                cx.read_entity(&view, |view, _| (view.selected, view.activations)),
+                (index == 0, index + 1),
+            );
+        }
+    }
 }

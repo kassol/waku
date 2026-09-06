@@ -47,7 +47,7 @@ impl Waku {
     pub(super) fn assistant_response_footer_cached(
         &self,
         message_index: usize,
-    ) -> (Option<SharedString>, Option<u64>) {
+    ) -> (Option<SharedString>, Option<u64>, Option<SharedString>) {
         self.refresh_transcript_row_kinds();
         let fingerprint = self.transcript_row_kinds_fingerprint.get();
         if self.assistant_footer_fingerprint.get() != fingerprint {
@@ -57,10 +57,16 @@ impl Waku {
         if let Some(cached) = self.assistant_footer_cache.borrow().get(&message_index) {
             return cached.clone();
         }
-        let value = self.selected_session().map_or((None, None), |session| {
+        let value = self.selected_session().map_or((None, None, None), |session| {
             (
                 assistant_response_footer(session, message_index).map(SharedString::from),
                 assistant_response_footer_time(session, message_index),
+                session
+                    .messages
+                    .get(message_index)
+                    .and_then(|message| message.turn_id)
+                    .and_then(|turn_id| interrupted_response_status(session, turn_id))
+                    .map(SharedString::from),
             )
         });
         self.assistant_footer_cache
@@ -927,6 +933,14 @@ pub(super) fn folded_transcript_row_kinds(
         let turn_rows = turn_rows(session, turn.id);
         if let Some(message_index) = response_footer_message_index_from_rows(session, &turn_rows) {
             response_footers.insert(turn.id, message_index);
+        } else if turn.status == TurnStatus::Interrupted
+            && turn_rows.is_empty()
+            && let Some(message_index) = session
+                .messages
+                .iter()
+                .position(|message| message.turn_id == Some(turn.id))
+        {
+            response_footers.insert(turn.id, message_index);
         }
         let hidden = &turn_rows[..turn_answer_start(session, &turn_rows)];
         let Some(anchor) = hidden.first().copied() else {
@@ -1069,6 +1083,9 @@ fn response_footer_message_index_from_rows(
     session: &AgentSession,
     turn_rows: &[TranscriptRowKind],
 ) -> Option<usize> {
+    if turn_answer_start(session, turn_rows) == turn_rows.len() {
+        return None;
+    }
     let message_index = turn_rows.iter().rev().find_map(|row| match *row {
         TranscriptRowKind::Message(message_index) => Some(message_index),
         TranscriptRowKind::TurnBlock(_)
@@ -1117,6 +1134,9 @@ fn turn_answer_start(session: &AgentSession, turn_rows: &[TranscriptRowKind]) ->
     let Some(last_text) = turn_rows.iter().rposition(is_answer_text) else {
         return turn_rows.len();
     };
+    if last_text + 1 != turn_rows.len() {
+        return turn_rows.len();
+    }
     turn_rows[..last_text]
         .iter()
         .rposition(|row| !is_answer_text(row))
@@ -1152,6 +1172,16 @@ pub(super) fn response_row_turn_id(session: &AgentSession, row: TranscriptRowKin
         | TranscriptRowKind::ResponseFooter(_, _)
         | TranscriptRowKind::ChangedFiles(_) => row_turn_id(session, row),
     }
+}
+
+pub(super) fn interrupted_response_status(
+    session: &AgentSession,
+    turn_id: Uuid,
+) -> Option<String> {
+    let turn = session.turns.iter().find(|turn| turn.id == turn_id)?;
+    (turn.status == TurnStatus::Interrupted
+        && turn_answer_start(session, &turn_rows(session, turn_id)) == 0)
+        .then(|| turn_fold_label(session, turn_id))
 }
 
 pub(super) fn turn_fold_label(session: &AgentSession, turn_id: Uuid) -> String {
@@ -1271,4 +1301,52 @@ pub(super) fn message_starts_followup_turn(messages: &[Message], message_index: 
         && messages[..message_index]
             .iter()
             .any(|message| message.role == MessageRole::User)
+}
+
+#[cfg(test)]
+mod interrupted_presentation_tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_turns_keep_a_visible_stop_status_and_all_output() {
+        for shape in ["empty", "text", "trailing_tool"] {
+            let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+            let turn_id = session.begin_turn("Run a command");
+            if shape != "empty" {
+                session.push_message(MessageRole::Assistant, "Starting the command.");
+            }
+            if shape == "trailing_tool" {
+                session.transcript_blocks.push(TranscriptBlock {
+                    after_message: session.messages.len(),
+                    turn_id: Some(turn_id),
+                    activities: vec![ActivityItem::new(
+                        None, ActivityKind::Command, "sleep 60", None, true,
+                    )],
+                });
+            }
+            session.finish_active_turn(TurnStatus::Interrupted);
+            let rows = folded_transcript_row_kinds(&session, &HashSet::new());
+            if shape == "trailing_tool" {
+                assert!(interrupted_response_status(&session, turn_id).is_none());
+                assert!(
+                    rows.contains(&TranscriptRowKind::TurnFold(turn_id)),
+                    "{shape}: {rows:?}"
+                );
+                let expanded = folded_transcript_row_kinds(&session, &HashSet::from([turn_id]));
+                assert!(expanded.contains(&TranscriptRowKind::Message(1)));
+                assert!(expanded.contains(&TranscriptRowKind::TurnBlock(0)));
+            } else {
+                assert_eq!(
+                    interrupted_response_status(&session, turn_id),
+                    Some(turn_fold_label(&session, turn_id))
+                );
+                assert!(
+                    rows.iter().any(|row| matches!(
+                        row, TranscriptRowKind::ResponseFooter(id, _) if *id == turn_id
+                    )),
+                    "{shape}: {rows:?}"
+                );
+            }
+        }
+    }
 }

@@ -419,8 +419,12 @@ impl Waku {
         let bar_width = (chat_viewport_width - 24.0).clamp(260.0, 430.0);
         let input_width = (bar_width - 154.0).max(104.0);
         let query = search.query.clone();
-        let previous_focus = self.transcript_control_focus("transcript-find-previous", cx);
-        let next_focus = self.transcript_control_focus("transcript-find-next", cx);
+        let previous_focus = self
+            .transcript_control_focus("transcript-find-previous", cx)
+            .tab_stop(has_matches);
+        let next_focus = self
+            .transcript_control_focus("transcript-find-next", cx)
+            .tab_stop(has_matches);
         let close_focus = self.transcript_control_focus("transcript-find-close", cx);
 
         let previous = icon_button("transcript-find-previous", "icons/arrow-up.svg", theme)

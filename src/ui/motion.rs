@@ -244,6 +244,23 @@ fn width_at(from: f32, target: f32, elapsed: Duration) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AppContext;
+
+    #[gpui::test]
+    fn reduced_motion_does_not_schedule_loader_frames(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let view = cx.new(|_| ());
+            cx.set_reduce_motion(true);
+            assert_eq!(pulse_phase(SPINNER_PERIOD, 1, view.entity_id(), cx), 0.0);
+            assert!(!cx.has_global::<PulseClock>());
+
+            cx.set_reduce_motion(false);
+            pulse_phase(SPINNER_PERIOD, 1, view.entity_id(), cx);
+            let clock = cx.global::<PulseClock>();
+            assert!(clock.running);
+            assert!(clock.leases.contains_key(&view.entity_id()));
+        });
+    }
 
     #[test]
     fn a_slide_eases_out_and_then_retires() {

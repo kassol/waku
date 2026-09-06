@@ -1118,6 +1118,32 @@ fn response_hover_owns_every_response_row_but_not_the_prompt() {
 }
 
 #[test]
+fn empty_interrupted_turn_keeps_checkpoint_in_its_status_footer() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+    let turn_id = session.begin_turn("Make the change");
+    session.finish_active_turn(TurnStatus::Interrupted);
+    attach_changed_files(
+        &mut session,
+        vec![CheckpointFile {
+            path: "src/lib.rs".into(),
+            additions: 1,
+            deletions: 0,
+        }],
+    );
+
+    assert_eq!(
+        folded_transcript_row_kinds(&session, &HashSet::new()),
+        vec![Message(0), ResponseFooter(turn_id, 0)]
+    );
+    assert!(assistant_response_footer(&session, 0).is_none());
+    assert!(super::transcript::interrupted_response_status(&session, turn_id).is_some());
+    let checkpoint = session.turns[0].checkpoint.as_ref().unwrap();
+    assert_eq!(checkpoint.status, CheckpointStatus::Ready);
+    assert_eq!(checkpoint.files[0].path, "src/lib.rs");
+    assert_eq!(checkpoint.additions, 1);
+}
+
+#[test]
 fn changed_files_remain_visible_when_an_interrupted_turn_has_no_answer() {
     let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
     let turn_id = session.begin_turn("Make the change");
@@ -1538,7 +1564,7 @@ fn assistant_response_footer_is_owned_by_the_terminal_part_and_copies_the_visibl
 }
 
 #[test]
-fn response_footer_follows_trailing_tool_activity() {
+fn interrupted_trailing_tool_activity_remains_available_when_expanded() {
     let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
     let turn_id = session.begin_turn("Inspect it");
     session.push_message(MessageRole::Assistant, "I’ll inspect the implementation.");
@@ -1556,12 +1582,12 @@ fn response_footer_follows_trailing_tool_activity() {
     session.finish_active_turn(TurnStatus::Interrupted);
 
     assert_eq!(
-        folded_transcript_row_kinds(&session, &HashSet::new()),
+        folded_transcript_row_kinds(&session, &HashSet::from([turn_id])),
         vec![
             Message(0),
+            TurnFold(turn_id),
             Message(1),
             TurnBlock(0),
-            ResponseFooter(turn_id, 1),
         ]
     );
 }

@@ -882,12 +882,6 @@ impl Waku {
                     cx.stop_propagation();
                     this.set_right_panel_diff_source(ReviewDiffSource::Uncommitted, cx);
                 }))
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                        this.set_right_panel_diff_source(ReviewDiffSource::Uncommitted, cx);
-                        cx.stop_propagation();
-                    }
-                }))
                 .into_any_element()
         });
         let open_in = self.render_open_in_control(workspace_path, cx);
@@ -996,7 +990,6 @@ impl Waku {
         let focus = self.transcript_control_focus("header-open-in", cx);
 
         let primary_path = path.clone();
-        let key_path = path.clone();
         let primary = div()
             .id("header-open-in")
             .track_focus(&focus)
@@ -1026,12 +1019,6 @@ impl Waku {
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 this.open_workspace_in_app(&primary_path, preferred_id, cx);
-            }))
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    this.open_workspace_in_app(&key_path, preferred_id, cx);
-                    cx.stop_propagation();
-                }
             }));
 
         let caret = div()
@@ -1153,8 +1140,6 @@ impl Waku {
                 );
                 let click_key = item.key.clone();
                 let click_weak = cx.entity().downgrade();
-                let key_key = item.key.clone();
-                let key_weak = cx.entity().downgrade();
                 div()
                     .id(SharedString::from(format!(
                         "background-surface-stop-{}-{}",
@@ -1187,14 +1172,6 @@ impl Waku {
                         let _ = click_weak.update(cx, |this, cx| {
                             this.stop_background_work(session_id, click_key.clone(), cx);
                         });
-                    })
-                    .on_key_down(move |event: &KeyDownEvent, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            let _ = key_weak.update(cx, |this, cx| {
-                                this.stop_background_work(session_id, key_key.clone(), cx);
-                            });
-                            cx.stop_propagation();
-                        }
                     })
             })
         });
@@ -1569,13 +1546,12 @@ fn render_task_identifier_row(
         tr!("common.copy_named", name = label.clone())
     });
     let copy_value = value.clone();
-    let copy_action = Rc::new(move |cx: &mut App| {
+    let copy_action = move |cx: &mut App| {
         cx.write_to_clipboard(ClipboardItem::new_string(copy_value.clone()));
         let _ = weak.update(cx, |this, cx| {
             this.show_control_copied(control_id, cx);
         });
-    });
-    let key_copy_action = copy_action.clone();
+    };
     let copy_button = div()
         .id(control_id)
         .track_focus(focus)
@@ -1609,14 +1585,6 @@ fn render_task_identifier_row(
         .on_click(move |_, _, cx| {
             copy_action(cx);
             cx.stop_propagation();
-        })
-        .on_key_down(move |event: &KeyDownEvent, _, cx| {
-            if !event.keystroke.modifiers.modified()
-                && matches!(event.keystroke.key.as_str(), "enter" | "space")
-            {
-                key_copy_action(cx);
-                cx.stop_propagation();
-            }
         });
 
     div()
@@ -1751,11 +1719,10 @@ fn render_environment_action_row(
     } else {
         icon(icon_path, 14.0, icon_foreground).into_any_element()
     };
-    let action: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(action);
-    let key_action = action.clone();
+    let focus = focus.clone().tab_stop(enabled);
     div()
         .id(id)
-        .track_focus(focus)
+        .track_focus(&focus)
         .when(enabled, |row| row.tab_index(0))
         .min_h(px(32.0))
         .w_full()
@@ -1782,12 +1749,6 @@ fn render_environment_action_row(
         .children(trailing)
         .when(enabled, |row| {
             row.on_click(move |_, window, cx| action(window, cx))
-                .on_key_down(move |event: &KeyDownEvent, window, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                        key_action(window, cx);
-                        cx.stop_propagation();
-                    }
-                })
         })
 }
 
@@ -1855,8 +1816,6 @@ fn render_background_summary_row(
     let stop = (item.status.is_stoppable() && item.can_stop).then(|| {
         let click_key = item.key.clone();
         let click_weak = weak.clone();
-        let key_key = item.key.clone();
-        let key_weak = weak.clone();
         div()
             .id(SharedString::from(format!(
                 "background-summary-stop-{}-{}",
@@ -1890,14 +1849,6 @@ fn render_background_summary_row(
                     this.stop_background_work(session_id, click_key.clone(), cx);
                 });
             })
-            .on_key_down(move |event: &KeyDownEvent, _, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    let _ = key_weak.update(cx, |this, cx| {
-                        this.stop_background_work(session_id, key_key.clone(), cx);
-                    });
-                    cx.stop_propagation();
-                }
-            })
     });
     let trailing = (status.is_some() || stop.is_some()).then(|| {
         div()
@@ -1909,11 +1860,8 @@ fn render_background_summary_row(
     });
     let is_process = item.key.kind != BackgroundWorkKind::Subagent;
     let open_key = item.key.clone();
-    let key_key = open_key.clone();
     let click_handle = handle.clone();
     let click_weak = weak.clone();
-    let key_handle = handle;
-    let key_weak = weak;
     div()
         .id(SharedString::from(format!(
             "background-summary-row-{}-{}",
@@ -1958,21 +1906,72 @@ fn render_background_summary_row(
                 this.open_background_work_surface(session_id, open_key.clone(), cx);
             });
         })
-        .on_key_down(move |event: &KeyDownEvent, window, cx| {
-            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                key_handle.close(window, cx);
-                window.refresh();
-                let _ = key_weak.update(cx, |this, cx| {
-                    this.open_background_work_surface(session_id, key_key.clone(), cx);
-                });
-                cx.stop_propagation();
-            }
-        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EnvironmentActionControls {
+        before: FocusHandle,
+        action: FocusHandle,
+        after: FocusHandle,
+        pending: bool,
+    }
+
+    impl Render for EnvironmentActionControls {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size(px(200.0))
+                .on_key_down(crate::ui::navigate_tab)
+                .child(div().size(px(20.0)).track_focus(&self.before).tab_index(0))
+                .child(render_environment_action_row(
+                    "environment-summary-commit",
+                    &self.action,
+                    "icons/git-commit-horizontal.svg",
+                    "Commit".into(),
+                    !self.pending,
+                    self.pending,
+                    None,
+                    &Theme::light(),
+                    |_, _| {},
+                ))
+                .child(div().size(px(20.0)).track_focus(&self.after).tab_index(0))
+        }
+    }
+
+    #[gpui::test]
+    fn environment_action_skips_pending_and_rejoins_tab_order(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, cx) = cx.add_window_view(|_, cx| EnvironmentActionControls {
+            before: cx.focus_handle().tab_stop(true),
+            action: cx.focus_handle().tab_stop(true),
+            after: cx.focus_handle().tab_stop(true),
+            pending: true,
+        });
+        let (before, action, after) = cx.read_entity(&view, |view, _| {
+            (view.before.clone(), view.action.clone(), view.after.clone())
+        });
+        cx.update(|window, cx| window.focus(&before, cx));
+        cx.simulate_keystrokes("tab");
+        assert!(cx.update(|window, _| after.is_focused(window)));
+        cx.simulate_keystrokes("shift-tab");
+        assert!(cx.update(|window, _| before.is_focused(window)));
+        cx.update_entity(&view, |view, cx| {
+            view.pending = false;
+            cx.notify();
+        });
+        cx.simulate_keystrokes("tab");
+        assert!(cx.update(|window, _| action.is_focused(window)));
+        cx.simulate_keystrokes("tab");
+        assert!(cx.update(|window, _| after.is_focused(window)));
+        cx.update_entity(&view, |view, cx| {
+            view.pending = true;
+            cx.notify();
+        });
+        cx.simulate_keystrokes("shift-tab");
+        assert!(cx.update(|window, _| before.is_focused(window)));
+    }
 
     fn item(id: &str, status: BackgroundWorkStatus, background: bool) -> BackgroundWorkItem {
         let mut item = BackgroundWorkItem::new(

@@ -2888,12 +2888,6 @@ impl Waku {
                 .child(icon(icon_path, 12.0, theme.text_tertiary))
                 .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_markdown_preview(cx)))
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                        this.toggle_markdown_preview(cx);
-                        cx.stop_propagation();
-                    }
-                }))
         });
 
         let editor = div()
@@ -3627,13 +3621,7 @@ impl Waku {
             .hover(|style| style.bg(theme.overlay))
             .child(refresh_icon)
             .tooltip(|window, cx| Tooltip::new(tr!("diff.refresh")).build(window, cx))
-            .on_click(cx.listener(|this, _, _, cx| this.refresh_right_panel_diff(cx)))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    this.refresh_right_panel_diff(cx);
-                    cx.stop_propagation();
-                }
-            }));
+            .on_click(cx.listener(|this, _, _, cx| this.refresh_right_panel_diff(cx)));
 
         div()
             .h(px(44.0))
@@ -3858,7 +3846,8 @@ impl Waku {
                         gutter
                     });
                 let label_focus = self
-                    .transcript_control_focus(format!("right-panel-diff-gap-{}-label", gap.id), cx);
+                    .transcript_control_focus(format!("right-panel-diff-gap-{}-label", gap.id), cx)
+                    .tab_stop(expandable);
                 let label = div()
                     .id(SharedString::from(format!(
                         "right-panel-diff-gap-{}-label",
@@ -3894,14 +3883,16 @@ impl Waku {
                                 this.expand_right_panel_diff_gap(index, direction, cx);
                                 cx.stop_propagation();
                             }))
-                            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                    let direction = if event.keystroke.modifiers.shift {
-                                        crate::review_diff::ExpansionDirection::All
-                                    } else {
-                                        crate::review_diff::ExpansionDirection::Both
-                                    };
-                                    this.expand_right_panel_diff_gap(index, direction, cx);
+                            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                                if event.keystroke.modifiers.shift
+                                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                {
+                                    window.prevent_default();
+                                    this.expand_right_panel_diff_gap(
+                                        index,
+                                        crate::review_diff::ExpansionDirection::All,
+                                        cx,
+                                    );
                                     cx.stop_propagation();
                                 }
                             }))
@@ -4050,14 +4041,16 @@ impl Waku {
                 this.expand_right_panel_diff_gap(line_index, direction, cx);
                 cx.stop_propagation();
             }))
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    let direction = if event.keystroke.modifiers.shift {
-                        crate::review_diff::ExpansionDirection::All
-                    } else {
-                        direction
-                    };
-                    this.expand_right_panel_diff_gap(line_index, direction, cx);
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.modifiers.shift
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    window.prevent_default();
+                    this.expand_right_panel_diff_gap(
+                        line_index,
+                        crate::review_diff::ExpansionDirection::All,
+                        cx,
+                    );
                     cx.stop_propagation();
                 }
             }))

@@ -150,6 +150,18 @@ impl ConversationNavigationRail {
     }
 }
 
+fn cached_transcript_control_focus(
+    focuses: &RefCell<HashMap<String, FocusHandle>>,
+    key: impl Into<String>,
+    cx: &mut App,
+) -> FocusHandle {
+    focuses
+        .borrow_mut()
+        .entry(key.into())
+        .or_insert_with(|| cx.focus_handle().tab_stop(true))
+        .clone()
+}
+
 impl Waku {
     // ── Transcript ─────────────────────────────────────────────────────────
 
@@ -158,11 +170,7 @@ impl Waku {
         key: impl Into<String>,
         cx: &mut App,
     ) -> FocusHandle {
-        self.transcript_control_focuses
-            .borrow_mut()
-            .entry(key.into())
-            .or_insert_with(|| cx.focus_handle())
-            .clone()
+        cached_transcript_control_focus(&self.transcript_control_focuses, key, cx)
     }
 
     pub(super) fn render_transcript(
@@ -282,12 +290,6 @@ impl Waku {
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.scroll_transcript_to_bottom(cx);
                             cx.stop_propagation();
-                        }))
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                this.scroll_transcript_to_bottom(cx);
-                                cx.stop_propagation();
-                            }
                         })),
                 )
         });
@@ -904,7 +906,6 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let focus = self.transcript_control_focus(id.clone(), cx);
-        let key_path = path.clone();
         div()
             .id(SharedString::from(id))
             .track_focus(&focus)
@@ -928,12 +929,6 @@ impl Waku {
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 this.open_activity_file(&path, cx);
-            }))
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    this.open_activity_file(&key_path, cx);
-                    cx.stop_propagation();
-                }
             }))
             .into_any_element()
     }
@@ -1250,7 +1245,7 @@ impl Waku {
                 .cloned()
                 .map(|message| {
                     let copied = self.copied_message_feedback.contains_key(&message.id);
-                    let (assistant_footer_copy_content, assistant_footer_time) =
+                    let (assistant_footer_copy_content, assistant_footer_time, _) =
                         self.assistant_response_footer_cached(message_index);
                     let assistant_message_action =
                         self.assistant_message_action_for_message(message_index);
@@ -1426,15 +1421,14 @@ impl Waku {
         else {
             return div().into_any_element();
         };
-        let (copy_content, footer_time) = self.assistant_response_footer_cached(message_index);
-        let Some(copy_content) = copy_content else {
-            return div().into_any_element();
-        };
-        let copied = self.copied_message_feedback.contains_key(&message.id);
-        let action = self.assistant_message_action_for_message(message_index);
-        let force_visible = self
-            .hovered_response_row
-            .is_some_and(|(hovered_turn_id, _)| hovered_turn_id == turn_id);
+        let (copy_content, footer_time, stopped) =
+            self.assistant_response_footer_cached(message_index);
+        let stopped = stopped.map(|label| {
+            div()
+                .text_size(sp(12.5))
+                .text_color(theme.text_secondary)
+                .child(label)
+        });
         let group_name = SharedString::from(format!("assistant-response-footer-{turn_id}"));
         let mut column = div()
             .w_full()
@@ -1442,12 +1436,18 @@ impl Waku {
             .flex()
             .flex_col()
             .gap(px(3.0))
-            .group(group_name.clone());
+            .group(group_name.clone())
+            .children(stopped);
         if let Some(changed_files) = self.render_changed_files_row(turn_id, theme, cx) {
             column = column.child(div().w_full().mb(px(3.0)).child(changed_files));
         }
-        column
-            .child(render_message_footer(
+        if let Some(copy_content) = copy_content {
+            let copied = self.copied_message_feedback.contains_key(&message.id);
+            let action = self.assistant_message_action_for_message(message_index);
+            let force_visible = self
+                .hovered_response_row
+                .is_some_and(|(hovered_turn_id, _)| hovered_turn_id == turn_id);
+            column = column.child(render_message_footer(
                 theme,
                 &message,
                 footer_time.unwrap_or(message.created_at),
@@ -1459,8 +1459,9 @@ impl Waku {
                 action,
                 None,
                 cx.entity().downgrade(),
-            ))
-            .into_any_element()
+            ));
+        }
+        column.into_any_element()
     }
 
     pub(super) fn toggle_changed_files(
@@ -1538,12 +1539,6 @@ impl Waku {
             .child(tr_cow!("transcript.review_changes"))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_turn_diff(turn_id, cx);
-            }))
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    this.open_turn_diff(turn_id, cx);
-                    cx.stop_propagation();
-                }
             }));
 
         let title = if files.len() == 1 {
@@ -1725,12 +1720,6 @@ impl Waku {
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_changed_files(turn_id, expanded, cx);
-                    }))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            this.toggle_changed_files(turn_id, expanded, cx);
-                            cx.stop_propagation();
-                        }
                     })),
             );
         }
@@ -1747,6 +1736,7 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let expanded = self.expanded_turns.contains(&turn_id);
+        let focus = self.transcript_control_focus(format!("turn-fold-{turn_id}"), cx);
         let label = self
             .selected_session()
             .map(|session| turn_fold_label(session, turn_id))
@@ -1761,6 +1751,8 @@ impl Waku {
             .child(
                 div()
                     .id(SharedString::from(format!("turn-fold-{turn_id}")))
+                    .track_focus(&focus)
+                    .tab_index(0)
                     .h(px(24.0))
                     .px(px(2.0))
                     .flex_none()
@@ -1772,6 +1764,7 @@ impl Waku {
                     .line_height(sp(18.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.text_tertiary)
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
                     .child(SharedString::from(label))
                     .child(icon(
                         if expanded {
@@ -1943,12 +1936,6 @@ impl Waku {
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_activities(block_index, expanded, cx);
-                    }))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            this.toggle_activities(block_index, expanded, cx);
-                            cx.stop_propagation();
-                        }
                     })),
             );
         if !expanded {
@@ -1980,7 +1967,6 @@ impl Waku {
                         .map(|item| (session_id, item.key.clone(), item.status))
                 });
             let background_badge = background_work.map(|(session_id, key, status)| {
-                let click_key = key.clone();
                 let focus = self.transcript_control_focus(format!("activity-background-{id}"), cx);
                 let color = work_status_color(status, *theme);
                 div()
@@ -2004,13 +1990,7 @@ impl Waku {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.open_background_work_surface(session_id, click_key.clone(), cx);
-                    }))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            this.open_background_work_surface(session_id, key.clone(), cx);
-                            cx.stop_propagation();
-                        }
+                        this.open_background_work_surface(session_id, key.clone(), cx);
                     }))
             });
             let reasoning = activity.reasoning.as_ref();
@@ -2156,14 +2136,6 @@ impl Waku {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if has_detail {
                                 this.toggle_activity_item(id, item_expanded, cx);
-                            }
-                        }))
-                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                            if has_detail
-                                && matches!(event.keystroke.key.as_str(), "enter" | "space")
-                            {
-                                this.toggle_activity_item(id, item_expanded, cx);
-                                cx.stop_propagation();
                             }
                         })),
                 );
@@ -2901,6 +2873,131 @@ fn decode_activity_image(image_url: &str) -> Option<std::sync::Arc<gpui::Image>>
         .decode(encoded)
         .ok()?;
     (!bytes.is_empty()).then(|| std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)))
+}
+
+#[cfg(test)]
+mod transcript_control_focus_tests {
+    use super::*;
+
+    struct FoldControl {
+        focus: FocusHandle,
+        expanded: bool,
+        calls: Vec<&'static str>,
+    }
+
+    impl Render for FoldControl {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let expanded = self.expanded;
+            div()
+                .size(px(100.0))
+                .key_context("Waku")
+                .on_key_down(crate::ui::navigate_tab)
+                .child(
+                    div()
+                        .id("test-turn-fold")
+                        .size(px(24.0))
+                        .track_focus(&self.focus)
+                        .tab_index(0)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.expanded = !expanded;
+                            this.calls.push("click");
+                            cx.notify();
+                        })),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn fold_control_enter_space_and_click_each_toggle_once(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| FoldControl {
+            focus: cx.focus_handle().tab_stop(true),
+            expanded: false,
+            calls: Vec::new(),
+        });
+        let focus = cx.read_entity(&view, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_keystrokes("enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        cx.run_until_parked();
+        cx.read_entity(&view, |view, _| {
+            assert!(view.expanded);
+            assert_eq!(view.calls, ["click"]);
+        });
+        cx.simulate_keystrokes("space");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("space").unwrap(),
+        });
+        cx.run_until_parked();
+        cx.read_entity(&view, |view, _| {
+            assert!(!view.expanded);
+            assert_eq!(view.calls, ["click", "click"]);
+        });
+        cx.simulate_click(point(px(10.0), px(10.0)), gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.read_entity(&view, |view, _| {
+            assert!(view.expanded);
+            assert_eq!(view.calls, ["click", "click", "click"]);
+        });
+    }
+
+    struct Controls {
+        focuses: RefCell<HashMap<String, FocusHandle>>,
+        can_continue: bool,
+    }
+
+    impl Render for Controls {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let allow = cached_transcript_control_focus(&self.focuses, "allow", cx);
+            let deny = cached_transcript_control_focus(&self.focuses, "deny", cx);
+            let next = cached_transcript_control_focus(&self.focuses, "continue", cx)
+                .tab_stop(self.can_continue);
+            div()
+                .size(px(100.0))
+                .on_key_down(crate::ui::navigate_tab)
+                .child(div().size(px(20.0)).track_focus(&allow).tab_index(0))
+                .child(div().size(px(20.0)).track_focus(&next).tab_index(0))
+                .child(div().size(px(20.0)).track_focus(&deny).tab_index(0))
+        }
+    }
+
+    #[gpui::test]
+    fn transcript_controls_skip_disabled_continue_and_rejoin_tab_order(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| Controls {
+            focuses: RefCell::new(HashMap::new()),
+            can_continue: false,
+        });
+        let (allow, deny, next) = cx.read_entity(&view, |view, _| {
+            let focuses = view.focuses.borrow();
+            (
+                focuses["allow"].clone(),
+                focuses["deny"].clone(),
+                focuses["continue"].clone(),
+            )
+        });
+        cx.update(|window, cx| window.focus(&allow, cx));
+        cx.simulate_keystrokes("tab");
+        assert!(cx.update(|window, _| deny.is_focused(window)));
+        cx.simulate_keystrokes("shift-tab");
+        assert!(cx.update(|window, _| allow.is_focused(window)));
+        cx.update_entity(&view, |view, cx| {
+            view.can_continue = true;
+            cx.notify();
+        });
+        cx.simulate_keystrokes("tab");
+        assert!(cx.update(|window, _| next.is_focused(window)));
+        cx.simulate_keystrokes("tab");
+        assert!(cx.update(|window, _| deny.is_focused(window)));
+        cx.update_entity(&view, |view, cx| {
+            view.can_continue = false;
+            cx.notify();
+        });
+        cx.simulate_keystrokes("shift-tab");
+        assert!(cx.update(|window, _| allow.is_focused(window)));
+    }
 }
 
 #[cfg(test)]

@@ -1494,7 +1494,8 @@ pub struct Waku {
     /// every visible row on every frame, and the underlying turn walk and
     /// answer join are O(session). Footers exist only for settled turns,
     /// whose parts are immutable, and settling moves the fingerprint.
-    assistant_footer_cache: RefCell<HashMap<usize, (Option<SharedString>, Option<u64>)>>,
+    assistant_footer_cache:
+        RefCell<HashMap<usize, (Option<SharedString>, Option<u64>, Option<SharedString>)>>,
     /// The row-kinds fingerprint `assistant_footer_cache` was built under.
     assistant_footer_fingerprint: Cell<Option<u64>>,
     /// The response row currently under the pointer. Response footers are

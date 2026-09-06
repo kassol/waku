@@ -106,24 +106,9 @@ impl ActivationExt for Stateful<Div> {
     where
         E: 'static,
     {
-        let activate = std::rc::Rc::new(activate);
-        let click_activate = activate.clone();
-        let key_activate = activate;
         self.on_click(cx.listener(move |this, _, window, cx| {
-            click_activate(this, window, cx);
+            activate(this, window, cx);
             cx.stop_propagation();
-        }))
-        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-            // Bare Enter/Space only. A modified chord belongs to whatever
-            // command owns it, so a focused control must not swallow it —
-            // this is the guard the hand-rolled settings toggles carried
-            // before they moved onto this helper.
-            if !event.keystroke.modifiers.modified()
-                && matches!(event.keystroke.key.as_str(), "enter" | "space")
-            {
-                key_activate(this, window, cx);
-                cx.stop_propagation();
-            }
         }))
     }
 }
@@ -475,6 +460,43 @@ impl RenderOnce for ProjectNameSelector {
 mod tests {
     use super::*;
     gpui::actions!(tab_navigation_test, [ConsumeTab]);
+
+    struct ActivationHarness {
+        focus: gpui::FocusHandle,
+        calls: usize,
+    }
+
+    impl gpui::Render for ActivationHarness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("activation")
+                .size(px(40.0))
+                .track_focus(&self.focus)
+                .on_activation(cx, |this, _, cx| {
+                    this.calls += 1;
+                    cx.notify();
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn activation_runs_once_per_complete_key_press(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| ActivationHarness {
+            focus: cx.focus_handle().tab_stop(true),
+            calls: 0,
+        });
+        let focus = cx.read_entity(&view, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        for (key, expected) in [("enter", 1), ("space", 2), ("shift-enter", 2)] {
+            cx.simulate_keystrokes(key);
+            cx.run_until_parked();
+            cx.simulate_event(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse(key).unwrap(),
+            });
+            cx.run_until_parked();
+            assert_eq!(cx.read_entity(&view, |view, _| view.calls), expected);
+        }
+    }
 
     struct TabHarness {
         first: gpui::FocusHandle,
