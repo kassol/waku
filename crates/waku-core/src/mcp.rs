@@ -20,6 +20,9 @@ struct SpawnArguments {
     model: Option<String>,
     title: Option<String>,
     runtime_mode: Option<RuntimeMode>,
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    workspace: crate::protocol::CreationWorkspace,
 }
 
 pub fn run_stdio(
@@ -94,10 +97,19 @@ pub fn run_stdio(
                 "tools": [
                     {
                         "name": "waku_spawn_session",
-                        "description": "Create a direct Claude or Codex child in a new Git worktree. No automatic retry after a lost response.",
+                        "description": "Create a direct Claude or Codex child. workspace defaults to worktree; inherit uses the parent directory and local uses the project checkout. Reuse idempotency_key with the same arguments to recover the same result after disconnect or restart. Without a key retries are not deduplicated; never automatically resend an uncertain creation.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
+                                "idempotency_key": {
+                                    "type": "string",
+                                    "minLength": 1
+                                },
+                                "workspace": {
+                                    "type": "string",
+                                    "enum": ["worktree", "inherit", "local"],
+                                    "default": "worktree"
+                                },
                                 "provider": {
                                     "type": "string",
                                     "enum": [
@@ -225,6 +237,7 @@ pub fn run_stdio(
                         } if returned == request_id => {
                             let (text,failed) = match outcome {
                                 ResponseOutcome::Ok { payload:ResponsePayload::SessionCreated {session,workspace_path,branch,..} } => (json!({"session_id":session.id,"workspace_path":workspace_path,"branch":branch}).to_string(),false),
+                                ResponseOutcome::Ok { payload: failure @ ResponsePayload::SessionCreationFailed { .. } } => (serde_json::to_string(&failure)?, true),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildSessions {sessions} } => (json!({"sessions":sessions}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildStatus {sessions,timed_out} } => (json!({"sessions":sessions,"timed_out":timed_out}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildResult {session,reply,reply_truncated,transcript,transcript_truncated} } => (json!({"session":session,"reply":reply,"reply_truncated":reply_truncated,"transcript":transcript,"transcript_truncated":transcript_truncated}).to_string(),false),
@@ -281,6 +294,8 @@ fn tool_command(name: &str, arguments: Value) -> Result<Command, String> {
             model: args.model,
             title: args.title,
             runtime_mode: args.runtime_mode,
+            idempotency_key: args.idempotency_key,
+            workspace: args.workspace,
         })
     } else if name == "waku_list_sessions" || name == "waku_status" || name == "waku_result" {
         let mut arguments = arguments

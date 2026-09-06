@@ -20,7 +20,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -32,6 +32,25 @@ pub struct DaemonReady {
     pub address: String,
     pub protocol_version: u32,
     pub pid: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum CreationStage {
+    #[default]
+    Workspace,
+    SessionSave,
+    ProviderStart,
+    FirstPrompt,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum CreationWorkspace {
+    #[default]
+    Worktree,
+    Inherit,
+    Local,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -138,6 +157,10 @@ pub enum Command {
         title: Option<String>,
         #[serde(default)]
         runtime_mode: Option<RuntimeMode>,
+        #[serde(default)]
+        idempotency_key: Option<String>,
+        #[serde(default)]
+        workspace: CreationWorkspace,
     },
     /// Stop accepting work and confirm all provider tails are durable.
     PrepareShutdown,
@@ -475,12 +498,20 @@ pub enum ResponsePayload {
         transcript: Option<String>,
         transcript_truncated: bool,
     },
+    SessionCreationFailed {
+        stage: CreationStage,
+        uncertain: bool,
+        session_id: Option<Uuid>,
+        workspace_path: Option<PathBuf>,
+        branch: Option<String>,
+        error: String,
+    },
     SessionCreated {
         session: AgentSession,
         runtime_id: Uuid,
         turn_id: Uuid,
         workspace_path: PathBuf,
-        branch: String,
+        branch: Option<String>,
     },
     Ack,
     SessionRuntime {
@@ -644,7 +675,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(PROTOCOL_VERSION, 12);
     }
 
     #[test]
@@ -653,7 +684,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(PROTOCOL_VERSION, 12);
     }
 
     #[test]

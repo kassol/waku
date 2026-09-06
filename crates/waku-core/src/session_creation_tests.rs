@@ -149,6 +149,680 @@ fn creates_codex_child_in_isolated_worktree_and_restores_its_history() {
     });
 }
 
+#[test]
+fn same_creation_key_reuses_one_child_across_concurrent_transport_requests() {
+    with_creation_daemon(|client, observer, _root, project_path, _address| {
+        let project = Project::from_path(project_path.to_owned());
+        let mut parent = AgentSession::new(project.id, ProviderKind::Codex);
+        parent.begin_turn("Delegate");
+        let parent_id = parent.id;
+        client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project],
+                    live_session_ids: vec![parent_id],
+                    sessions: vec![parent],
+                },
+            )
+            .unwrap();
+        let command: Command = serde_json::from_value(json!({
+            "type": "createSession", "provider": "codex", "prompt": "write fixture result",
+            "idempotencyKey": "same-task"
+        }))
+        .unwrap();
+        let concurrent = command.clone();
+        let first =
+            std::thread::spawn(move || client.request(parent_id, Uuid::nil(), concurrent).unwrap());
+        let second = observer
+            .request(parent_id, Uuid::nil(), command.clone())
+            .unwrap();
+        let first = first.join().unwrap();
+        let ResponsePayload::SessionCreated {
+            session,
+            workspace_path,
+            ..
+        } = &first
+        else {
+            panic!("{first:?}")
+        };
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+        let again = observer.request(parent_id, Uuid::nil(), command).unwrap();
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(again).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_path.join("child-calls.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let ResponsePayload::TaskState { sessions, .. } = observer
+            .request(Uuid::nil(), Uuid::nil(), Command::LoadTaskState)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            sessions
+                .iter()
+                .filter(|child| child.parent_session_id == Some(parent_id))
+                .map(|child| child.id)
+                .collect::<Vec<_>>(),
+            vec![session.id]
+        );
+    });
+}
+
+#[test]
+fn cached_creation_revalidates_the_original_child_permissions() {
+    with_creation_daemon(|client, _observer, _root, project_path, _address| {
+        let project = Project::from_path(project_path.to_owned());
+        let mut parent = AgentSession::new(project.id, ProviderKind::Codex);
+        parent.runtime_mode = RuntimeMode::FullAccess;
+        parent.begin_turn("Delegate");
+        let parent_id = parent.id;
+        let save = |parent| Command::SaveTaskState {
+            projects: vec![project.clone()],
+            live_session_ids: vec![parent_id],
+            sessions: vec![parent],
+        };
+        client
+            .request(Uuid::nil(), Uuid::nil(), save(parent.clone()))
+            .unwrap();
+        let command: Command = serde_json::from_value(json!({"type":"createSession", "provider":"codex", "prompt":"write fixture result", "idempotencyKey":"permissions"})).unwrap();
+        assert!(matches!(
+            client
+                .request(parent_id, Uuid::nil(), command.clone())
+                .unwrap(),
+            ResponsePayload::SessionCreated { .. }
+        ));
+        parent.runtime_mode = RuntimeMode::Ask;
+        client
+            .request(Uuid::nil(), Uuid::nil(), save(parent))
+            .unwrap();
+        assert!(
+            client.request(parent_id, Uuid::nil(), command).is_err(),
+            "cached FullAccess child must not bypass the parent's current Ask ceiling"
+        );
+    });
+}
+
+#[test]
+fn transport_cached_creation_revalidates_parent_permissions() {
+    with_creation_daemon(|client, _observer, _root, project_path, address| {
+        let project = Project::from_path(project_path.to_owned());
+        let mut parent = AgentSession::new(project.id, ProviderKind::Codex);
+        parent.runtime_mode = RuntimeMode::FullAccess;
+        parent.begin_turn("Delegate");
+        let parent_id = parent.id;
+        client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project.clone()],
+                    live_session_ids: vec![parent_id],
+                    sessions: vec![parent.clone()],
+                },
+            )
+            .unwrap();
+        let request = Request { request_id: Uuid::new_v4(), session_id: parent_id, runtime_id: Uuid::nil(), command: serde_json::from_value(json!({"type":"createSession", "provider":"codex", "prompt":"write fixture result", "idempotencyKey":"transport-permissions"})).unwrap() };
+        let mut socket = creation_socket(address);
+        let message = serde_json::to_string(&ClientMessage::Request(request.clone())).unwrap();
+        socket.send(Message::Text(message.clone().into())).unwrap();
+        assert!(matches!(
+            creation_response(&mut socket, request.request_id),
+            ResponseOutcome::Ok {
+                payload: ResponsePayload::SessionCreated { .. }
+            }
+        ));
+        parent.runtime_mode = RuntimeMode::Ask;
+        client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project],
+                    live_session_ids: vec![parent_id],
+                    sessions: vec![parent],
+                },
+            )
+            .unwrap();
+        socket.send(Message::Text(message.into())).unwrap();
+        assert!(
+            matches!(
+                creation_response(&mut socket, request.request_id),
+                ResponseOutcome::Error { .. }
+            ),
+            "transport cache must recheck the parent's permission ceiling"
+        );
+    });
+}
+
+#[test]
+fn creation_workspace_choices_use_the_requested_existing_directory() {
+    with_creation_daemon(|client, _observer, root, project_path, _address| {
+        let parent_path = root.join("parent-worktree");
+        git(
+            project_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "parent-work",
+                parent_path.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(parent_path.join("user-data.txt"), "keep this change").unwrap();
+        let project = Project::from_path(project_path.to_owned());
+        let mut parent = AgentSession::new(project.id, ProviderKind::Codex);
+        parent.workspace = crate::model::SessionWorkspace::Worktree {
+            path: parent_path.clone(),
+            branch: "parent-work".into(),
+        };
+        parent.begin_turn("Delegate");
+        let parent_id = parent.id;
+        client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project],
+                    live_session_ids: vec![parent_id],
+                    sessions: vec![parent],
+                },
+            )
+            .unwrap();
+        for (choice, expected) in [("inherit", parent_path.as_path()), ("local", project_path)] {
+            let command = serde_json::from_value(json!({ "type":"createSession", "provider":"codex", "prompt":"write fixture result", "workspace":choice, "idempotencyKey":choice })).unwrap();
+            let ResponsePayload::SessionCreated {
+                workspace_path,
+                session,
+                runtime_id,
+                ..
+            } = client.request(parent_id, Uuid::nil(), command).unwrap()
+            else {
+                panic!("creation failed")
+            };
+            assert_eq!(workspace_path, expected);
+            client
+                .request(session.id, runtime_id, Command::CloseSession)
+                .unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(parent_path.join("user-data.txt")).unwrap(),
+            "keep this change"
+        );
+        assert!(!root.join("worktrees").exists());
+    });
+}
+
+#[test]
+fn failed_creation_returns_its_stage_and_retained_resources() {
+    with_creation_daemon(|client, _observer, _root, project_path, _address| {
+        let project = Project::from_path(project_path.to_owned());
+        let mut parent = AgentSession::new(project.id, ProviderKind::Codex);
+        parent.begin_turn("Delegate");
+        let parent_id = parent.id;
+        client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project],
+                    live_session_ids: vec![parent_id],
+                    sessions: vec![parent],
+                },
+            )
+            .unwrap();
+        let command: Command = serde_json::from_value(json!({ "type":"createSession", "provider":"codex", "prompt":"reject fixture turn", "idempotencyKey":"failed-task" })).unwrap();
+        let failure = client
+            .request(parent_id, Uuid::nil(), command.clone())
+            .unwrap();
+        let ResponsePayload::SessionCreationFailed {
+            stage,
+            session_id: Some(child_id),
+            workspace_path: Some(path),
+            error,
+            ..
+        } = &failure
+        else {
+            panic!("{failure:?}")
+        };
+        assert_eq!(*stage, crate::protocol::CreationStage::FirstPrompt);
+        assert!(path.is_dir());
+        assert!(error.contains("fixture rejected"));
+        let ResponsePayload::Session {
+            session: Some(child),
+        } = client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::HydrateSession {
+                    session_id: *child_id,
+                },
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(child.status, SessionStatus::Failed);
+        assert_eq!(
+            serde_json::to_value(&failure).unwrap(),
+            serde_json::to_value(client.request(parent_id, Uuid::nil(), command).unwrap()).unwrap()
+        );
+    });
+}
+
+#[test]
+fn creation_keys_survive_restart_and_conflict_without_repeating_the_first_prompt() {
+    with_creation_daemon(|client, _observer, root, project_path, _address| {
+        let project = Project::from_path(project_path.to_owned());
+        let mut parent = AgentSession::new(project.id, ProviderKind::Codex);
+        parent.begin_turn("Delegate");
+        let parent_id = parent.id;
+        client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project.clone()],
+                    live_session_ids: vec![parent_id],
+                    sessions: vec![parent.clone()],
+                },
+            )
+            .unwrap();
+        let command: Command = serde_json::from_value(json!({"type":"createSession", "provider":"codex", "prompt":"write fixture result", "idempotencyKey":"restart"})).unwrap();
+        let created = client
+            .request(parent_id, Uuid::nil(), command.clone())
+            .unwrap();
+        let ResponsePayload::SessionCreated {
+            workspace_path,
+            session,
+            ..
+        } = &created
+        else {
+            panic!("{created:?}")
+        };
+        let child_id = session.id;
+        client
+            .request(Uuid::nil(), Uuid::nil(), Command::PrepareShutdown)
+            .unwrap();
+        with_reopened_creation_daemon(root, |reopened| {
+            assert_eq!(
+                serde_json::to_value(
+                    reopened
+                        .request(parent_id, Uuid::nil(), command.clone())
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(&created).unwrap()
+            );
+            let mut conflict = command.clone();
+            if let Command::CreateSession { prompt, .. } = &mut conflict {
+                *prompt = "different task".into();
+            }
+            assert!(
+                reopened
+                    .request(parent_id, Uuid::nil(), conflict)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("conflicts")
+            );
+            let mut second_parent = parent.clone();
+            second_parent.id = Uuid::new_v4();
+            reopened
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::SaveTaskState {
+                        projects: vec![project.clone()],
+                        live_session_ids: vec![second_parent.id],
+                        sessions: vec![second_parent.clone()],
+                    },
+                )
+                .unwrap();
+            let ResponsePayload::SessionCreated {
+                session: second, ..
+            } = reopened
+                .request(second_parent.id, Uuid::nil(), command.clone())
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_ne!(second.id, child_id, "keys are scoped to each manager");
+            let mut moved = parent;
+            let other_project = Project::from_path(root.to_owned());
+            moved.project_id = other_project.id;
+            reopened
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::SaveTaskState {
+                        projects: vec![project, other_project],
+                        live_session_ids: vec![parent_id],
+                        sessions: vec![moved],
+                    },
+                )
+                .unwrap();
+            assert!(
+                reopened
+                    .request(parent_id, Uuid::nil(), command.clone())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("different steward project")
+            );
+            reopened
+                .request(parent_id, Uuid::nil(), Command::RemoveSession)
+                .unwrap();
+            assert!(reopened.request(parent_id, Uuid::nil(), command).is_err());
+            assert_eq!(
+                std::fs::read_to_string(workspace_path.join("child-calls.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        });
+    });
+}
+
+#[test]
+fn interrupted_creation_is_reported_after_restart_without_resending_input() {
+    with_creation_daemon(|client, _observer, root, project_path, _address| {
+        let project = Project::from_path(project_path.to_owned());
+        let mut parent = AgentSession::new(project.id, ProviderKind::Codex);
+        parent.begin_turn("Delegate");
+        let parent_id = parent.id;
+        client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project],
+                    live_session_ids: vec![parent_id],
+                    sessions: vec![parent],
+                },
+            )
+            .unwrap();
+        let command: Command = serde_json::from_value(json!({"type":"createSession", "provider":"codex", "prompt":"write fixture result", "idempotencyKey":"interrupted"})).unwrap();
+        let ResponsePayload::SessionCreated {
+            workspace_path,
+            session,
+            ..
+        } = client
+            .request(parent_id, Uuid::nil(), command.clone())
+            .unwrap()
+        else {
+            panic!()
+        };
+        client
+            .request(Uuid::nil(), Uuid::nil(), Command::PrepareShutdown)
+            .unwrap();
+        // Reconstruct the durable checkpoint immediately before outcome commit.
+        // The provider's real first prompt has already modified the worktree.
+        let connection = rusqlite::Connection::open(root.join("app.db")).unwrap();
+        connection.execute("UPDATE session_creations SET complete = 0, data = json_set(data, '$.outcome', NULL)", []).unwrap();
+        drop(connection);
+        with_reopened_creation_daemon(root, |reopened| {
+            let failure = reopened
+                .request(parent_id, Uuid::nil(), command.clone())
+                .unwrap();
+            assert!(
+                matches!(failure, ResponsePayload::SessionCreationFailed { uncertain: true, session_id: Some(id), stage: crate::protocol::CreationStage::FirstPrompt, .. } if id == session.id)
+            );
+            assert_eq!(
+                serde_json::to_value(&failure).unwrap(),
+                serde_json::to_value(reopened.request(parent_id, Uuid::nil(), command).unwrap())
+                    .unwrap()
+            );
+            let ResponsePayload::Session {
+                session: Some(child),
+            } = reopened
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::HydrateSession {
+                        session_id: session.id,
+                    },
+                )
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert!(
+                child
+                    .last_driver_error
+                    .as_ref()
+                    .unwrap()
+                    .contains("interrupted")
+            );
+            assert_eq!(
+                std::fs::read_to_string(workspace_path.join("child-calls.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            assert!(workspace_path.join("child-result.txt").exists());
+        });
+    });
+}
+
+#[test]
+fn workspace_and_provider_start_failures_retain_their_recorded_resources() {
+    for stage in [
+        crate::protocol::CreationStage::Workspace,
+        crate::protocol::CreationStage::ProviderStart,
+    ] {
+        with_creation_daemon(|client, _observer, root, project_path, _address| {
+            let project = Project::from_path(project_path.to_owned());
+            let mut parent = AgentSession::new(project.id, ProviderKind::Codex);
+            parent.begin_turn("Delegate");
+            let parent_id = parent.id;
+            client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::SaveTaskState {
+                        projects: vec![project],
+                        live_session_ids: vec![parent_id],
+                        sessions: vec![parent],
+                    },
+                )
+                .unwrap();
+            if stage == crate::protocol::CreationStage::Workspace {
+                std::fs::write(root.join("worktrees"), "existing user file").unwrap();
+            } else {
+                std::fs::remove_file(root.join("codex-fixture")).unwrap();
+            }
+            let command: Command = serde_json::from_value(json!({"type":"createSession", "provider":"codex", "prompt":"write fixture result", "idempotencyKey":"failure"})).unwrap();
+            let failure = client
+                .request(parent_id, Uuid::nil(), command.clone())
+                .unwrap();
+            let ResponsePayload::SessionCreationFailed {
+                stage: actual,
+                workspace_path: Some(path),
+                ..
+            } = &failure
+            else {
+                panic!("{failure:?}")
+            };
+            assert_eq!(*actual, stage);
+            assert!(!path.join("child-calls.jsonl").exists());
+            if stage == crate::protocol::CreationStage::Workspace {
+                assert_eq!(
+                    std::fs::read_to_string(root.join("worktrees")).unwrap(),
+                    "existing user file"
+                );
+            } else {
+                assert!(path.is_dir());
+            }
+            client
+                .request(Uuid::nil(), Uuid::nil(), Command::PrepareShutdown)
+                .unwrap();
+            with_reopened_creation_daemon(root, |reopened| {
+                assert_eq!(
+                    serde_json::to_value(&failure).unwrap(),
+                    serde_json::to_value(
+                        reopened.request(parent_id, Uuid::nil(), command).unwrap()
+                    )
+                    .unwrap()
+                );
+            });
+        });
+    }
+}
+
+#[test]
+fn different_creation_keys_run_concurrently() {
+    with_creation_daemon(|client, observer, root, project_path, _address| {
+        let project = Project::from_path(project_path.to_owned());
+        let mut parent = AgentSession::new(project.id, ProviderKind::Codex);
+        parent.begin_turn("Delegate");
+        let parent_id = parent.id;
+        client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project],
+                    live_session_ids: vec![parent_id],
+                    sessions: vec![parent],
+                },
+            )
+            .unwrap();
+        let hold: Command = serde_json::from_value(json!({"type":"createSession", "provider":"codex", "prompt":"hold fixture turn", "workspace":"local", "idempotencyKey":"held"})).unwrap();
+        let held = std::thread::spawn(move || observer.request(parent_id, Uuid::nil(), hold));
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while !project_path.join("creation-waiting").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let other = serde_json::from_value(json!({"type":"createSession", "provider":"codex", "prompt":"write fixture result", "idempotencyKey":"other"})).unwrap();
+        assert!(matches!(
+            client.request(parent_id, Uuid::nil(), other).unwrap(),
+            ResponsePayload::SessionCreated { .. }
+        ));
+        assert!(
+            !held.is_finished(),
+            "different keys must complete independently of the held first prompt"
+        );
+        std::fs::write(project_path.join("creation-release"), "continue").unwrap();
+        assert!(matches!(
+            held.join().unwrap().unwrap(),
+            ResponsePayload::SessionCreated { .. }
+        ));
+        assert!(root.join("worktrees").is_dir());
+    });
+}
+
+#[test]
+fn parent_project_is_revalidated_after_worktree_creation() {
+    with_creation_daemon(|client, observer, root, project_path, _address| {
+        let project = Project::from_path(project_path.to_owned());
+        let mut parent = AgentSession::new(project.id, ProviderKind::Codex);
+        parent.begin_turn("Delegate");
+        let parent_id = parent.id;
+        client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project.clone()],
+                    live_session_ids: vec![parent_id],
+                    sessions: vec![parent.clone()],
+                },
+            )
+            .unwrap();
+        let hook = project_path.join(".git/hooks/post-checkout");
+        std::fs::write(&hook, "#!/usr/bin/env python3\nimport pathlib,time\np=pathlib.Path(__file__).resolve().parents[2]\n(p/'hook-waiting').touch()\ndeadline=time.monotonic()+15\nwhile not (p/'hook-release').exists() and time.monotonic()<deadline: time.sleep(.01)\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = serde_json::from_value(json!({"type":"createSession", "provider":"codex", "prompt":"write fixture result", "idempotencyKey":"moving-parent"})).unwrap();
+        let creating =
+            std::thread::spawn(move || observer.request(parent_id, Uuid::nil(), command));
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while !project_path.join("hook-waiting").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "checkout hook did not run"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let other = Project::from_path(root.to_owned());
+        parent.project_id = other.id;
+        client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project, other],
+                    live_session_ids: vec![parent_id],
+                    sessions: vec![parent],
+                },
+            )
+            .unwrap();
+        std::fs::write(project_path.join("hook-release"), "continue").unwrap();
+        let ResponsePayload::SessionCreationFailed {
+            error,
+            workspace_path: Some(path),
+            ..
+        } = creating.join().unwrap().unwrap()
+        else {
+            panic!("moved parent must fail creation")
+        };
+        assert!(error.contains("parent project changed"), "{error}");
+        assert!(path.is_dir());
+        assert!(!path.join("child-calls.jsonl").exists());
+        let ResponsePayload::TaskState { sessions, .. } = client
+            .request(Uuid::nil(), Uuid::nil(), Command::LoadTaskState)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(sessions.len(), 1);
+    });
+}
+
+fn with_reopened_creation_daemon(root: &Path, test: impl FnOnce(DaemonClient)) {
+    let backend = Arc::new(
+        WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let stop = stopping.clone();
+    let service = backend.clone();
+    let server = std::thread::spawn(move || {
+        serve(
+            listener,
+            "fixture".into(),
+            service,
+            stop,
+            ServerOptions::default(),
+        )
+        .unwrap()
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        test(DaemonClient::connect(&address.to_string(), "fixture".into()).unwrap())
+    }));
+    stopping.store(true, Ordering::Release);
+    server.join().unwrap();
+    drop(backend);
+    result.unwrap();
+}
+
 fn with_creation_daemon(
     test: impl FnOnce(DaemonClient, DaemonClient, &Path, &Path, std::net::SocketAddr),
 ) {
@@ -262,10 +936,12 @@ fn child_creation_reports_provider_rejection_and_retains_failed_history_and_work
                 model: None,
                 title: None,
                 runtime_mode: None,
+                idempotency_key: None,
+                workspace: crate::protocol::CreationWorkspace::Worktree,
             },
         );
         assert!(
-            result.is_err(),
+            matches!(result, Ok(ResponsePayload::SessionCreationFailed { .. })),
             "provider rejection must fail the creation request: {result:?}"
         );
         let store = StateStore::daemon(root.join("app.db"));
@@ -318,6 +994,8 @@ fn child_permissions_and_parent_relationship_are_daemon_authoritative() {
             model: None,
             title: None,
             runtime_mode: mode,
+            idempotency_key: None,
+            workspace: crate::protocol::CreationWorkspace::Worktree,
         };
         assert!(
             client
@@ -510,6 +1188,8 @@ fn child_creation_excludes_concurrent_runtime_replacement_and_removal() {
                     model: None,
                     title: None,
                     runtime_mode: None,
+                    idempotency_key: None,
+                    workspace: crate::protocol::CreationWorkspace::Worktree,
                 },
             )
         });
@@ -664,6 +1344,8 @@ fn concurrent_creation_retransmissions_share_one_child_and_the_same_response() {
                 model: None,
                 title: None,
                 runtime_mode: None,
+                idempotency_key: None,
+                workspace: crate::protocol::CreationWorkspace::Worktree,
             },
         }))
         .unwrap();
@@ -789,6 +1471,8 @@ fn owned_shutdown_waits_for_child_creation_then_drains_its_saved_runtime() {
             model: None,
             title: None,
             runtime_mode: None,
+            idempotency_key: None,
+            workspace: crate::protocol::CreationWorkspace::Worktree,
         };
         let creation = std::thread::spawn(move || {
             observer.request(parent_id, Uuid::nil(), create("hold fixture turn"))
@@ -961,14 +1645,22 @@ fn failed_initial_child_save_disables_new_creation_before_provider_start() {
             model: None,
             title: None,
             runtime_mode: None,
+            idempotency_key: None,
+            workspace: crate::protocol::CreationWorkspace::Worktree,
         };
-        let failed_save = client
-            .request(parent_id, Uuid::nil(), create())
-            .unwrap_err();
-        assert!(
-            failed_save.to_string().contains("could not save child"),
-            "{failed_save:#}"
-        );
+        let failed_save = client.request(parent_id, Uuid::nil(), create()).unwrap();
+        let ResponsePayload::SessionCreationFailed {
+            stage,
+            error,
+            workspace_path: Some(path),
+            ..
+        } = failed_save
+        else {
+            panic!("missing structured failure")
+        };
+        assert_eq!(stage, crate::protocol::CreationStage::SessionSave);
+        assert!(error.contains("could not save child"), "{error}");
+        assert!(path.is_dir());
         connection
             .execute_batch("DROP TRIGGER reject_child_save;")
             .unwrap();

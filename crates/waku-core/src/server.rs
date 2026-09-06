@@ -77,6 +77,10 @@ pub trait Backend: Send + Sync + 'static {
         bail!("steward sessions are unavailable")
     }
 
+    fn authorize_cached_creation(&self, _child: &AgentSession) -> anyhow::Result<()> {
+        bail!("cached child creation is unavailable")
+    }
+
     fn shutdown(&self) {}
 }
 
@@ -627,7 +631,7 @@ impl Hub {
             drop(state);
             let _ = outgoing.send(ServerMessage::Response {
                 request_id,
-                outcome,
+                outcome: self.validate_cached_creation(outcome),
             });
             return false;
         }
@@ -648,14 +652,30 @@ impl Hub {
     }
 
     fn cached_response_as(&self, principal: Uuid, request_id: Uuid) -> Option<ResponseOutcome> {
-        self.state
+        let outcome = self
+            .state
             .lock()
             .responses
             .iter()
             .rev()
             .find_map(|(cached_id, outcome)| {
                 (*cached_id == (principal, request_id)).then(|| outcome.clone())
-            })
+            });
+        outcome.map(|outcome| self.validate_cached_creation(outcome))
+    }
+
+    fn validate_cached_creation(&self, outcome: ResponseOutcome) -> ResponseOutcome {
+        if let ResponseOutcome::Ok {
+            payload: ResponsePayload::SessionCreated { session, .. },
+        } = &outcome
+            && let Some(backend) = self.backend.as_ref().and_then(Weak::upgrade)
+            && let Err(error) = backend.authorize_cached_creation(session)
+        {
+            return ResponseOutcome::Error {
+                error: RpcError::from(error),
+            };
+        }
+        outcome
     }
 
     fn cache_response(&self, request_id: Uuid, outcome: ResponseOutcome) {

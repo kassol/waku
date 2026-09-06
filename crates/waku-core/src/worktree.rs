@@ -43,6 +43,27 @@ pub(crate) fn create_in(
     prompt: &str,
     requested_base: Option<&str>,
 ) -> anyhow::Result<CreatedWorktree> {
+    create_in_before(
+        project_path,
+        worktree_root,
+        project_id,
+        session_id,
+        prompt,
+        requested_base,
+        |_| Ok(()),
+    )
+}
+
+/// Persist the chosen path before creating any directory or Git resource.
+pub(crate) fn create_in_before(
+    project_path: &Path,
+    worktree_root: &Path,
+    project_id: Uuid,
+    session_id: Uuid,
+    prompt: &str,
+    requested_base: Option<&str>,
+    mut before_create: impl FnMut(&CreatedWorktree) -> anyhow::Result<()>,
+) -> anyhow::Result<CreatedWorktree> {
     let project_path = fs::canonicalize(project_path)
         .with_context(|| format!("could not open project {}", project_path.display()))?;
     let repository = git_stdout(&project_path, &["rev-parse", "--show-toplevel"])
@@ -65,12 +86,6 @@ pub(crate) fn create_in(
     )
     .with_context(|| format!("base branch `{base_ref}` is unavailable"))?;
     let project_worktrees = worktree_root.join(project_id.to_string());
-    fs::create_dir_all(&project_worktrees).with_context(|| {
-        format!(
-            "could not create the worktree directory {}",
-            project_worktrees.display()
-        )
-    })?;
 
     let slug = worktree_slug(prompt);
     for index in 0..MAX_CANDIDATES {
@@ -81,6 +96,16 @@ pub(crate) fn create_in(
             continue;
         }
 
+        before_create(&CreatedWorktree {
+            path: path.join(&project_relative),
+            branch: branch.clone(),
+        })?;
+        fs::create_dir_all(&project_worktrees).with_context(|| {
+            format!(
+                "could not create the worktree directory {}",
+                project_worktrees.display()
+            )
+        })?;
         let output = crate::command_env::plain_command("git")
             .args(["worktree", "add", "-b"])
             .arg(&branch)
@@ -114,6 +139,16 @@ pub(crate) fn create_in(
     if path.exists() || local_branch_exists(&repository, &branch)? {
         bail!("could not allocate a unique Git worktree name");
     }
+    before_create(&CreatedWorktree {
+        path: path.join(&project_relative),
+        branch: branch.clone(),
+    })?;
+    fs::create_dir_all(&project_worktrees).with_context(|| {
+        format!(
+            "could not create the worktree directory {}",
+            project_worktrees.display()
+        )
+    })?;
     let output = crate::command_env::plain_command("git")
         .args(["worktree", "add", "-b"])
         .arg(&branch)

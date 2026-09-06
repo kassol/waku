@@ -8,7 +8,7 @@
 - 设计 v2：[设计 v2](waku-steward-design.md)。
 - 当前一期澄清：[澄清记录](waku-steward-scope.md)，包含逐项已确认决策、ADR 与当前源码证据。
 - 已发布规格：[GitHub Issue #1](https://github.com/kassol/waku/issues/1)；仓库副本见[一期规格](waku-steward-spec.md)。规格和测试边界已确认；本轮已获实现授权。
-- 已发布任务：[11 张纵向任务清单](waku-steward-tickets.md)，对应 GitHub #2–#12，具备原生阻塞关系。已完成 [#2 测试 App 独立启动与资源隔离](https://github.com/kassol/waku/issues/2) 和 [#3 历史持久化](https://github.com/kassol/waku/issues/3)，继续推进 [#4 Codex 子会话创建](https://github.com/kassol/waku/issues/4) ；[#11 安全退出](https://github.com/kassol/waku/issues/11) 已验收。
+- 已发布任务：[11 张纵向任务清单](waku-steward-tickets.md)，对应 GitHub #2–#12，具备原生阻塞关系。已完成 [#2 测试 App 独立启动与资源隔离](https://github.com/kassol/waku/issues/2) 和 [#3 历史持久化](https://github.com/kassol/waku/issues/3)，[#4 Codex 子会话创建](https://github.com/kassol/waku/issues/4) 已验收；[#11 安全退出](https://github.com/kassol/waku/issues/11) 已验收。
 - 先读上述文件，再读取正式仓库及其父目录适用的 `AGENTS.md` / `CONTEXT.md`。迁移前已读取正式仓库根规范，并检查测试 App 隔离相关源码；期 1 源码复核仍待执行。
 
 ## 建仓时的核验记录（2026-09-06）
@@ -37,7 +37,7 @@
 
 1. 工程技能配置已完成：任务使用 `kassol/waku` GitHub Issues，保留默认 triage 标签，领域文档采用单一上下文；配置见 `docs/agents/`，无需重复初始化。
 2. 一期规格和任务已发布，实施以对应 Issue 和 ADR 为准；新增范围或对外行为决策仍需用户确认。
-3. 隔离、构建与历史持久化基线已通过；从 #4 Codex 子会话创建继续推进，#11 保存故障与安全退出已完成，随后按依赖完成 MCP 委派与查询闭环。本轮授权已覆盖安装、实现与隔离验证；完成构建及隔离检查后方可启动测试 App。
+3. 隔离、构建与历史持久化基线已通过；创建、MCP 查询和安全退出已验收；继续整合 #7 递归、#8 幂等和 #9 后续输入与取消，并完成 #10/#12 原生交互验收。本轮授权已覆盖安装、实现与隔离验证；完成构建及隔离检查后方可启动测试 App。
 4. 后续实现逐票完成必要回归检查与 Standards / Spec 两轴评审，凭实际验收证据关闭对应 Issue。
 
 以下建仓时疑点已在本轮澄清中处理，详细决策和源码证据见[一期澄清记录](waku-steward-scope.md)；隔离任务已完成，以下功能仍待后续任务验证：
@@ -100,10 +100,16 @@ Matt 流程产生仓库产物时，遵循用户的独立提交及默认 push 约
 
 - #10（ca347eb、7b1b8fc）：侧边栏按父子关系生成虚拟化树，支持展开、折叠、方向键导航与孤儿标记。历史仅清理已保存的事件前缀；超过回放窗口时从一致性快照恢复，大快照分块传输并在后台解码。
 - 已通过深层树与环、并发清理、一致性快照、超过 48 MiB 的真实 WebSocket 回放/加载、并发用户修改保留回归。主 checkout 桌面与 daemon 编译、共享客户端 38 项测试、类型检查及生成协议检查通过。
-- watcher 已成功重建签名 Debug App。后台原生展开、折叠及打开子会话通过；三个真实会话的历史结果、父子关系与已保存游标核验通过。后台键盘投递已恢复，#4 搜索打开通过；树导航验证发现窗口缺少通用 Tab/Shift+Tab 焦点处理，正在修复，#10 暂保持开放。
+- watcher 已成功重建签名 Debug App。后台原生展开、折叠及打开子会话通过；三个真实会话的历史结果、父子关系与已保存游标核验通过。后台键盘投递已恢复，#4 搜索打开通过；已修复窗口 Tab/Shift+Tab 焦点处理和菜单 Tab 焦点泄漏，GPUI 回归通过；等待整合后原生复验，#10 暂保持开放。
 
 ## Claude 子会话与递归委派
 
 - `waku_spawn_session` 使用同一 daemon 创建 Claude/Codex 子会话。两种 provider 启动时均获得按会话、项目及运行时绑定的 MCP；Claude 使用 `--mcp-config`，Codex 使用进程级 `-c mcp_servers.waku=...`，不写共用原生配置。
 - 每层 MCP 仅管理直属子会话；子会话可继续委派，父子关系沿用既有持久化。跨 provider 仅接受 Ask 或权限上限为 FullAccess 的父会话；其他无法安全映射的自动审批组合明确拒绝。同 provider 保持现有权限上限。
 - 复用现有新会话入口，以说明文字提示委派能力；审批与回答仍由用户进入子会话处理。原生 App、真实 Claude 流程与键盘验收由整合阶段完成。
+
+## 创建重试与工作目录
+
+- #8 创建记录在产生资源前持久化；相同管家、相同幂等键和请求返回保存结果，重启不重发首轮。重试重新验证项目、父会话及权限。
+- 默认 worktree，inherit 使用父会话实际目录，local 使用项目普通检出目录；失败保留已产生资源并返回阶段及不确定状态。与 #7 整合后，Claude/Codex 共用此创建流程。
+- 独立 Standards / Spec 复核通过；整合回归与原生验收进行中。

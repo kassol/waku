@@ -46,13 +46,27 @@ The protocol types use Serde's tagged JSON representation and are exported by
 `waku-protocol`, including checked-in TypeScript bindings.
 
 `CreateSession` creates one Claude or Codex child from the request's parent session ID.
-The daemon validates the existing parent and Git project, creates a worktree
-beneath the task database directory, saves the child, and submits its first
-prompt. Success follows the provider's durable first-turn acceptance and
-returns the child ID, runtime ID, worktree path, and branch. Startup failures
-retain the workspace and readable failed history. Runtime replacement and
-removal are rejected while creation is in progress; no automatic retry or
-workspace cleanup is performed.
+The daemon validates the parent and project, saves the child, starts the
+provider and submits one first prompt. `workspace` defaults to `worktree`
+beneath the task database directory; `inherit` uses the parent's actual
+directory, and `local` uses the project's ordinary checkout. The response
+includes the actual directory and an optional branch. Invalid worktree
+requests fail without changing to another workspace mode.
+
+An optional `idempotency_key` on the MCP tool (`idempotencyKey` on the wire)
+is scoped to the parent session. SQLite records the request before creating
+resources. Equal requests reuse the saved result across daemon restarts;
+different requests with the same key fail. Retrying revalidates the parent,
+project and permission limit. Different keys can create children concurrently.
+Without a key, retries have no durable deduplication guarantee.
+
+Creation failures return `SessionCreationFailed`, including the attempted
+stage, allocated session ID, retained path and branch when known, and whether
+first-prompt acceptance is uncertain. Provider failures are saved in the child
+history. Restart converts an unfinished creation into a saved uncertain result;
+it never resends its input. Runtime replacement is rejected while creation is
+in progress. Workspaces are retained on failure for inspection; existing and
+modified directories are never automatically removed.
 
 The daemon assigns immutable `parent_session_id`. Client snapshots cannot
 reparent existing sessions or create that relationship, and manual response

@@ -31,6 +31,8 @@ export type { ComputerPermissions } from "./ComputerPermissions";
 export type { ContextUsage } from "./ContextUsage";
 export type { CostQuality } from "./CostQuality";
 export type { CreatedWorktree } from "./CreatedWorktree";
+export type { CreationStage } from "./CreationStage";
+export type { CreationWorkspace } from "./CreationWorkspace";
 export type { DaemonReady } from "./DaemonReady";
 export type { DaemonSettings } from "./DaemonSettings";
 export type { DaySlice } from "./DaySlice";
