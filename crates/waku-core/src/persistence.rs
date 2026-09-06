@@ -1226,6 +1226,7 @@ impl StateStore {
         session.history_saved_cursor = stored.history_saved_cursor;
         session.history_save_error = stored.history_save_error;
         session.last_driver_error = stored.last_driver_error;
+        session.cancellation_requested_turn_id = stored.cancellation_requested_turn_id;
         session.pending_permission = stored.pending_permission;
         session.pending_user_input = stored.pending_user_input;
 
@@ -1703,6 +1704,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         history_saved_cursor: None,
         history_save_error: None,
         last_driver_error: None,
+        cancellation_requested_turn_id: None,
         provider_session_id: None,
         messages: Vec::new(),
         transcript_blocks: Vec::new(),

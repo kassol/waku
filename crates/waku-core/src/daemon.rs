@@ -420,6 +420,7 @@ impl Backend for WakuBackend {
         let starts_work = matches!(
             request.command,
             Command::CreateSession { .. }
+                | Command::StewardPrompt { .. }
                 | Command::Start { .. }
                 | Command::Prompt { .. }
                 | Command::Steer { .. }
@@ -515,6 +516,13 @@ impl WakuBackend {
         let session_id = request.session_id;
         let runtime_id = request.runtime_id;
         match request.command {
+            Command::StewardPrompt {
+                child_session_id,
+                prompt,
+            } => self.steward_prompt(session_id, child_session_id, prompt, &events),
+            Command::StewardCancel { child_session_id } => {
+                self.steward_cancel(session_id, child_session_id, &events)
+            }
             Command::CreateSession {
                 provider,
                 prompt,
@@ -2437,6 +2445,8 @@ fn handle_driver_command(
             return Ok(ResponsePayload::Cursor { cursor });
         }
         Command::StewardQuery { .. }
+        | Command::StewardPrompt { .. }
+        | Command::StewardCancel { .. }
         | Command::CreateSession { .. }
         | Command::PrepareShutdown
         | Command::ShutdownDaemon
@@ -2606,6 +2616,7 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
         ),
         DriverEvent::Error(error) => ("error", Value::String(error)),
         DriverEvent::CancelRequested => ("cancelRequested", Value::Null),
+        DriverEvent::TurnInterrupted => ("turnInterrupted", Value::Null),
         DriverEvent::InteractionResponded { request_id } => {
             ("interactionResponded", json!({ "request_id": request_id }))
         }
@@ -2703,6 +2714,7 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         }
         "error" => DriverEvent::Error(serde_json::from_value(payload)?),
         "cancelRequested" => DriverEvent::CancelRequested,
+        "turnInterrupted" => DriverEvent::TurnInterrupted,
         "interactionResponded" => DriverEvent::InteractionResponded {
             request_id: serde_json::from_value(
                 payload.get("request_id").cloned().unwrap_or(Value::Null),

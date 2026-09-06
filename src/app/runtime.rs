@@ -3344,6 +3344,7 @@ impl Waku {
                         | DriverEvent::SteerAccepted { .. }
                         | DriverEvent::SteerRejected { .. }
                         | DriverEvent::TurnFinished { .. }
+                        | DriverEvent::TurnInterrupted
                         | DriverEvent::Error(_)
                         | DriverEvent::ProcessExited
                 );

@@ -152,7 +152,7 @@ fn mcp_stdio_creates_real_child_and_rejects_spoofed_arguments() {
             .collect();
         assert_eq!(replies.len(), 6);
         assert_eq!(replies[5]["error"]["code"], -32600);
-        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 4);
+        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 6);
         assert_eq!(replies[2]["error"]["code"], -32602);
         assert_eq!(replies[3]["result"]["isError"], true);
         assert_eq!(replies[4]["result"]["isError"], false);
@@ -1177,6 +1177,268 @@ fn query_preserves_failed_turn_reason_across_storage_restart() {
             client
                 .request(parent.id, runtime, Command::CloseSession)
                 .unwrap();
+        },
+    );
+}
+
+#[test]
+fn mcp_prompt_and_cancel_preserve_durable_turn_boundaries() {
+    with_creation_daemon_seed(
+        |root, path| {
+            std::fs::write(
+                root.join("codex-fixture"),
+                include_str!("../tests/fixtures/codex_prompt_cancel.py"),
+            )
+            .unwrap();
+            let seeded = seed_query_sessions(root, path);
+            let store = StateStore::daemon(root.join("app.db"));
+            let mut state = store.load().unwrap();
+            let waiting = state
+                .sessions
+                .iter_mut()
+                .find(|s| s.id == seeded.2[1].id)
+                .unwrap();
+            store.hydrate(waiting).unwrap();
+            waiting.pending_user_input = Some(crate::model::UserInputRequest {
+                request_id: "question".into(),
+                questions: vec![],
+            });
+            state.mark_session_dirty(seeded.2[1].id);
+            store.save(&mut state).unwrap();
+            seeded
+        },
+        |client, _, root, path, address, (project, parent, children)| {
+            let (parent, _, config, runtime) =
+                start_steward_saved(&client, root, path, parent, project);
+            let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+                .as_str()
+                .unwrap();
+            let child = children[0].id;
+            let waiting = mcp_response(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_prompt",
+                json!({"session_id":children[1].id,"prompt":"wait for the user"}),
+            );
+            assert_eq!(waiting["result"]["isError"], true, "{waiting}");
+            for target in [parent.id, children[2].id, children[3].id] {
+                for (name, args) in [
+                    (
+                        "waku_prompt",
+                        json!({"session_id":target,"prompt":"forbidden"}),
+                    ),
+                    ("waku_cancel", json!({"session_id":target})),
+                ] {
+                    let reply = mcp_response(address, token, parent.id, runtime, name, args);
+                    assert_eq!(reply["result"]["isError"], true, "{reply}");
+                }
+            }
+            let results = std::thread::scope(|scope| {
+                let requests = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            mcp_response(
+                                address,
+                                token,
+                                parent.id,
+                                runtime,
+                                "waku_prompt",
+                                json!({"session_id":child,"prompt":"continue"}),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                requests
+                    .into_iter()
+                    .map(|request| request.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|r| r["result"]["isError"] == false)
+                    .count(),
+                1,
+                "{results:?}"
+            );
+            let accepted = results
+                .iter()
+                .find(|r| r["result"]["isError"] == false)
+                .unwrap();
+            let accepted: serde_json::Value =
+                serde_json::from_str(accepted["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            let turn_id = accepted["turn_id"].as_str().unwrap();
+            let store = StateStore::daemon(root.join("app.db"));
+            let mut saved = store.load().unwrap();
+            let saved = saved.sessions.iter_mut().find(|s| s.id == child).unwrap();
+            store.hydrate(saved).unwrap();
+            assert_eq!(saved.turns.last().unwrap().id.to_string(), turn_id);
+            assert_eq!(saved.messages.last().unwrap().content, "continue");
+            let result = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_result",
+                json!({"session_id":child}),
+            );
+            assert_eq!(result["reply"], "");
+            assert_eq!(result["session"]["turn"]["status"], "running");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !path.join("prompt-ready").exists() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            for _ in 0..2 {
+                let cancelled = mcp_tool(
+                    address,
+                    token,
+                    parent.id,
+                    runtime,
+                    "waku_cancel",
+                    json!({"session_id":child}),
+                );
+                assert_eq!(cancelled["accepted"], true);
+                assert_eq!(cancelled["stopped"], false);
+                assert_eq!(cancelled["session"]["turn"]["status"], "running");
+            }
+            assert_eq!(
+                mcp_response(
+                    address,
+                    token,
+                    parent.id,
+                    runtime,
+                    "waku_prompt",
+                    json!({"session_id":child,"prompt":"too early"})
+                )["result"]["isError"],
+                true
+            );
+            std::fs::write(path.join("cancel-release"), "").unwrap();
+            loop {
+                let result = mcp_tool(
+                    address,
+                    token,
+                    parent.id,
+                    runtime,
+                    "waku_result",
+                    json!({"session_id":child,"include_transcript":true}),
+                );
+                if result["session"]["turn"]["status"] == "interrupted" {
+                    assert!(
+                        result["transcript"]
+                            .as_str()
+                            .unwrap()
+                            .contains("previous answer")
+                    );
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "{result}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let cancelled = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_cancel",
+                json!({"session_id":child}),
+            );
+            assert_eq!(cancelled["stopped"], true);
+            // Lose the next prompt's response. The saved turn is discoverable
+            // through a fresh connection; no transport retries the submission.
+            let mut socket = scoped_socket(address, token);
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&ClientMessage::Request(Request {
+                        request_id: Uuid::new_v4(),
+                        session_id: parent.id,
+                        runtime_id: runtime,
+                        command: Command::StewardPrompt {
+                            child_session_id: child,
+                            prompt: "after disconnect".into(),
+                        },
+                    }))
+                    .unwrap()
+                    .into(),
+                ))
+                .unwrap();
+            drop(socket);
+            loop {
+                let result = mcp_tool(
+                    address,
+                    token,
+                    parent.id,
+                    runtime,
+                    "waku_result",
+                    json!({"session_id":child}),
+                );
+                if result["session"]["turn"]["turn_id"] != turn_id {
+                    assert_eq!(result["reply"], "");
+                    assert_eq!(result["session"]["turn"]["status"], "running");
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            loop {
+                let calls = std::fs::read_to_string(path.join("prompt-calls.jsonl")).unwrap();
+                if calls.lines().count() == 2 {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "{calls}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_cancel",
+                json!({"session_id":child}),
+            );
+            loop {
+                let result = mcp_tool(
+                    address,
+                    token,
+                    parent.id,
+                    runtime,
+                    "waku_result",
+                    json!({"session_id":child}),
+                );
+                if result["session"]["turn"]["status"] == "interrupted" {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let accepted = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_prompt",
+                json!({"session_id":child,"prompt":"reject"}),
+            );
+            loop {
+                let result = mcp_tool(
+                    address,
+                    token,
+                    parent.id,
+                    runtime,
+                    "waku_result",
+                    json!({"session_id":child}),
+                );
+                if result["session"]["turn"]["status"] == "failed" {
+                    assert_eq!(result["session"]["turn"]["turn_id"], accepted["turn_id"]);
+                    assert_eq!(result["session"]["error"], "fixture rejected");
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "{result}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
         },
     );
 }

@@ -123,6 +123,7 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
         ),
         DriverEvent::Error(error) => ("error", Value::String(error)),
         DriverEvent::CancelRequested => ("cancelRequested", Value::Null),
+        DriverEvent::TurnInterrupted => ("turnInterrupted", Value::Null),
         DriverEvent::InteractionResponded { request_id } => {
             ("interactionResponded", json!({ "request_id": request_id }))
         }
@@ -220,6 +221,7 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         }
         "error" => DriverEvent::Error(serde_json::from_value(payload)?),
         "cancelRequested" => DriverEvent::CancelRequested,
+        "turnInterrupted" => DriverEvent::TurnInterrupted,
         "interactionResponded" => DriverEvent::InteractionResponded {
             request_id: serde_json::from_value(
                 payload.get("request_id").cloned().unwrap_or(Value::Null),

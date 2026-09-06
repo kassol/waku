@@ -292,6 +292,8 @@ impl CodexDriver {
             pending: None,
         }));
 
+        let pending_prompts = Arc::new(Mutex::new(HashSet::new()));
+        let writer_pending_prompts = pending_prompts.clone();
         let writer_thread_id = thread_id.clone();
         let writer_turn_id = turn_id.clone();
         let writer_turn_ids = turn_ids.clone();
@@ -417,6 +419,10 @@ impl CodexDriver {
                                 let _ = writer_events.send(DriverEvent::Error(tr!(
                                     "errors.codex_thread_open_incomplete"
                                 )));
+                                let _ = writer_events.send(DriverEvent::TurnFinished {
+                                    success: false,
+                                    summary: None,
+                                });
                                 continue;
                             };
                             {
@@ -428,6 +434,7 @@ impl CodexDriver {
                                 }
                             }
                             next_request_id += 1;
+                            writer_pending_prompts.lock().insert(next_request_id);
                             let mut params = turn_start_params(
                                 &thread_id,
                                 text,
@@ -497,9 +504,10 @@ impl CodexDriver {
                         }
                         CommandMessage::Cancel => {
                             let (Some(thread_id), Some(turn_id)) = (
-                                writer_thread_id.lock().clone(),
-                                writer_turn_id.lock().clone(),
+                                wait_for_thread_id(&writer_thread_id),
+                                wait_for_thread_id(&writer_turn_id),
                             ) else {
+                                let _ = writer_events.send(DriverEvent::Error("Cancellation is unconfirmed: Codex did not provide an active turn id".into()));
                                 continue;
                             };
                             next_request_id += 1;
@@ -758,7 +766,10 @@ impl CodexDriver {
         let reader_thread = thread::Builder::new()
             .name("waku-codex-reader".into())
             .spawn(move || {
-                let mut stream_state = CodexStreamState::default();
+                let mut stream_state = CodexStreamState {
+                    pending_prompts,
+                    ..CodexStreamState::default()
+                };
                 for line in BufReader::new(stdout).lines() {
                     match line {
                         Ok(line) if !line.trim().is_empty() => {
@@ -1357,6 +1368,7 @@ const CODEX_CITATION_SEPARATOR: char = '\u{e202}';
 
 #[derive(Default)]
 struct CodexStreamState {
+    pending_prompts: Arc<Mutex<HashSet<u64>>>,
     citations: HashMap<String, String>,
     citation_numbers: HashMap<String, usize>,
     citation_buffer: String,
@@ -1646,6 +1658,21 @@ fn handle_codex_message(
     // the same numeric ID as one of Waku's earlier requests. Only messages
     // without a method are responses to Waku-originated requests.
     let is_response = value.get("method").is_none();
+    if is_response
+        && value
+            .get("id")
+            .and_then(Value::as_u64)
+            .is_some_and(|id| stream_state.pending_prompts.lock().remove(&id))
+    {
+        if let Some(error) = value.pointer("/error/message").and_then(Value::as_str) {
+            let _ = events.send(DriverEvent::Error(error.into()));
+            let _ = events.send(DriverEvent::TurnFinished {
+                success: false,
+                summary: Some(error.into()),
+            });
+        }
+        return;
+    }
     let pending_goal = is_response
         .then(|| value.get("id").and_then(Value::as_u64))
         .flatten()
@@ -1914,8 +1941,17 @@ fn handle_codex_message(
             }
         }
         "turn/completed" => {
+            let mut active = turn_id.lock();
+            if params
+                .pointer("/turn/id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| active.as_deref() != Some(id))
+            {
+                return;
+            }
+            *active = None;
+            drop(active);
             stream_state.citation_buffer.clear();
-            *turn_id.lock() = None;
             let status = params
                 .pointer("/turn/status")
                 .and_then(Value::as_str)
@@ -1924,9 +1960,13 @@ fn handle_codex_message(
                 .pointer("/turn/error/message")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let _ = events.send(DriverEvent::TurnFinished {
-                success: status == "completed",
-                summary: error,
+            let _ = events.send(if status == "interrupted" {
+                DriverEvent::TurnInterrupted
+            } else {
+                DriverEvent::TurnFinished {
+                    success: status == "completed",
+                    summary: error,
+                }
             });
         }
         "thread/name/updated" => {

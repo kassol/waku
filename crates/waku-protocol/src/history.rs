@@ -34,6 +34,7 @@ pub fn apply_rewound_history(current: &mut AgentSession, rewound: AgentSession) 
     current.history_saved_cursor = rewound.history_saved_cursor;
     current.history_save_error = rewound.history_save_error;
     current.last_driver_error = rewound.last_driver_error;
+    current.cancellation_requested_turn_id = rewound.cancellation_requested_turn_id;
     current.pending_permission = rewound.pending_permission;
     current.pending_user_input = rewound.pending_user_input;
     current.status = rewound.status;
@@ -129,6 +130,10 @@ impl HistoryReducer {
                 session.last_driver_error = None;
             }
             DriverEvent::CancelRequested => {
+                session.cancellation_requested_turn_id = session.active_turn_id();
+            }
+            DriverEvent::TurnInterrupted => {
+                session.cancellation_requested_turn_id = None;
                 session.pending_permission = None;
                 session.pending_user_input = None;
                 if session.active_turn_id().is_some() {
@@ -224,6 +229,12 @@ impl HistoryReducer {
                 }
             }
             DriverEvent::TurnFinished { success, summary } => {
+                if session.cancellation_requested_turn_id.is_some()
+                    && session.cancellation_requested_turn_id == session.active_turn_id()
+                {
+                    return self.apply(session, DriverEvent::TurnInterrupted);
+                }
+                session.cancellation_requested_turn_id = None;
                 session.pending_permission = None;
                 session.pending_user_input = None;
                 session.last_driver_error = if success {
@@ -291,6 +302,11 @@ impl HistoryReducer {
                 }
             }
             DriverEvent::ProcessExited => {
+                if session.cancellation_requested_turn_id.is_some()
+                    && session.cancellation_requested_turn_id == session.active_turn_id()
+                {
+                    return self.apply(session, DriverEvent::TurnInterrupted);
+                }
                 session.pending_permission = None;
                 session.pending_user_input = None;
                 finish_streaming_assistant(session);
@@ -651,6 +667,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancellation_waits_for_provider_and_preserves_current_turn() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let turn = session.begin_turn("task");
+        let mut reducer = HistoryReducer::default();
+        reducer.apply(&mut session, DriverEvent::TurnStarted);
+        reducer.apply(&mut session, DriverEvent::TextDelta("partial".into()));
+        reducer.apply(&mut session, DriverEvent::CancelRequested);
+        reducer.apply(&mut session, DriverEvent::CancelRequested);
+        assert_eq!(session.active_turn_id(), Some(turn));
+        assert_eq!(session.turns.last().unwrap().status, TurnStatus::Running);
+        reducer.apply(
+            &mut session,
+            DriverEvent::TurnFinished {
+                success: true,
+                summary: None,
+            },
+        );
+        assert_eq!(
+            session.turns.last().unwrap().status,
+            TurnStatus::Interrupted
+        );
+        assert_eq!(session.messages.last().unwrap().content, "partial");
+        session.begin_turn("next");
+        reducer.apply(
+            &mut session,
+            DriverEvent::TurnFinished {
+                success: true,
+                summary: None,
+            },
+        );
+        assert_eq!(session.turns.last().unwrap().status, TurnStatus::Completed);
+    }
+
+    #[test]
     fn snapshot_preserves_pending_provider_error_until_exit() {
         let mut current = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
         current.begin_turn("task");
@@ -932,8 +982,8 @@ mod tests {
         ))
         .unwrap();
         history.apply(&mut session, cancel);
-        assert_eq!(session.turns[0].status, TurnStatus::Interrupted);
-        assert_eq!(session.status, SessionStatus::Idle);
+        assert_eq!(session.turns[0].status, TurnStatus::Running);
+        assert_eq!(session.status, SessionStatus::Working);
         history.apply(
             &mut session,
             DriverEvent::TurnFinished {

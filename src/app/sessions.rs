@@ -1154,90 +1154,17 @@ impl Waku {
             .find(|session| session.id == session_id)
             .is_some_and(|session| retain_runtime_after_cancel(session.provider))
             || self.session_has_live_detached_work(session_id);
-        // Goal operations queued behind a starting runtime would set the
-        // objective after this stop and begin pursuing it; the user asked to
-        // stop, so they leave with the turn.
         self.pending_goal_operations.remove(&session_id);
-        let mut runtime = self.runtimes.remove(&session_id);
-        if let Some(runtime) = runtime.as_ref() {
-            runtime.driver.cancel();
-            if retain_runtime {
-                // A detached process keeps Codex's app-server resident, but
-                // Computer Use descendants still belong to the cancelled turn.
-                runtime.driver.cancel_computer_use();
-            }
-        }
-        // Do not leave already-received text in the smoothing queue: once the
-        // message is marked complete, a later delta would otherwise create a
-        // second assistant bubble. Show the received portion immediately.
-        // Buffered turn-completion events also must not start queued
-        // follow-ups: the user asked to stop, not to continue.
-        let mut keep_runtime = true;
-        if let Some(runtime) = runtime.as_mut() {
-            Self::collect_runtime_events(runtime);
-            while let Some(event) = runtime.pending_events.pop_front() {
-                keep_runtime &= self.handle_driver_event(session_id, runtime, event, false, cx);
-                if !keep_runtime {
-                    break;
-                }
-            }
-        }
         self.pending_queue_drains.retain(|id| *id != session_id);
-        let has_active_turn = self
-            .state
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .and_then(AgentSession::active_turn_id)
-            .is_some();
-        let previous_kinds = has_active_turn
-            .then(|| self.snapshot_selected_transcript_rows(session_id))
-            .flatten();
-        self.finish_streaming_assistant(session_id);
-        self.complete_turn_blocks(session_id);
-        self.settle_foreground_work(session_id, BackgroundWorkStatus::Stopped);
-        if let Some(runtime) = runtime.as_mut() {
-            runtime.stream_phase = None;
-            runtime.pending_permission = None;
-            runtime.pending_user_input = None;
-            runtime.pending_computer_approval = None;
-            runtime.computer_use_previews.clear();
-        }
-        if has_active_turn {
-            let needs_fallback = !self.turn_has_assistant_message(session_id);
-            if let Some(session) = self.state.session_mut(session_id) {
-                session.status = SessionStatus::Idle;
-                if needs_fallback {
-                    session.push_message(MessageRole::Assistant, tr!("session.stopped"));
-                }
+        if let Some(runtime) = self.runtimes.get(&session_id) {
+            runtime.driver.cancel();
+            runtime.driver.cancel_computer_use();
+            if !retain_runtime {
+                runtime.driver.close();
             }
-            self.finish_active_turn_with_analytics(
-                session_id,
-                TurnStatus::Interrupted,
-                crate::analytics::TurnOutcome::Cancelled,
-            );
         }
-        if has_active_turn {
-            self.capture_latest_turn_checkpoint_for(session_id);
-            self.start_pending_checkpoint_captures(cx);
-        }
-        if let Some(previous_kinds) = previous_kinds.as_deref() {
-            self.splice_active_transcript_rows_after_visibility_change(previous_kinds);
-        }
-        // A provider runtime owns its Waku JavaScript REPL and Computer Use
-        // descendants. Normally Stop closes that process tree and the next
-        // prompt resumes the same provider thread with a fresh runtime. A
-        // detached process or subagent is the exception: its provider must
-        // remain resident so Waku can keep observing and stopping it.
-        if retain_runtime && keep_runtime {
-            if let Some(runtime) = runtime.take() {
-                self.runtimes.insert(session_id, runtime);
-            }
-        } else if let Some(runtime) = runtime {
-            runtime.driver.close();
-        }
-        self.remeasure_transcript_tail();
-        self.save();
+        // The daemon publishes acceptance; the provider's ending event owns
+        // the turn boundary. Keep receiving its remaining output until then.
         cx.notify();
     }
 

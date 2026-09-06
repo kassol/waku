@@ -110,6 +110,11 @@ export function reduceRuntimeEvent(
 
   switch (kind) {
     case 'cancelRequested':
+      session.cancellation_requested_turn_id = activeTurn(session)?.id
+      break
+    case 'turnInterrupted':
+      delete session.cancellation_requested_turn_id
+      delete session.last_driver_error
       result.settled = settleTurn(session, 'interrupted', 'Stopped.', clock)
       if (result.settled) session.status = 'idle'
       result.permission = null
@@ -294,7 +299,16 @@ export function reduceRuntimeEvent(
     }
     case 'turnFinished': {
       const value = asRecord(payload)
+      const interrupted = session.cancellation_requested_turn_id != null
+        && session.cancellation_requested_turn_id === activeTurn(session)?.id
+      delete session.cancellation_requested_turn_id
       const success = value?.success === true
+      if (interrupted) {
+        delete session.last_driver_error
+        result.settled = settleTurn(session, 'interrupted', 'Stopped.', clock)
+        if (result.settled) session.status = 'idle'
+        break
+      }
       if (success) delete session.last_driver_error
       else session.last_driver_error ??= typeof value?.summary === 'string' ? value.summary : 'The agent stopped before responding.'
       result.settled = settleTurn(
@@ -345,6 +359,15 @@ export function reduceRuntimeEvent(
       break
     }
     case 'processExited':
+      if (session.cancellation_requested_turn_id != null
+        && session.cancellation_requested_turn_id === activeTurn(session)?.id) {
+        delete session.cancellation_requested_turn_id
+        delete session.last_driver_error
+        result.settled = settleTurn(session, 'interrupted', 'Stopped.', clock)
+        if (result.settled) session.status = 'idle'
+        result.removeRuntime = true
+        break
+      }
       if (activeTurn(session)) session.last_driver_error ??= processExitError ?? 'The agent exited before responding.'
       result.settled = settleTurn(
         session,
@@ -360,10 +383,10 @@ export function reduceRuntimeEvent(
       break
   }
 
-  if (['cancelRequested', 'turnStarted'].includes(kind)) {
+  if (['turnInterrupted', 'turnStarted'].includes(kind)) {
     delete session.last_driver_error
   }
-  if (['cancelRequested', 'turnParked', 'turnFinished', 'processExited'].includes(kind)) {
+  if (['turnInterrupted', 'turnParked', 'turnFinished', 'processExited'].includes(kind)) {
     delete session.pending_permission
     delete session.pending_user_input
     result.permission = null

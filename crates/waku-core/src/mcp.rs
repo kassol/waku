@@ -22,6 +22,18 @@ struct SpawnArguments {
     runtime_mode: Option<RuntimeMode>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptArguments {
+    session_id: Uuid,
+    prompt: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelArguments {
+    session_id: Uuid,
+}
+
 pub fn run_stdio(
     input: impl BufRead,
     mut output: impl Write,
@@ -132,6 +144,16 @@ pub fn run_stdio(
                         }
                     },
                     {
+                        "name": "waku_prompt",
+                        "description": "Submit a new turn to an idle direct child. Returns turn_id after durable saving. Busy or waiting children reject input. Never automatically retry after a lost response; query waku_status first.",
+                        "inputSchema": {"type":"object", "properties":{"session_id":{"type":"string","format":"uuid"},"prompt":{"type":"string","minLength":1}}, "required":["session_id","prompt"],"additionalProperties":false}
+                    },
+                    {
+                        "name": "waku_cancel",
+                        "description": "Request cancellation of the direct child's current turn. Repeatable. accepted means requested; stopped means the provider has ended the turn. Preserves history and files.",
+                        "inputSchema": {"type":"object", "properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}
+                    },
+                    {
                         "name": "waku_list_sessions",
                         "description": "List summaries of direct child sessions.",
                         "inputSchema": {
@@ -216,8 +238,8 @@ pub fn run_stdio(
                             runtime_id,
                             command,
                         }),
-                    )?;
-                    match read(&mut socket)? {
+                    ).context("steward submission state is uncertain; query waku_status before retrying; do not automatically resend")?;
+                    match read(&mut socket).context("steward submission state is uncertain; query waku_status before retrying; do not automatically resend")? {
                         ServerMessage::Response {
                             request_id: returned,
                             outcome,
@@ -227,6 +249,8 @@ pub fn run_stdio(
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildSessions {sessions} } => (json!({"sessions":sessions}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildStatus {sessions,timed_out} } => (json!({"sessions":sessions,"timed_out":timed_out}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildResult {session,reply,reply_truncated,transcript,transcript_truncated} } => (json!({"session":session,"reply":reply,"reply_truncated":reply_truncated,"transcript":transcript,"transcript_truncated":transcript_truncated}).to_string(),false),
+                                ResponseOutcome::Ok { payload:ResponsePayload::ChildPromptAccepted {turn_id} } => (json!({"turn_id":turn_id}).to_string(),false),
+                                ResponseOutcome::Ok { payload:ResponsePayload::ChildCancel {session,accepted,stopped} } => (json!({"session":session,"accepted":accepted,"stopped":stopped}).to_string(),false),
                                 ResponseOutcome::Error {error} => (error.message,true),
                                 _ => bail!("unexpected steward response"),
                             };
@@ -271,7 +295,23 @@ fn read(socket: &mut WebSocket<TcpStream>) -> anyhow::Result<ServerMessage> {
 }
 
 fn tool_command(name: &str, arguments: Value) -> Result<Command, String> {
-    if name == "waku_spawn_session" {
+    if name == "waku_prompt" {
+        let args: PromptArguments = serde_json::from_value(arguments)
+            .map_err(|error| format!("Invalid tool arguments: {error}"))?;
+        if args.prompt.trim().is_empty() {
+            return Err("prompt must not be empty".into());
+        }
+        Ok(Command::StewardPrompt {
+            child_session_id: args.session_id,
+            prompt: args.prompt,
+        })
+    } else if name == "waku_cancel" {
+        let args: CancelArguments = serde_json::from_value(arguments)
+            .map_err(|error| format!("Invalid tool arguments: {error}"))?;
+        Ok(Command::StewardCancel {
+            child_session_id: args.session_id,
+        })
+    } else if name == "waku_spawn_session" {
         let args: SpawnArguments = serde_json::from_value(arguments)
             .map_err(|error| format!("Invalid tool arguments: {error}"))?;
         Ok(Command::CreateSession {

@@ -74,7 +74,7 @@ context_usage?: ContextUsage | null, runtime_event_cursor?: RuntimeEventCursor |
 /**
  * Current or latest turn failure, retained across exit until the next turn or success.
  */
-last_driver_error?: string | null, pending_permission?: PendingPermission | null, pending_user_input?: UserInputRequest | null,
+last_driver_error?: string | null, cancellation_requested_turn_id?: string | null, pending_permission?: PendingPermission | null, pending_user_input?: UserInputRequest | null,
 /**
  * Read-only compatibility field for v1 state files. New saves omit it.
  */

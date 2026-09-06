@@ -1,4 +1,4 @@
-//! Read-only queries over daemon-owned, hydrated child sessions.
+//! Scoped operations over daemon-owned, hydrated child sessions.
 use super::*;
 use std::time::Duration;
 use waku_protocol::{ChildSessionSummary, ChildTurnSummary, ChildWaitingReason, StewardQuery};
@@ -246,5 +246,206 @@ impl BoundedText {
             self.push("\n\n");
         }
         self.push(text);
+    }
+}
+
+impl WakuBackend {
+    fn authorized_child(
+        &self,
+        state: &mut PersistedState,
+        parent_id: Uuid,
+        child_id: Uuid,
+        events: &EventSink,
+    ) -> anyhow::Result<(AgentSession, PathBuf)> {
+        let parent = state
+            .sessions
+            .iter()
+            .find(|s| s.id == parent_id)
+            .ok_or_else(|| anyhow!("steward session is unavailable"))?;
+        let project = state
+            .projects
+            .iter()
+            .find(|p| p.id == parent.project_id)
+            .ok_or_else(|| anyhow!("steward project is unavailable"))?;
+        if events.scoped_project.is_some_and(|id| id != project.id) {
+            bail!("steward project is no longer available");
+        }
+        let project_id = project.id;
+        let project_path = project.path.clone();
+        let child = state
+            .sessions
+            .iter_mut()
+            .find(|s| {
+                s.id == child_id
+                    && s.parent_session_id == Some(parent_id)
+                    && s.project_id == project_id
+            })
+            .ok_or_else(|| anyhow!("target is not a direct child in the steward project"))?;
+        self.task_store.hydrate(child)?;
+        if !matches!(child.provider, ProviderKind::Claude | ProviderKind::Codex) {
+            bail!("child provider is unsupported");
+        }
+        Ok((child.clone(), project_path))
+    }
+
+    pub(super) fn steward_prompt(
+        &self,
+        parent_id: Uuid,
+        child_id: Uuid,
+        prompt: String,
+        events: &EventSink,
+    ) -> anyhow::Result<ResponsePayload> {
+        if prompt.trim().is_empty() {
+            bail!("prompt must not be empty");
+        }
+        events.ensure_steward_active()?;
+        let _operation = events.reserve_steward_target(child_id)?;
+        let exited = self
+            .forwarders
+            .lock()
+            .get(&child_id)
+            .is_some_and(|(_, forwarder)| forwarder.is_finished());
+        if exited {
+            self.authorized_child(&mut self.task_state.lock(), parent_id, child_id, events)?;
+            self.close_runtime(child_id, None)?;
+        }
+        let (child, project_path, turn_id, message_id) = {
+            let mut state = self.task_state.lock();
+            let (child, project_path) =
+                self.authorized_child(&mut state, parent_id, child_id, events)?;
+            if child.active_turn_id().is_some()
+                || child.status.is_busy()
+                || child.pending_permission.is_some()
+                || child.pending_user_input.is_some()
+            {
+                bail!(
+                    "child is busy or waiting for the user; query status before submitting a new turn"
+                );
+            }
+            let session = state
+                .sessions
+                .iter_mut()
+                .find(|s| s.id == child_id)
+                .unwrap();
+            let turn_id = session.begin_turn(prompt.clone());
+            let message_id = session.messages.last().unwrap().id;
+            session.status = SessionStatus::Connecting;
+            session.last_driver_error = None;
+            state.mark_session_dirty(child_id);
+            if let Err(error) = self.task_store.save(&mut state) {
+                self.saving_failed.store(true, Ordering::Release);
+                state
+                    .sessions
+                    .iter_mut()
+                    .find(|s| s.id == child_id)
+                    .unwrap()
+                    .history_save_error = Some(error.to_string());
+                bail!("could not save child input; query state before retrying: {error}");
+            }
+            (child, project_path, turn_id, message_id)
+        };
+        let active = self.sessions.lock().get(&child_id).map(|(id, _)| *id);
+        let runtime_id = active.unwrap_or_else(Uuid::new_v4);
+        let child_events = if active.is_some() {
+            events.child_sink(child_id, runtime_id)
+        } else {
+            events.begin_child(child_id, runtime_id).0
+        };
+        let send = || -> anyhow::Result<()> {
+            events.ensure_steward_active()?;
+            if active.is_none() {
+                self.handle_accepted(
+                    Request {
+                        request_id: Uuid::new_v4(),
+                        session_id: child_id,
+                        runtime_id,
+                        command: Command::Start {
+                            options: crate::WireDriverStartOptions {
+                                provider: serde_json::to_value(child.provider)?
+                                    .as_str()
+                                    .unwrap()
+                                    .into(),
+                                binary: self.provider_binary(child.provider)?,
+                                cwd: child.workspace.path().unwrap_or(&project_path).to_owned(),
+                                mode: serde_json::to_value(child.runtime_mode)?
+                                    .as_str()
+                                    .unwrap()
+                                    .into(),
+                                model: child.model,
+                                reasoning_effort: child.reasoning_effort,
+                                service_tier: child.service_tier,
+                                context_window: child.context_window,
+                                agent_preset: child.agent_preset,
+                                computer_use_enabled: false,
+                                provider_cursor: child
+                                    .provider_cursor
+                                    .map(serde_json::to_value)
+                                    .transpose()?,
+                            },
+                        },
+                    },
+                    child_events.clone(),
+                )?;
+            }
+            self.handle_accepted(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: child_id,
+                    runtime_id,
+                    command: Command::Prompt {
+                        prompt,
+                        turn_id: Some(turn_id),
+                        message_id: Some(message_id),
+                    },
+                },
+                child_events.clone(),
+            )?;
+            Ok(())
+        };
+        if let Err(error) = send() {
+            child_events.send_batch(vec![
+                event_to_wire(DriverEvent::Error(format!(
+                    "could not run saved turn {turn_id}: {error:#}"
+                )))?,
+                event_to_wire(DriverEvent::TurnFinished {
+                    success: false,
+                    summary: None,
+                })?,
+            ])?;
+        }
+        Ok(ResponsePayload::ChildPromptAccepted { turn_id })
+    }
+
+    pub(super) fn steward_cancel(
+        &self,
+        parent_id: Uuid,
+        child_id: Uuid,
+        events: &EventSink,
+    ) -> anyhow::Result<ResponsePayload> {
+        events.ensure_steward_active()?;
+        let _operation = events.reserve_steward_target(child_id)?;
+        let child = self
+            .authorized_child(&mut self.task_state.lock(), parent_id, child_id, events)?
+            .0;
+        let accepted = child.active_turn_id().is_some();
+        if accepted && child.cancellation_requested_turn_id != child.active_turn_id() {
+            let (runtime_id, driver) = self
+                .sessions
+                .lock()
+                .get(&child_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("child runtime is unavailable; stopping is unconfirmed"))?;
+            let child_events = events.child_sink(child_id, runtime_id);
+            let saved = child_events.send(event_to_wire(DriverEvent::CancelRequested)?);
+            handle_driver_command(&driver, Command::Cancel, saved)?;
+        }
+        let child = self
+            .authorized_child(&mut self.task_state.lock(), parent_id, child_id, events)?
+            .0;
+        Ok(ResponsePayload::ChildCancel {
+            stopped: child.active_turn_id().is_none(),
+            accepted,
+            session: self.child_summary(&child),
+        })
     }
 }
