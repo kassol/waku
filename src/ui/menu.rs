@@ -1282,6 +1282,10 @@ fn on_menu_key(
     cx: &mut App,
 ) {
     let key = event.keystroke.key.as_str();
+    if key == "tab" {
+        cx.stop_propagation();
+        return;
+    }
     if key == "escape" {
         handle.close(window, cx);
         window.refresh();
@@ -1506,6 +1510,7 @@ mod tests {
                 .tab_index(0)
                 .tab_group()
                 .tab_stop(false)
+                .on_key_down(crate::ui::navigate_tab)
                 .child(match self.surface {
                     Surface::Popover => {
                         popover(trigger, &self.handle, MenuAlign::BelowLeft, |_, _, _| {
@@ -1635,6 +1640,33 @@ mod tests {
         cx.update(|window, cx| window.focus(&handle.trigger_focus, cx));
         cx.simulate_keystrokes("enter");
         assert!(handle.is_open(), "enter on the tab stop should open");
+    }
+
+    #[gpui::test]
+    fn menu_tab_preserves_focus_until_escape(cx: &mut TestAppContext) {
+        let handle = cx.update(ContextMenuHandle::new);
+        let (_view, cx) = cx.add_window_view(|_, _| Harness {
+            handle: handle.clone(),
+            surface: Surface::Dropdown,
+        });
+        cx.simulate_mouse_down(
+            point(px(10.0), px(10.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        cx.update(|window, cx| window.focus(&handle.focus, cx));
+        assert!(cx.update(|window, _| handle.focus.is_focused(window)));
+        for key in ["tab", "shift-tab"] {
+            cx.simulate_keystrokes(key);
+            assert!(handle.is_open());
+            assert!(
+                cx.update(|window, _| handle.focus.is_focused(window)),
+                "{key} moved focus behind the menu"
+            );
+        }
+        cx.simulate_keystrokes("escape");
+        assert!(!handle.is_open());
     }
 
     #[gpui::test]
