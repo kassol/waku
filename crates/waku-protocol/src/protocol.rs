@@ -183,6 +183,8 @@ pub enum Command {
         idempotency_key: Option<String>,
         #[serde(default)]
         workspace: CreationWorkspace,
+        #[serde(default)]
+        dependencies: Vec<crate::model::WorkspaceDependency>,
     },
     /// Stop accepting work and confirm all provider tails are durable.
     PrepareShutdown,

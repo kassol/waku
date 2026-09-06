@@ -138,6 +138,7 @@ fn spawn_command(prompt: &str) -> Command {
         runtime_mode: None,
         idempotency_key: None,
         workspace: crate::protocol::CreationWorkspace::Worktree,
+        dependencies: Vec::new(),
     }
 }
 
@@ -2090,3 +2091,5 @@ fn steward_capability_cannot_open_or_submit_a_consultation() {
         ));
     });
 }
+#[path = "task_workspace_delivery_tests.rs"]
+mod task_workspace_delivery_tests;

@@ -49,6 +49,8 @@ mod creation;
 
 #[path = "task_workspace.rs"]
 mod task_workspace;
+#[path = "task_integration.rs"]
+mod task_integration;
 
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
@@ -57,6 +59,7 @@ pub struct WakuBackend {
     work_gate: RwLock<()>,
     workspace_start_gate: Mutex<()>,
     runtime_workspaces: Mutex<HashMap<Uuid, PathBuf>>,
+    terminal_workspaces: Mutex<HashMap<Uuid, PathBuf>>,
     quitting: AtomicBool,
     saving_failed: AtomicBool,
     failed_sessions: Mutex<HashSet<Uuid>>,
@@ -184,6 +187,7 @@ impl WakuBackend {
             work_gate: RwLock::new(()),
             workspace_start_gate: Mutex::new(()),
             runtime_workspaces: Mutex::new(HashMap::new()),
+            terminal_workspaces: Mutex::new(HashMap::new()),
             quitting: AtomicBool::new(false),
             saving_failed: AtomicBool::new(false),
             failed_sessions: Mutex::new(HashSet::new()),
@@ -493,6 +497,7 @@ impl Backend for WakuBackend {
             // Every runtime is stopped even if one tail cannot be saved.
             let terminals = std::mem::take(&mut *self.terminals.lock());
             drop(terminals);
+        self.terminal_workspaces.lock().clear();
             if !failures.is_empty() {
                 bail!(
                     "unsaved history prevents safe exit: {}",
@@ -620,6 +625,7 @@ impl Backend for WakuBackend {
         }
         let terminals = std::mem::take(&mut *self.terminals.lock());
         drop(terminals);
+        self.terminal_workspaces.lock().clear();
     }
 }
 
@@ -1253,6 +1259,9 @@ impl WakuBackend {
                 result: crate::workspace::execute(operation)?,
             }),
             Command::OpenTerminal { cwd, cols, rows } => {
+                let _workspace_start = self.workspace_start_gate.lock();
+                let cwd = std::fs::canonicalize(cwd)?;
+                let workspace = task_workspace::canonical_workspace(&cwd)?;
                 ensure_shell_environment();
                 let terminal = crate::terminal::DaemonTerminal::open(&cwd, cols, rows, events)?;
                 let previous = self
@@ -1260,6 +1269,7 @@ impl WakuBackend {
                     .lock()
                     .insert(session_id, (runtime_id, terminal));
                 drop(previous);
+                self.terminal_workspaces.lock().insert(session_id, workspace);
                 Ok(ResponsePayload::Ack)
             }
             Command::WriteTerminal { data } => {
@@ -1301,12 +1311,14 @@ impl WakuBackend {
                     terminals.remove(&session_id)
                 };
                 drop(removed);
+                self.terminal_workspaces.lock().remove(&session_id);
                 Ok(ResponsePayload::Ack)
             }
             Command::Start { options } => {
                 let _workspace_start = self.workspace_start_gate.lock();
-                self.check_workspace_writer(session_id, &options.cwd)?;
-                let runtime_workspace = task_workspace::canonical_workspace(&options.cwd)?;
+                let cwd = std::fs::canonicalize(&options.cwd)?;
+                self.check_workspace_writer(session_id, &cwd)?;
+                let runtime_workspace = task_workspace::canonical_workspace(&cwd)?;
                 validate_child_options(
                     &self.task_store,
                     &mut self.task_state.lock(),
@@ -1337,7 +1349,7 @@ impl WakuBackend {
                 };
                 let options = DriverStartOptions {
                     binary: options.binary,
-                    cwd: options.cwd,
+                    cwd,
                     mode: decode_enum(&options.mode)?,
                     model: options.model,
                     reasoning_effort: options.reasoning_effort,
@@ -2036,6 +2048,9 @@ impl WakuBackend {
 
         let (wake, _wake_events) = smol::channel::bounded(1);
         let (event_sender, _event_receiver) = driver::event_channel(wake);
+        let _workspace_start = self.workspace_start_gate.lock();
+        let cwd = std::fs::canonicalize(cwd)?;
+        self.check_workspace_writer(source.id, &cwd)?;
         let driver = driver::start_local(
             source.provider,
             DriverStartOptions {
@@ -2197,6 +2212,9 @@ impl WakuBackend {
 
         let (wake, _wake_events) = smol::channel::bounded(1);
         let (event_sender, _event_receiver) = driver::event_channel(wake);
+        let _workspace_start = self.workspace_start_gate.lock();
+        let cwd = std::fs::canonicalize(cwd)?;
+        self.check_workspace_writer(source.id, &cwd)?;
         let driver = driver::start_local(
             source.provider,
             DriverStartOptions {

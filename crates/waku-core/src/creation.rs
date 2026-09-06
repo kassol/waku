@@ -61,6 +61,7 @@ impl WakuBackend {
             runtime_mode,
             idempotency_key,
             workspace,
+            dependencies,
         } = command.clone()
         else {
             unreachable!("creation accepts only CreateSession")
@@ -194,6 +195,11 @@ impl WakuBackend {
                     )
                 })
                 .transpose()?;
+            if !dependencies.is_empty() {
+                if workspace != CreationWorkspace::Worktree { bail!("dependencies require an independent child worktree"); }
+                let base = task_base.as_deref().ok_or_else(|| anyhow!("dependencies require a managed task"))?;
+                self.check_task_dependencies(parent_id, &dependencies, base, &events)?;
+            }
             match workspace {
                 CreationWorkspace::Worktree => {
                     if project.is_projectless() {
@@ -216,11 +222,15 @@ impl WakuBackend {
                             if let Some(task) = &parent.managed_workspace {
                                 let mut managed = task.clone();
                                 managed.coordination = None;
+                managed.deliveries.clear();
+                managed.results.clear();
+                managed.dependencies = dependencies.clone();
                                 managed.name = child.display_title().to_string();
                                 managed.base_commit = task_base.clone().expect("managed task has a base");
                                 managed.path = planned.path.clone();
                                 managed.branch = planned.branch.clone();
                                 managed.owned = true;
+                                managed.created = false;
                                 managed.ready = false;
                                 managed.error = None;
                                 child.managed_workspace = Some(managed);
@@ -265,11 +275,15 @@ impl WakuBackend {
             if let Some(task) = &parent.managed_workspace {
                 let mut managed = task.clone();
                 managed.coordination = None;
+                managed.deliveries.clear();
+                managed.results.clear();
+                managed.dependencies = dependencies.clone();
                 managed.name = child.display_title().to_string();
                 managed.base_commit = task_workspace::git(&path, &["rev-parse", "HEAD"])?;
                 managed.path = path.clone();
                 managed.branch = task_workspace::git(&path, &["branch", "--show-current"])?;
                 managed.owned = workspace == CreationWorkspace::Worktree;
+                managed.created = managed.owned;
                 managed.ready = true;
                 managed.error = None;
                 child.managed_workspace = Some(managed);

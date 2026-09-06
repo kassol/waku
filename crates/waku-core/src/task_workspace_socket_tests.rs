@@ -130,11 +130,27 @@ fn managed_children_use_integration_commit_and_reject_shared_runtime_aliases() {
         client
             .request(child.id, runtime_id, Command::CloseSession)
             .unwrap();
+        let script = include_str!("../tests/fixtures/codex_create.py").replace(
+            "if method in ('thread/start', 'thread/resume'):",
+            "if method in ('thread/start', 'thread/resume'):\n        pathlib.Path('start-cwd.txt').write_text(request['params']['cwd'])",
+        );
+        std::fs::write(root.join("codex-fixture"), script).unwrap();
         let other_runtime = Uuid::new_v4();
         assert!(matches!(
             client.request(other.id, other_runtime, start).unwrap(),
             ResponsePayload::Started { .. }
         ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !workspace_path.join("start-cwd.txt").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(workspace_path.join("start-cwd.txt")).unwrap(),
+            std::fs::canonicalize(&workspace_path)
+                .unwrap()
+                .to_string_lossy()
+        );
         client
             .request(other.id, other_runtime, Command::CloseSession)
             .unwrap();

@@ -3,4 +3,4 @@
 /**
  * Daemon-owned resources explicitly created for a code task. Legacy sessions have none.
  */
-export type ManagedWorkspaceLocation = { path: string, branch: string, };
+export type ManagedWorkspaceLocation = { created: boolean, path: string, branch: string, };

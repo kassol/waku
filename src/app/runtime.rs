@@ -2828,8 +2828,8 @@ impl Waku {
 
     /// Start the next queued follow-up as a fresh turn. Only called once a
     /// settled turn has been fully closed, so the session is Idle.
-    fn drain_queued_message(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
-        if self.quit_in_progress {
+    pub(super) fn drain_queued_message(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        if self.quit_in_progress || self.submission_preparations.contains(&session_id) {
             return;
         }
         if self.response_fork_preparations.contains_key(&session_id) {
@@ -2876,6 +2876,10 @@ impl Waku {
             return;
         }
         if self.response_fork_preparations.contains_key(&session_id) {
+            return;
+        }
+        if self.submission_preparations.contains(&session_id) {
+            self.enqueue_follow_up_submission(session_id, submission, cx);
             return;
         }
         let selected = self.state.selected_session == Some(session_id);

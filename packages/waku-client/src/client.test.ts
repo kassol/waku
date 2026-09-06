@@ -125,6 +125,26 @@ describe("WakuClient", () => {
     await expect(response).resolves.toEqual({ type: "ack" });
   });
 
+  test("keeps workspace file responses distinct from task result records", async () => {
+    const { client, sockets } = fixture();
+    const socket = await connect(client, sockets);
+    const response = client.request({
+      type: "workspace",
+      operation: { type: "readTextFile", root: "/test", relative_path: "result.txt" },
+    });
+    const request = JSON.parse(socket.sent.at(-1)!);
+    socket.receive({
+      type: "response", requestId: request.requestId,
+      outcome: { status: "ok", payload: { type: "workspace", result: { type: "textFile", content: "retained file" } } },
+    });
+    const payload = await response;
+    if (payload.type !== "workspace" || payload.result.type !== "textFile") {
+      throw new Error("expected a workspace text file");
+    }
+    expect(payload.result.content).toBe("retained file");
+    client.disconnect();
+  });
+
   test("surfaces daemon errors", async () => {
     const { client, sockets } = fixture();
     const socket = sockets[0] ?? new FakeSocket();

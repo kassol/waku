@@ -114,3 +114,84 @@ fn task_workspace_starts_at_selected_commit_without_moving_dirty_checkout() {
     drop(reopened);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn task_workspace_preserves_preexisting_coordination_resources() {
+    for occupied_branch in [true, false] {
+        let root = std::env::temp_dir().join(format!("waku-task-preexisting-{}", Uuid::new_v4()));
+        let repository = root.join("repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        git_at(&repository, &["init", "-b", "main"]);
+        git_at(&repository, &["config", "user.name", "Fixture"]);
+        git_at(
+            &repository,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(repository.join("base"), "keep").unwrap();
+        git_at(&repository, &["add", "."]);
+        git_at(&repository, &["commit", "-m", "Base"]);
+        let backend = Arc::new(
+            WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(root.join("state.db")),
+            )
+            .unwrap(),
+        );
+        let project = Project::from_path(repository.clone());
+        let session = AgentSession::new(project.id, ProviderKind::Codex);
+        let erased: Arc<dyn Backend> = backend.clone();
+        let sink = EventSink::for_test(&erased, session.id, Uuid::nil());
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: session.id,
+                    runtime_id: Uuid::nil(),
+                    command: Command::SaveTaskState {
+                        projects: vec![project],
+                        sessions: vec![session.clone()],
+                        live_session_ids: vec![session.id],
+                    },
+                },
+                sink.clone(),
+            )
+            .unwrap();
+        let coordination_branch = format!(
+            "waku/task-parser-{}-coordination",
+            &session.id.simple().to_string()[..8]
+        );
+        let coordination_path = root
+            .join("task-worktrees")
+            .join(format!("{}-coordination", session.id));
+        if occupied_branch {
+            git_at(&repository, &["branch", &coordination_branch]);
+        } else {
+            std::fs::create_dir_all(&coordination_path).unwrap();
+            std::fs::write(coordination_path.join("keep"), "unrelated resource").unwrap();
+        }
+        let result = backend.handle(Request { request_id:Uuid::new_v4(), session_id:session.id, runtime_id:Uuid::nil(), command:serde_json::from_value(json!({"type":"stewardWorkspace", "operation":{"type":"begin", "name":"Parser", "targetBranch":"main", "expectedCommit":""}})).unwrap() }, sink);
+        assert!(
+            result.is_err(),
+            "preexisting coordination resources must be rejected before recording ownership: {result:?}"
+        );
+        assert!(
+            backend.task_state.lock().sessions[0]
+                .managed_workspace
+                .is_none()
+        );
+        if occupied_branch {
+            assert_eq!(
+                git_at(&repository, &["rev-parse", &coordination_branch]),
+                git_at(&repository, &["rev-parse", "main"])
+            );
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(coordination_path.join("keep")).unwrap(),
+                "unrelated resource"
+            );
+        }
+        drop(erased);
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

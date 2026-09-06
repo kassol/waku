@@ -10,7 +10,9 @@ pub(super) fn git(path: &Path, args: &[&str]) -> anyhow::Result<String> {
         .current_dir(path)
         .output()?;
     if !output.status.success() {
-        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!("{}", if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() });
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
@@ -40,6 +42,24 @@ impl WakuBackend {
             } => {
                 self.begin_task_workspace(session_id, name, target_branch, expected_commit, events)
             }
+            StewardWorkspaceOperation::Deliver {
+                commit,
+                expected_target_commit,
+                evidence,
+            } => self.deliver_task(session_id, commit, expected_target_commit, evidence),
+            StewardWorkspaceOperation::Integrate {
+                session_id: child,
+                commit,
+                expected_integration_commit,
+                evidence,
+            } => self.integrate_task_result(
+                session_id,
+                child,
+                commit,
+                expected_integration_commit,
+                evidence,
+                events,
+            ),
             StewardWorkspaceOperation::Inspect { session_id: target } => {
                 let mut state = self.task_state.lock();
                 let session = if target == session_id {
@@ -54,6 +74,15 @@ impl WakuBackend {
                     self.authorized_child(&mut state, session_id, target, events)?
                         .0
                 };
+                let mut session = session;
+                if let Some(resource) = &mut session.managed_workspace {
+                    if let Ok(commit) = git(
+                        &resource.repository,
+                        &["rev-parse", "--verify", &resource.integration_branch],
+                    ) {
+                        resource.integration_commit = commit;
+                    }
+                }
                 Ok(ResponsePayload::TaskWorkspace { session })
             }
         }
@@ -162,14 +191,36 @@ impl WakuBackend {
                 .ok_or_else(|| anyhow!("database directory unavailable"))?
                 .join("task-worktrees")
                 .join(session_id.to_string());
-            if path.exists() {
+            if std::fs::symlink_metadata(&path).is_ok() {
                 bail!("task workspace path is already used; existing directory was preserved");
             }
             let coordination = Some(ManagedWorkspaceLocation {
+                created: false,
                 path: path.with_file_name(format!("{session_id}-coordination")),
                 branch: format!("{branch}-coordination"),
             });
+            if let Some(location) = &coordination {
+                if std::fs::symlink_metadata(&location.path).is_ok()
+                    || git(
+                        &repository,
+                        &[
+                            "show-ref",
+                            "--verify",
+                            &format!("refs/heads/{}", location.branch),
+                        ],
+                    )
+                    .is_ok()
+                {
+                    bail!(
+                        "coordination workspace name is already used; existing resources were preserved"
+                    );
+                }
+            }
             ManagedWorkspace {
+                created: false,
+                deliveries: Vec::new(),
+                results: Vec::new(),
+                dependencies: Vec::new(),
                 revision: 0,
                 coordination,
                 task_id: session_id,
@@ -177,8 +228,9 @@ impl WakuBackend {
                 repository: repository.clone(),
                 base_commit: base.clone(),
                 target_branch,
-                target_commit: base,
+                target_commit: base.clone(),
                 integration_branch: branch.clone(),
+                integration_commit: base.clone(),
                 branch,
                 path,
                 owned: true,
@@ -188,28 +240,59 @@ impl WakuBackend {
         };
         self.save_task_workspace(session_id, managed.clone())?;
         let create = (|| -> anyhow::Result<()> {
-            for (path, branch) in std::iter::once((&managed.path, &managed.branch)).chain(
-                managed
-                    .coordination
-                    .iter()
-                    .map(|location| (&location.path, &location.branch)),
-            ) {
-                if path.exists() {
-                    if canonical_workspace(path)? != std::fs::canonicalize(path)?
-                        || git(path, &["branch", "--show-current"])? != *branch
+            for coordination in [false, true] {
+                let (path, branch, created) = if coordination {
+                    let Some(location) = &managed.coordination else {
+                        continue;
+                    };
+                    (
+                        location.path.clone(),
+                        location.branch.clone(),
+                        location.created,
+                    )
+                } else {
+                    (
+                        managed.path.clone(),
+                        managed.branch.clone(),
+                        managed.created,
+                    )
+                };
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    if !created {
+                        bail!(
+                            "workspace creation is unconfirmed; existing resources were preserved"
+                        );
+                    }
+                    if canonical_workspace(&path)? != std::fs::canonicalize(&path)?
+                        || git(&path, &["branch", "--show-current"])? != branch
                     {
                         bail!("recorded workspace branch changed; resources were preserved");
                     }
                 } else {
+                    if created {
+                        bail!("a recorded workspace was removed; its resources were preserved");
+                    }
                     std::fs::create_dir_all(path.parent().unwrap())?;
-                    let path = path
+                    let path_text = path
                         .to_str()
                         .ok_or_else(|| anyhow!("workspace path is not UTF-8"))?;
-                    // Never adopt an independently created branch after an interrupted attempt.
                     git(
                         &repository,
-                        &["worktree", "add", "-b", branch, path, &managed.base_commit],
+                        &[
+                            "worktree",
+                            "add",
+                            "-b",
+                            &branch,
+                            path_text,
+                            &managed.base_commit,
+                        ],
                     )?;
+                    if coordination {
+                        managed.coordination.as_mut().unwrap().created = true;
+                    } else {
+                        managed.created = true;
+                    }
+                    self.save_task_workspace(session_id, managed.clone())?;
                 }
             }
             Ok(())

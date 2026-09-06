@@ -14,7 +14,10 @@ impl Waku {
         let Some(session) = self.selected_session().cloned() else {
             return;
         };
-        if session.has_started() || self.branch_operation_pending {
+        if session.has_started()
+            || self.branch_operation_pending
+            || self.submission_preparations.contains(&session.id)
+        {
             return;
         }
         let prompt = self.composer.read(cx).content(cx).trim();
@@ -32,6 +35,7 @@ impl Waku {
             .collect();
         let client = self.daemon.client();
         self.branch_operation_pending = true;
+        self.submission_preparations.insert(session.id);
         cx.notify();
         cx.spawn(async move |waku, cx| {
             let session_id = session.id;
@@ -62,8 +66,10 @@ impl Waku {
                 .await;
             let _ = waku.update(cx, |waku, cx| {
                 waku.branch_operation_pending = false;
+                waku.submission_preparations.remove(&session_id);
                 match result {
                     Ok(waku_client::ResponsePayload::TaskWorkspace { session }) => {
+                        let ready = session.managed_workspace.as_ref().is_some_and(|task| task.ready);
                         if let Some(local) = waku
                             .state
                             .sessions
@@ -82,6 +88,9 @@ impl Waku {
                         }
                         waku.invalidate_workspace_queries(cx);
                         waku.save();
+                        if ready {
+                            waku.drain_queued_message(session_id, cx);
+                        }
                     }
                     Err(error) => waku.show_toast(error.to_string()),
                     _ => waku.show_toast("Invalid task workspace response".to_owned()),

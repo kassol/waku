@@ -938,6 +938,7 @@ fn child_creation_reports_provider_rejection_and_retains_failed_history_and_work
                 runtime_mode: None,
                 idempotency_key: None,
                 workspace: crate::protocol::CreationWorkspace::Worktree,
+                dependencies: Vec::new(),
             },
         );
         assert!(
@@ -996,6 +997,7 @@ fn child_permissions_and_parent_relationship_are_daemon_authoritative() {
             runtime_mode: mode,
             idempotency_key: None,
             workspace: crate::protocol::CreationWorkspace::Worktree,
+                dependencies: Vec::new(),
         };
         assert!(
             client
@@ -1190,6 +1192,7 @@ fn child_creation_excludes_concurrent_runtime_replacement_and_removal() {
                     runtime_mode: None,
                     idempotency_key: None,
                     workspace: crate::protocol::CreationWorkspace::Worktree,
+                dependencies: Vec::new(),
                 },
             )
         });
@@ -1346,6 +1349,7 @@ fn concurrent_creation_retransmissions_share_one_child_and_the_same_response() {
                 runtime_mode: None,
                 idempotency_key: None,
                 workspace: crate::protocol::CreationWorkspace::Worktree,
+                dependencies: Vec::new(),
             },
         }))
         .unwrap();
@@ -1473,6 +1477,7 @@ fn owned_shutdown_waits_for_child_creation_then_drains_its_saved_runtime() {
             runtime_mode: None,
             idempotency_key: None,
             workspace: crate::protocol::CreationWorkspace::Worktree,
+                dependencies: Vec::new(),
         };
         let creation = std::thread::spawn(move || {
             observer.request(parent_id, Uuid::nil(), create("hold fixture turn"))
@@ -1647,6 +1652,7 @@ fn failed_initial_child_save_disables_new_creation_before_provider_start() {
             runtime_mode: None,
             idempotency_key: None,
             workspace: crate::protocol::CreationWorkspace::Worktree,
+                dependencies: Vec::new(),
         };
         let failed_save = client.request(parent_id, Uuid::nil(), create()).unwrap();
         let ResponsePayload::SessionCreationFailed {

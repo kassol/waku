@@ -23,6 +23,8 @@ struct SpawnArguments {
     idempotency_key: Option<String>,
     #[serde(default)]
     workspace: crate::protocol::CreationWorkspace,
+    #[serde(default)]
+    dependencies: Vec<crate::model::WorkspaceDependency>,
 }
 
 #[derive(Deserialize)]
@@ -119,6 +121,9 @@ pub fn run_stdio(
                                     "type": "string",
                                     "minLength": 1
                                 },
+                                "dependencies": {
+                                    "type":"array", "items":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"commit":{"type":"string"}},"required":["session_id","commit"],"additionalProperties":false}
+                                },
                                 "workspace": {
                                     "type": "string",
                                     "enum": ["worktree", "inherit", "local"],
@@ -184,12 +189,14 @@ pub fn run_stdio(
                     },
                     {
                         "name": "waku_workspace",
-                        "description": "Inspect the current task or a direct child workspace. Task workspaces are explicitly created by the user before execution. Existing sessions are never migrated automatically.",
+                        "description": "Inspect this task or a direct child. Integrate an explicitly accepted full child commit into the daemon integration branch, with checks, environment and reviewer evidence bound to that commit. Deliver the accepted combined commit to the task's originally selected local target after checking its version and active users. Integration and delivery do not push or deploy. Repeating a confirmed fixed result reuses its record. On conflict or a moved target, inspect the retained state before retrying. Task workspaces are explicitly created by the user before execution.",
                         "inputSchema": {"type":"object","properties":{"operation":{
-                            "type":"object", "properties": {
-                                "type":{"const":"inspect"}, "sessionId":{"type":"string","format":"uuid"}
-                            }, "required":["type","sessionId"], "additionalProperties":false
-                        }},"required":["operation"],"additionalProperties":false}
+                            "oneOf":[
+                                {"type":"object","properties":{"type":{"const":"inspect"},"sessionId":{"type":"string","format":"uuid"}},"required":["type","sessionId"],"additionalProperties":false},
+                                {"type":"object","properties":{"type":{"const":"integrate"},"sessionId":{"type":"string","format":"uuid"},"commit":{"type":"string"},"expectedIntegrationCommit":{"type":"string"},"evidence":{"$ref":"#/$defs/evidence"}},"required":["type","sessionId","commit","expectedIntegrationCommit","evidence"],"additionalProperties":false},
+                                {"type":"object","properties":{"type":{"const":"deliver"},"commit":{"type":"string"},"expectedTargetCommit":{"type":"string"},"evidence":{"$ref":"#/$defs/evidence"}},"required":["type","commit","expectedTargetCommit","evidence"],"additionalProperties":false}
+                            ]
+                        }},"required":["operation"],"additionalProperties":false,"$defs":{"evidence":{"type":"array","minItems":1,"items":{"type":"object","properties":{"commit":{"type":"string"},"checks":{"type":"string","minLength":1},"environment":{"type":"string","minLength":1},"reviewer":{"type":"string","minLength":1}},"required":["commit","checks","environment","reviewer"],"additionalProperties":false}}}}
                     },
                     {
                         "name": "waku_wait",
@@ -263,6 +270,10 @@ pub fn run_stdio(
             ) {
                 Err(error) => Err((-32602, error)),
                 Ok(command) => {
+                    let workspace_operation = match &command {
+                        Command::StewardWorkspace { operation } => Some(operation.clone()),
+                        _ => None,
+                    };
                     let request_id = Uuid::new_v4();
                     send(
                         &mut socket,
@@ -287,7 +298,18 @@ pub fn run_stdio(
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildPromptAccepted {turn_id,delivery} } => (json!({"turn_id":turn_id,"delivery":delivery}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildInputStatus {delivery} } => (json!({"delivery":delivery}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildCancel {session,accepted,stopped} } => (json!({"session":session,"accepted":accepted,"stopped":stopped}).to_string(),false),
-                                ResponseOutcome::Ok { payload:ResponsePayload::TaskWorkspace {session} } => (json!({"session":session}).to_string(),false),
+                                ResponseOutcome::Ok { payload:ResponsePayload::TaskWorkspace {session} } => {
+                                    let failed = session.managed_workspace.as_ref().is_some_and(|workspace| {
+                                        use crate::model::StewardWorkspaceOperation as Operation;
+                                        match &workspace_operation {
+                                            Some(Operation::Inspect { .. }) => false,
+                                            Some(Operation::Integrate { commit, .. }) => !workspace.results.iter().any(|result| &result.commit == commit && result.integration_commit.is_some()),
+                                            Some(Operation::Deliver { commit, .. }) => !workspace.deliveries.iter().any(|delivery| &delivery.commit == commit && delivery.completed),
+                                            _ => workspace.error.is_some(),
+                                        }
+                                    });
+                                    (json!({"session":session}).to_string(),failed)
+                                },
                                 ResponseOutcome::Ok { payload:ResponsePayload::StewardWait {wait,sessions} } => (json!({"waiting":wait.is_some(),"wait":wait,"sessions":sessions,"next_action":"If waiting=true, end this turn now. A child event will automatically resume you; do not poll. If waiting=false, handle the actionable child states now."}).to_string(),false),
                                 ResponseOutcome::Error {error} => (error.message,true),
                                 _ => bail!("unexpected steward response"),
@@ -384,6 +406,7 @@ fn tool_command(name: &str, arguments: Value) -> Result<Command, String> {
             runtime_mode: args.runtime_mode,
             idempotency_key: args.idempotency_key,
             workspace: args.workspace,
+            dependencies: args.dependencies,
         })
     } else if name == "waku_list_sessions" || name == "waku_status" || name == "waku_result" {
         let mut arguments = arguments

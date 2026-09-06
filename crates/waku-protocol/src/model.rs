@@ -959,13 +959,58 @@ pub struct StewardWait {
 /// Daemon-owned resources explicitly created for a code task. Legacy sessions have none.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct ManagedWorkspaceLocation {
+    #[serde(default)]
+    pub created: bool,
     #[ts(type = "string")]
     pub path: PathBuf,
     pub branch: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDependency {
+    pub session_id: Uuid,
+    pub commit: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct WorkspaceEvidence {
+    pub commit: String,
+    pub checks: String,
+    pub environment: String,
+    pub reviewer: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct TaskResult {
+    pub commit: String,
+    pub owner: Uuid,
+    pub evidence: Vec<WorkspaceEvidence>,
+    pub expected_integration_commit: String,
+    pub integration_commit: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct WorkspaceDelivery {
+    pub error: Option<String>,
+    pub commit: String,
+    pub reference: String,
+    pub target_branch: String,
+    pub previous_target_commit: String,
+    pub evidence: Vec<WorkspaceEvidence>,
+    pub completed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct ManagedWorkspace {
+    #[serde(default)]
+    pub deliveries: Vec<WorkspaceDelivery>,
+    #[serde(default)]
+    pub created: bool,
+    #[serde(default)]
+    pub dependencies: Vec<WorkspaceDependency>,
+    #[serde(default)]
+    pub results: Vec<TaskResult>,
     #[serde(default)]
     pub revision: u64,
     pub coordination: Option<ManagedWorkspaceLocation>,
@@ -977,6 +1022,7 @@ pub struct ManagedWorkspace {
     pub target_branch: String,
     pub target_commit: String,
     pub integration_branch: String,
+    pub integration_commit: String,
     pub branch: String,
     #[ts(type = "string")]
     pub path: PathBuf,
@@ -999,6 +1045,17 @@ pub enum StewardWorkspaceOperation {
     },
     Inspect {
         session_id: Uuid,
+    },
+    Deliver {
+        commit: String,
+        expected_target_commit: String,
+        evidence: Vec<WorkspaceEvidence>,
+    },
+    Integrate {
+        session_id: Uuid,
+        commit: String,
+        expected_integration_commit: String,
+        evidence: Vec<WorkspaceEvidence>,
     },
 }
 

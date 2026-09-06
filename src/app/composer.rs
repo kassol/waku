@@ -2055,6 +2055,9 @@ impl Waku {
         prompt: &str,
         cx: &mut Context<Self>,
     ) -> Option<ComposerSubmission> {
+        if self.selected_session().is_some_and(|session| self.submission_preparations.contains(&session.id)) {
+            return None;
+        }
         if self.execute_local_composer_command(prompt, cx) {
             return None;
         }
@@ -3432,13 +3435,27 @@ impl Waku {
         let branch_selector = self.render_branch_selector(cx);
         let task_workspace = self.selected_session().and_then(|session| {
             if let Some(task) = &session.managed_workspace {
+                let status = if task.deliveries.iter().any(|delivery| delivery.completed) {
+                    "Delivered locally"
+                } else if task.results.last().is_some_and(|result| result.integration_commit.is_some()) {
+                    "Integrated"
+                } else if task.coordination.is_some() && task.integration_commit != task.base_commit {
+                    "Awaiting overall acceptance and delivery"
+                } else if session.is_busy() {
+                    "Executing"
+                } else if session.has_started() {
+                    "Awaiting acceptance and integration"
+                } else {
+                    "Ready to execute"
+                };
                 return Some(
                     div()
                         .px(px(7.0))
                         .text_color(theme.text_secondary)
                         .child(format!(
-                            "{} · {} → {} · base {} · owner {}{}",
+                            "{} · {} · {} → {} · base {} · owner {}{}",
                             task.name,
+                            status,
                             task.coordination
                                 .as_ref()
                                 .map_or(task.branch.as_str(), |location| location.branch.as_str()),

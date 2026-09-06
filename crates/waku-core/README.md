@@ -80,9 +80,24 @@ Managed code tasks use the explicit `StewardWorkspace` command before the root
 runtime starts. `begin` records the chosen target and commit, creates a separate
 coordination worktree for the root runtime, and reserves an integration worktree
 for daemon Git operations. Child worktrees start at a fixed integration commit.
-`waku_workspace` exposes scoped inspection; ordinary sessions keep their existing
-workspace behavior. All current provider runtimes can acquire write access, so
+`waku_workspace` exposes scoped inspection and fixed-commit acceptance; ordinary
+sessions keep their existing workspace behavior. All current provider runtimes can acquire write access, so
 managed resources reject another runtime at the same canonical execution path,
 including `inherit` and symlink aliases. Static queries do not acquire a writer.
 The daemon retains ownership through stale client saves and restarts. Failed
 creation retains its recorded resources; it never adopts an unrelated branch.
+
+`integrate` accepts a direct child's full commit ID and evidence naming the checks,
+environment and reviewer. It records the result before merging into the fixed
+integration target. Conflicts remain available for resolution; retries inspect
+actual Git state. `CreateSession.dependencies` names accepted child commits, and
+creation proceeds only when the selected integration commit contains them.
+
+`deliver` accepts the combined commit with separate overall evidence. It checks
+the selected local target's current commit, dirty files and active runtimes or
+terminals before a fast-forward. Each attempt retains its record; each published
+result has an immutable `refs/waku/tasks/<task-id>/deliveries/<commit>` reference.
+After a failed attempt, a newly reviewed commit can be delivered without replacing
+an earlier reference. A confirmed delivery is idempotent. Delivery does not push
+or deploy. The UI distinguishes execution, pending acceptance, integration and
+local delivery using saved records.
