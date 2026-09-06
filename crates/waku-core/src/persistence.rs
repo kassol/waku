@@ -881,7 +881,7 @@ impl StateStore {
     /// thrown away by deleting one directory. Release builds use the usual
     /// per-user application support directory.
     pub fn default_path() -> PathBuf {
-        if cfg!(debug_assertions) {
+        if cfg!(debug_assertions) && !waku_protocol::identity::IS_STEWARD {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .and_then(Path::parent)
@@ -898,10 +898,10 @@ impl StateStore {
 
     pub fn new(path: PathBuf) -> Self {
         let directory = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
-        let configuration_directory = dirs::home_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join(".waku");
-        let (app_settings_path, legacy_settings_paths) = if cfg!(debug_assertions) {
+        let configuration_directory = waku_protocol::identity::configuration_directory();
+        let (app_settings_path, legacy_settings_paths) = if cfg!(debug_assertions)
+            && !waku_protocol::identity::IS_STEWARD
+        {
             (
                 directory.join("app.json"),
                 vec![directory.join("settings.json")],
@@ -3045,8 +3045,7 @@ mod tests {
 
         // Debug files stay inside the checkout so development cannot read or
         // write the installed app's settings.
-        #[cfg(debug_assertions)]
-        {
+        if cfg!(debug_assertions) && !waku_protocol::identity::IS_STEWARD {
             assert_eq!(directory, Some(std::ffi::OsStr::new("temp")));
             let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -3058,13 +3057,9 @@ mod tests {
                 store.legacy_settings_paths,
                 [path.with_file_name("settings.json")]
             );
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            assert_eq!(directory, Some(std::ffi::OsStr::new("Waku")));
-            let configuration_directory = dirs::home_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join(".waku");
+        } else {
+            assert_eq!(directory, Some(std::ffi::OsStr::new(DATA_DIRECTORY_NAME)));
+            let configuration_directory = waku_protocol::identity::configuration_directory();
             assert_eq!(
                 store.app_settings_path,
                 configuration_directory.join("app.json")

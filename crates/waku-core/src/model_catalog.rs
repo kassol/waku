@@ -147,7 +147,7 @@ pub fn discover_catalog(
 /// in the checkout's gitignored `temp/` beside the debug database, so
 /// development never touches the installed app's cache.
 fn model_cache_path(provider: ProviderKind) -> PathBuf {
-    let directory = if cfg!(debug_assertions) {
+    let directory = if cfg!(debug_assertions) && !crate::identity::IS_STEWARD {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("temp")

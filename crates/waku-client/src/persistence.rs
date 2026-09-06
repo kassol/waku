@@ -726,13 +726,11 @@ impl PersistedState {
 }
 
 fn configuration_directory() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".waku")
+    waku_protocol::identity::configuration_directory()
 }
 
 fn default_app_settings_path() -> PathBuf {
-    if cfg!(debug_assertions) {
+    if cfg!(debug_assertions) && !waku_protocol::identity::IS_STEWARD {
         StateStore::default_path().with_file_name("app.json")
     } else {
         configuration_directory().join("app.json")
@@ -757,7 +755,7 @@ pub fn load_window_state() -> Option<PersistedWindowState> {
 }
 
 fn default_legacy_settings_paths() -> Vec<PathBuf> {
-    if cfg!(debug_assertions) {
+    if cfg!(debug_assertions) && !waku_protocol::identity::IS_STEWARD {
         vec![StateStore::default_path().with_file_name("settings.json")]
     } else {
         vec![configuration_directory().join("settings.json")]
@@ -846,7 +844,7 @@ pub struct StateStore {
 
 impl StateStore {
     pub fn default_path() -> PathBuf {
-        if cfg!(debug_assertions) {
+        if cfg!(debug_assertions) && !waku_protocol::identity::IS_STEWARD {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .and_then(Path::parent)
@@ -1316,18 +1314,14 @@ mod tests {
         let app_settings_path = default_app_settings_path();
         let legacy_settings_paths = default_legacy_settings_paths();
 
-        #[cfg(debug_assertions)]
-        {
+        if cfg!(debug_assertions) && !waku_protocol::identity::IS_STEWARD {
             let state_path = StateStore::default_path();
             assert_eq!(app_settings_path, state_path.with_file_name("app.json"));
             assert_eq!(
                 legacy_settings_paths,
                 [state_path.with_file_name("settings.json")]
             );
-        }
-
-        #[cfg(not(debug_assertions))]
-        {
+        } else {
             assert_eq!(
                 app_settings_path,
                 configuration_directory().join("app.json")

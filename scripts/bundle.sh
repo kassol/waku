@@ -49,8 +49,14 @@ case "$profile" in
     bundle_identifier="sh.waku"
     icon_file="AppIcon.icns"
     ;;
+  steward)
+    app_name="Waku Steward"
+    helper_name="Waku Steward Computer Use"
+    bundle_identifier="sh.waku.steward"
+    icon_file="AppIconDev.icns"
+    ;;
   *)
-    echo "usage: scripts/bundle.sh [debug|release]" >&2
+    echo "usage: scripts/bundle.sh [debug|release|steward]" >&2
     exit 2
     ;;
 esac
@@ -62,6 +68,8 @@ debug_adhoc_requirement="=designated => identifier \"$bundle_identifier\""
 if [ "${WAKU_SKIP_CARGO_BUILD:-0}" != "1" ]; then
   if [ "$profile" = "release" ]; then
     cargo build --release --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon
+  elif [ "$profile" = "steward" ]; then
+    cargo build --profile steward --features waku-protocol/steward --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon
   else
     cargo build --package waku --bin waku --bin waku_js_repl
   fi
@@ -118,7 +126,7 @@ if [ ! -d "$cached_helper_bundle" ]; then
     -o "$cached_helper_contents/MacOS/$helper_name"
   if [ "$codesign_identity" = "-" ]; then
     codesign --force --sign - "$cached_helper_staging"
-  elif [ "$profile" = "release" ]; then
+  elif [ "$profile" = "release" ] || [ "$profile" = "steward" ]; then
     codesign --force --options runtime --timestamp --sign "$codesign_identity" "$cached_helper_staging"
   else
     codesign --force --options runtime --sign "$codesign_identity" "$cached_helper_staging"
@@ -155,7 +163,7 @@ mkdir -p "$contents/MacOS" "$contents/Resources/computer-use" "$contents/Resourc
 cp "$cargo_target_dir/$profile/waku" "$contents/MacOS/$app_name"
 cp "$cargo_target_dir/$profile/waku_js_repl" "$repl_executable"
 chmod 755 "$repl_executable"
-if [ "$profile" = "release" ]; then
+if [ "$profile" = "release" ] || [ "$profile" = "steward" ]; then
   cp "$cargo_target_dir/$profile/waku-daemon" "$daemon_executable"
   chmod 755 "$daemon_executable"
 fi
@@ -178,6 +186,10 @@ plutil -replace CFBundleDisplayName -string "$app_name" "$contents/Info.plist"
 plutil -replace CFBundleExecutable -string "$app_name" "$contents/Info.plist"
 plutil -replace CFBundleIdentifier -string "$bundle_identifier" "$contents/Info.plist"
 plutil -replace CFBundleName -string "$app_name" "$contents/Info.plist"
+if [ "$profile" = "steward" ]; then
+  plutil -remove SUFeedURL "$contents/Info.plist"
+  plutil -remove SUPublicEDKey "$contents/Info.plist"
+fi
 cp -R "$cached_helper_bundle" "$helper_bundle"
 # Finder info and resource forks on copied resources make codesign reject the
 # bundle as "detritus"; strip extended attributes before signing.
@@ -190,7 +202,7 @@ if [ "$codesign_identity" = "-" ]; then
   codesign --force --sign - "$sparkle_framework/Versions/B/Updater.app"
   codesign --force --sign - "$sparkle_framework"
   codesign --force --identifier "$bundle_identifier.js-repl" --sign - "$repl_executable"
-  if [ "$profile" = "release" ]; then
+  if [ "$profile" = "release" ] || [ "$profile" = "steward" ]; then
     codesign --force --identifier "$bundle_identifier.daemon" --sign - "$daemon_executable"
   fi
   if [ "$profile" = "debug" ]; then
@@ -203,7 +215,7 @@ if [ "$codesign_identity" = "-" ]; then
   else
     codesign --force --sign - "$bundle"
   fi
-elif [ "$profile" = "release" ]; then
+elif [ "$profile" = "release" ] || [ "$profile" = "steward" ]; then
   codesign --force --options runtime --timestamp --sign "$codesign_identity" "$sparkle_framework/Versions/B/Autoupdate"
   codesign --force --options runtime --timestamp --sign "$codesign_identity" "$sparkle_framework/Versions/B/Updater.app"
   codesign --force --options runtime --timestamp --sign "$codesign_identity" "$sparkle_framework"
@@ -217,7 +229,7 @@ else
   codesign --force --options runtime --identifier "$bundle_identifier.js-repl" --sign "$codesign_identity" "$repl_executable"
   codesign --force --options runtime --sign "$codesign_identity" "$bundle"
 fi
-if [ "$profile" = "release" ]; then
+if [ "$profile" = "release" ] || [ "$profile" = "steward" ]; then
   codesign --verify --strict --verbose=2 "$repl_executable"
   codesign --verify --strict --verbose=2 "$daemon_executable"
   codesign --verify --deep --strict --verbose=2 "$bundle"

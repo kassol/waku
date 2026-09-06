@@ -265,7 +265,7 @@ pub fn pi_extension_path() -> anyhow::Result<PathBuf> {
 /// helper its own TCC identity while the signed app bundle remains the source
 /// shipped with Waku.
 fn install_helper_app(source: &Path) -> anyhow::Result<PathBuf> {
-    let install_root = if cfg!(debug_assertions) {
+    let install_root = if crate::identity::IS_ISOLATED {
         crate::identity::configuration_directory().join("Computer Use")
     } else {
         dirs::data_dir()

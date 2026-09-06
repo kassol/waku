@@ -583,7 +583,7 @@ mod macos {
         /// running outside a bundle with an embedded framework.
         pub fn init() -> Option<Self> {
             // Debug must never install an upstream release over the test bundle.
-            if cfg!(debug_assertions) {
+            if waku_protocol::identity::IS_ISOLATED {
                 return None;
             }
             let preview = false;

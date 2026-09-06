@@ -123,3 +123,19 @@ Matt 流程产生仓库产物时，遵循用户的独立提交及默认 push 约
 ## 一期整体交付
 
 六工具、两种原生 provider、递归、创建幂等与重启恢复、实际取消、后台键盘审批和回答、父子导航及保存退出均完成验证。最终修复包含禁用控件焦点、回答卡片顺序、中断轮次可见提示及空输出中断的修改摘要。三会话并发流与每会话千条历史验证、性能测量边界、隔离与清理记录见[一期验收](waku-steward-acceptance.md)。日常开发仍遵循唯一 watcher；测试身份不能替代原版安装。
+
+## 独立日用包（2026-09-06）
+
+用户授权安装 `Waku Steward.app` 供日常使用。运行 `sh scripts/bundle.sh steward`，使用继承 release 优化的 `steward` profile 和 `waku-protocol/steward` feature。产物为 `target/steward/Waku Steward.app`，安装到 `/Applications/Waku Steward.app`，不依赖开发 watcher。
+
+- 应用身份 `sh.waku.steward`；helper 身份 `sh.waku.steward.computer-use`。
+- 配置、projectless 工作区、worktree、helper 位于 `~/.waku-steward`。
+- 数据库及附件位于 `~/Library/Application Support/Waku Steward`；模型缓存位于 `~/Library/Caches/Waku Steward`。
+- 始终启动包内 daemon，忽略外部 daemon 地址、token 和可执行路径覆盖；关闭上游自动更新和上游分析上报。
+- 启动时保持后台，避免抢占键盘焦点。用户通过 Dock 或 Finder 激活窗口。
+- 不读取或迁移原版 Waku 数据；原生 Claude/Codex 登录配置继续按 ADR-0004 共用。
+- 后续更新重新构建并替换 Steward 包，保留上述独立数据目录。普通 release 仍是上游身份，禁止用于此安装流程。
+
+本机安装验证：优化构建成功；App、REPL、daemon 及嵌套 helper 签名检查通过；4 项身份、配置路径及导航回归检查通过。传入无效外部 daemon 地址和路径后，安装版仍启动自己的包内 daemon，并通过真实 WebSocket `loadTaskState` 读取独立数据库。初次启动自动创建 1 个空白会话。清除验证启动参数后，经 Launch Services 后台重启成功。原版 App、Info.plist、settings.json 的 SHA-256 和原版两个进程均保持不变。
+
+本机使用现有 Apple Development 证书签名；该包用于本机使用，未做面向其他设备分发的公证。可重复安装包保存在 `~/Downloads/Waku-Steward-2026-09-06.zip`。

@@ -6,7 +6,7 @@ use anyhow::{Context as _, anyhow, bail};
 
 pub fn start_process() -> anyhow::Result<waku_client::DaemonSupervisor> {
     // Test builds always own their daemon, including launches outside the watcher.
-    if !cfg!(debug_assertions) {
+    if !waku_protocol::identity::IS_ISOLATED {
         let address = std::env::var(waku_client::DAEMON_ADDRESS_ENV)
             .ok()
             .filter(|value| !value.trim().is_empty());
@@ -67,7 +67,7 @@ pub fn local_hostname() -> Option<String> {
 }
 
 fn daemon_executable_path() -> anyhow::Result<PathBuf> {
-    if !cfg!(debug_assertions)
+    if !waku_protocol::identity::IS_ISOLATED
         && let Some(path) = std::env::var_os("WAKU_DAEMON_PATH").filter(|path| !path.is_empty())
     {
         return Ok(path.into());

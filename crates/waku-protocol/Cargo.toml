@@ -5,6 +5,9 @@ edition = "2024"
 description = "Versioned, transport-neutral wire contract shared by Waku clients and daemon"
 license = "GPL-3.0-only"
 
+[features]
+steward = []
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"

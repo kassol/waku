@@ -185,6 +185,9 @@ windows-sys = { version = "0.61", features = [
 # updater trusts the same key Sparkle does on macOS.
 ed25519-dalek = "2"
 
+[profile.steward]
+inherits = "release"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
