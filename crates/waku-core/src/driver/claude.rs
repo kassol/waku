@@ -253,6 +253,8 @@ impl ClaudeDriver {
         let (commands, command_rx) = unbounded();
         let auto_approve = mode != RuntimeMode::Ask;
         let turn_active = Arc::new(Mutex::new(false));
+        let cancellation_requested = Arc::new(AtomicBool::new(false));
+        let reader_cancellation_requested = cancellation_requested.clone();
         let pending_task_stops = Arc::new(Mutex::new(HashMap::<String, BackgroundWorkKey>::new()));
         let pending_user_inputs = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
 
@@ -266,6 +268,7 @@ impl ClaudeDriver {
             .name("waku-claude-reader".into())
             .spawn(move || {
                 let mut state = ClaudeStreamState {
+                    cancellation_requested: reader_cancellation_requested,
                     pending_task_stops: reader_pending_task_stops,
                     pending_user_inputs: reader_pending_user_inputs,
                     ..ClaudeStreamState::default()
@@ -303,6 +306,7 @@ impl ClaudeDriver {
                 while let Ok(message) = command_rx.recv() {
                     let written = match message {
                         CommandMessage::Prompt(text) => {
+                            cancellation_requested.store(false, Ordering::Release);
                             *writer_turn.lock() = true;
                             start_claude_title_refresh(
                                 &writer_title_refresh,
@@ -354,6 +358,7 @@ impl ClaudeDriver {
                             written
                         }
                         CommandMessage::Cancel => {
+                            cancellation_requested.store(true, Ordering::Release);
                             next_request_id += 1;
                             write_line(
                                 &mut stdin,
@@ -613,6 +618,7 @@ fn write_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()> {
 
 #[derive(Default)]
 struct ClaudeStreamState {
+    cancellation_requested: Arc<AtomicBool>,
     saw_text_delta: bool,
     saw_reasoning_delta: bool,
     /// Tool-use id → transcript presentation plus the full shell command.
@@ -1613,16 +1619,28 @@ fn handle_message(
             // the CLI wakes the model itself once the detached work settles,
             // so the turn is parked and its wake continues it. Only a reply
             // with nothing left to wait for settles it.
-            if !failed && !state.live_tasks.is_empty() {
+            let interrupted = state.cancellation_requested.load(Ordering::Acquire);
+            if (!failed || interrupted) && !state.live_tasks.is_empty() {
                 state.parked = true;
                 let _ = events.send(DriverEvent::TurnParked);
+                if interrupted {
+                    // A result settles only the foreground reply. Close the
+                    // resident CLI through its existing shutdown path, and
+                    // let ProcessExited confirm the remaining work stopped.
+                    let _ = commands.send(CommandMessage::Shutdown);
+                }
                 return;
             }
+            state.cancellation_requested.store(false, Ordering::Release);
             state.parked = false;
             *turn_active.lock() = false;
-            let _ = events.send(DriverEvent::TurnFinished {
-                success: !failed,
-                summary: None,
+            let _ = events.send(if interrupted {
+                DriverEvent::TurnInterrupted
+            } else {
+                DriverEvent::TurnFinished {
+                    success: !failed,
+                    summary: None,
+                }
             });
         }
         // `system` status/thinking-token notices and `rate_limit_event` are not
@@ -2603,6 +2621,50 @@ mod tests {
         assert_eq!(questions[0].options[0].label, "Preview");
         assert!(command_rx.try_recv().is_err());
         assert!(state.pending_user_inputs.lock().contains_key("ask-1"));
+    }
+
+    #[test]
+    fn cancelled_result_waits_for_shutdown_when_detached_work_remains() {
+        let (events, event_rx, commands, command_rx, turn, mut state) = harness();
+        state.live_tasks.insert("detached".into());
+        state.cancellation_requested.store(true, Ordering::Release);
+        handle_message(
+            &json!({"type":"result","is_error":false}),
+            "s",
+            &events,
+            &commands,
+            &turn,
+            true,
+            &mut state,
+        );
+        let seen = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event, DriverEvent::TurnParked))
+        );
+        assert!(!seen.iter().any(|event| matches!(
+            event,
+            DriverEvent::TurnInterrupted | DriverEvent::TurnFinished { .. }
+        )));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(CommandMessage::Shutdown)
+        ));
+        assert!(*turn.lock());
+        let mut session =
+            crate::model::AgentSession::new(Uuid::new_v4(), crate::model::ProviderKind::Claude);
+        session.begin_turn("task");
+        let mut history = waku_protocol::history::HistoryReducer::default();
+        history.apply(&mut session, DriverEvent::CancelRequested);
+        for event in seen {
+            history.apply(&mut session, event);
+        }
+        assert!(session.active_turn_id().is_some());
+        history.apply(&mut session, DriverEvent::ProcessExited);
+        assert_eq!(
+            session.turns.last().unwrap().status,
+            crate::model::TurnStatus::Interrupted
+        );
     }
 
     #[test]

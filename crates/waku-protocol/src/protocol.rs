@@ -20,7 +20,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -143,6 +143,13 @@ pub struct ChildSessionSummary {
     rename_all_fields = "camelCase"
 )]
 pub enum Command {
+    StewardPrompt {
+        child_session_id: Uuid,
+        prompt: String,
+    },
+    StewardCancel {
+        child_session_id: Uuid,
+    },
     /// Read direct children of Request.session_id.
     StewardQuery {
         query: StewardQuery,
@@ -484,6 +491,14 @@ pub enum ResponseOutcome {
     rename_all_fields = "camelCase"
 )]
 pub enum ResponsePayload {
+    ChildPromptAccepted {
+        turn_id: Uuid,
+    },
+    ChildCancel {
+        session: ChildSessionSummary,
+        accepted: bool,
+        stopped: bool,
+    },
     ChildSessions {
         sessions: Vec<ChildSessionSummary>,
     },
@@ -675,7 +690,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     #[test]
@@ -684,7 +699,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     #[test]

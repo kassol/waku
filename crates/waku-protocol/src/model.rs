@@ -977,6 +977,8 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_driver_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_requested_turn_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_permission: Option<PendingPermission>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_user_input: Option<UserInputRequest>,
@@ -1041,6 +1043,7 @@ impl AgentSession {
             history_saved_cursor: None,
             history_save_error: None,
             last_driver_error: None,
+            cancellation_requested_turn_id: None,
             pending_permission: None,
             pending_user_input: None,
             provider_session_id: None,
@@ -1083,6 +1086,7 @@ impl AgentSession {
             history_saved_cursor: None,
             history_save_error: None,
             last_driver_error: None,
+            cancellation_requested_turn_id: None,
             pending_permission: None,
             pending_user_input: None,
             provider_session_id: None,
@@ -1860,8 +1864,10 @@ pub enum DriverEvent {
         turn_id: Uuid,
         message_id: Uuid,
     },
-    /// Mirrors the existing immediate user-stop history policy.
+    /// Cancellation was accepted; the current turn remains open until stopped.
     CancelRequested,
+    /// The provider confirmed that its current turn stopped.
+    TurnInterrupted,
     InteractionResponded {
         request_id: String,
     },

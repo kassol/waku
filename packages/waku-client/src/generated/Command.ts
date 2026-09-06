@@ -21,7 +21,7 @@ import type { WireSessionOptions } from "./WireSessionOptions";
 import type { WorkspaceOperation } from "./WorkspaceOperation";
 import type { JsonValue } from "./serde_json/JsonValue";
 
-export type Command = { "type": "stewardQuery", query: StewardQuery, } | { "type": "createSession", provider: ProviderKind, prompt: string, model: string | null, title: string | null, runtimeMode: RuntimeMode | null, idempotencyKey: string | null, workspace: CreationWorkspace, } | { "type": "prepareShutdown" } | { "type": "shutdownDaemon" } | { "type": "attachSession" } | { "type": "start", options: WireDriverStartOptions, } | { "type": "prompt", prompt: string,
+export type Command = { "type": "stewardPrompt", childSessionId: string, prompt: string, } | { "type": "stewardCancel", childSessionId: string, } | { "type": "stewardQuery", query: StewardQuery, } | { "type": "createSession", provider: ProviderKind, prompt: string, model: string | null, title: string | null, runtimeMode: RuntimeMode | null, idempotencyKey: string | null, workspace: CreationWorkspace, } | { "type": "prepareShutdown" } | { "type": "shutdownDaemon" } | { "type": "attachSession" } | { "type": "start", options: WireDriverStartOptions, } | { "type": "prompt", prompt: string,
 /**
  * The ids the submitting client already gave this turn and its user
  * message. The daemon republishes them with the submission so every

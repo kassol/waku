@@ -156,6 +156,23 @@ impl EventSink {
         }
     }
 
+    pub(crate) fn reserve_steward_target(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<ChildCreationGuard> {
+        if !self.hub.state.lock().creating_sessions.insert(session_id) {
+            bail!("child session is busy accepting another operation");
+        }
+        Ok(ChildCreationGuard {
+            session_id,
+            hub: self.hub.clone(),
+        })
+    }
+
+    pub(crate) fn child_sink(&self, session_id: Uuid, runtime_id: Uuid) -> Self {
+        self.hub.event_sink(session_id, runtime_id)
+    }
+
     pub(crate) fn begin_child(
         &self,
         session_id: Uuid,
@@ -1123,7 +1140,10 @@ fn dispatch_steward(
         && request.runtime_id == scope.runtime_id
         && matches!(
             request.command,
-            Command::CreateSession { .. } | Command::StewardQuery { .. }
+            Command::CreateSession { .. }
+                | Command::StewardQuery { .. }
+                | Command::StewardPrompt { .. }
+                | Command::StewardCancel { .. }
         )
         && active
         && backend

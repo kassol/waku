@@ -18,6 +18,7 @@ impl Waku {
             DriverEvent::TurnFinished { success: false, .. } => {
                 Some(crate::analytics::TurnOutcome::Failed)
             }
+            DriverEvent::TurnInterrupted => Some(crate::analytics::TurnOutcome::Cancelled),
             DriverEvent::ProcessExited => Some(crate::analytics::TurnOutcome::ProcessExited),
             _ => None,
         };
@@ -43,26 +44,6 @@ impl Waku {
             self.analytics.track(event);
         }
         effects
-    }
-
-    pub(super) fn finish_streaming_assistant(&mut self, session_id: Uuid) {
-        if let Some(session) = self.state.session_mut(session_id) {
-            history::finish_streaming_assistant(session);
-        }
-    }
-
-    pub(super) fn complete_turn_blocks(&mut self, session_id: Uuid) {
-        if let Some(session) = self.state.session_mut(session_id) {
-            history::complete_turn_blocks(session);
-        }
-    }
-
-    pub(super) fn turn_has_assistant_message(&self, session_id: Uuid) -> bool {
-        self.state
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .is_some_and(history::turn_has_assistant_message)
     }
 
     /// Whether the running turn was prompted — a provider-started wake has no
@@ -109,6 +90,20 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> bool {
         runtime.last_active_at = Instant::now();
+        let event = if matches!(event, DriverEvent::TurnFinished { .. })
+            && self
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .is_some_and(|session| {
+                    session.cancellation_requested_turn_id.is_some()
+                        && session.cancellation_requested_turn_id == session.active_turn_id()
+                }) {
+            DriverEvent::TurnInterrupted
+        } else {
+            event
+        };
         match event {
             DriverEvent::HistorySnapshot(snapshot) => {
                 if self
@@ -168,9 +163,26 @@ impl Waku {
                 self.apply_history_event(session_id, runtime, event);
             }
             DriverEvent::CancelRequested => {
+                self.apply_history_event(session_id, runtime, DriverEvent::CancelRequested);
+            }
+            DriverEvent::TurnInterrupted => {
+                self.settle_foreground_work(session_id, BackgroundWorkStatus::Stopped);
+                let previous_kinds = self.snapshot_selected_transcript_rows(session_id);
+                self.apply_history_event(session_id, runtime, DriverEvent::TurnInterrupted);
                 runtime.pending_permission = None;
                 runtime.pending_user_input = None;
-                self.apply_history_event(session_id, runtime, DriverEvent::CancelRequested);
+                runtime.pending_computer_approval = None;
+                runtime.computer_use_previews.clear();
+                runtime.park_announced = false;
+                runtime.driver.cancel_computer_use();
+                self.pending_queue_drains.retain(|id| *id != session_id);
+                self.capture_latest_turn_checkpoint_for(session_id);
+                if self.state.selected_session == Some(session_id) {
+                    self.workspace_queries_stale = true;
+                }
+                if let Some(previous_kinds) = previous_kinds.as_deref() {
+                    self.splice_active_transcript_rows_after_visibility_change(previous_kinds);
+                }
             }
             DriverEvent::InteractionResponded { request_id } => {
                 if runtime
