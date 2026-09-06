@@ -54,7 +54,9 @@ impl HistoryReducer {
         let mut effects = HistoryEffects::default();
         match event {
             DriverEvent::InputDeliveryChanged(delivery) => {
-                if !session.input_deliveries.iter().any(|entry| entry.id == delivery.id) {
+                if let Some(existing) = session.input_deliveries.iter_mut().find(|entry| entry.id == delivery.id) {
+                    if existing.state == InputDeliveryState::Queued { *existing = delivery.clone(); }
+                } else {
                     session.input_deliveries.push(delivery.clone());
                 }
                 effects.invalidated_activity_diff = self.update_activity(session, input_delivery_activity(&delivery));
@@ -619,6 +621,7 @@ impl HistoryReducer {
 
 fn input_delivery_activity(delivery: &InputDelivery) -> ActivityItem {
     let state = match delivery.state {
+        InputDeliveryState::Queued => tr!("session.input_queued"),
         InputDeliveryState::Accepted => tr!("session.input_accepted"),
         InputDeliveryState::Received => match delivery.confirmation {
             Some(InputConfirmation::Transport) => tr!("session.input_received_transport"),

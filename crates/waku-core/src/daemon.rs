@@ -29,6 +29,9 @@ use waku_protocol::provider_session::{ProviderSessionFork, ProviderSessionForkRe
 
 #[path = "steward_input.rs"]
 mod steward_input;
+#[cfg(test)]
+#[path = "steward_input_tests.rs"]
+mod steward_input_tests;
 #[path = "steward.rs"]
 mod steward;
 #[path = "steward_wait.rs"]
@@ -95,13 +98,31 @@ impl WakuBackend {
             }
             task_store.hydrate(&mut task_state.sessions[index])?;
             let session = &mut task_state.sessions[index];
+            let mut recovered_deliveries = Vec::new();
+            let lost_interaction = session.pending_permission.is_some() || session.pending_user_input.is_some();
+            if lost_interaction {
+                for delivery in &mut session.input_deliveries {
+                    if delivery.state == crate::model::InputDeliveryState::Queued {
+                        delivery.state = crate::model::InputDeliveryState::Failed;
+                        delivery.reason = Some("Provider stopped while awaiting the user; queued input needs a new decision".into());
+                        recovered_deliveries.push(delivery.clone());
+                        cleared_waits.push(session.id);
+                        recovered = true;
+                    }
+                }
+            }
             for delivery in &mut session.input_deliveries {
                 if delivery.state == crate::model::InputDeliveryState::Accepted {
                     delivery.state = crate::model::InputDeliveryState::Uncertain;
                     delivery.reason = Some("Daemon restarted before input confirmation; do not resend automatically".into());
+                    recovered_deliveries.push(delivery.clone());
                     cleared_waits.push(session.id);
                     recovered = true;
                 }
+            }
+
+            for delivery in recovered_deliveries {
+                waku_protocol::history::HistoryReducer::default().apply(session, DriverEvent::InputDeliveryChanged(delivery));
             }
 
             if session.steward_wait.as_ref().is_some_and(|wait| {
@@ -510,6 +531,7 @@ impl Backend for WakuBackend {
     }
 
     fn resume_stewards(&self, events: EventSink) {
+        self.resume_queued_inputs(&events);
         self.resume_waiting_stewards(&events);
     }
 
@@ -612,6 +634,7 @@ impl WakuBackend {
         let session_id = request.session_id;
         let runtime_id = request.runtime_id;
         if matches!(&request.command, Command::Cancel) {
+            let cancelled_queue = self.cancel_queued_inputs(session_id, &events)?;
             let cancelled_wait = {
                 let mut state = self.task_state.lock();
                 let waiting = state.sessions.iter_mut().find(|session| {
@@ -647,6 +670,7 @@ impl WakuBackend {
                 }
                 return Ok(ResponsePayload::Ack);
             }
+            if cancelled_queue && !self.sessions.lock().contains_key(&session_id) { return Ok(ResponsePayload::Ack); }
         }
         match request.command {
             Command::StewardWorkspace { operation } => self.steward_workspace(session_id, operation, &events),

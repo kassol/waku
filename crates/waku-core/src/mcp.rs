@@ -160,7 +160,7 @@ pub fn run_stdio(
                     },
                     {
                         "name": "waku_prompt",
-                        "description": "Deliver input to a direct child: new turn when idle, native steer when working. Provide a stable delivery_id to recover the same input after disconnect. Same id with different text is rejected. Query waku_prompt_status for confirmation; uncertain input must never be resent with a new id. Approvals and questions remain for the user.",
+                        "description": "Deliver input to a direct child: new turn when idle, native steer when working, persistent FIFO queue only when the active provider explicitly lacks steering support. Provide a stable delivery_id to recover the same input after disconnect. Same id with different text is rejected. Query waku_prompt_status for confirmation; uncertain input must never be resent with a new id. Approvals and questions remain for the user.",
                         "inputSchema": {"type":"object", "properties":{"session_id":{"type":"string","format":"uuid"},"prompt":{"type":"string","minLength":1},"delivery_id":{"type":"string","format":"uuid"}}, "required":["session_id","prompt"],"additionalProperties":false}
                     },
                     {

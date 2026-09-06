@@ -118,6 +118,20 @@ impl Drop for ChildCreationGuard {
 }
 
 impl EventSink {
+    pub(crate) fn reserve_input_target(&self, session_id: Uuid, user_input: bool) -> anyhow::Result<ChildCreationGuard> {
+        let mut guard = if user_input { self.reserve_client_target(session_id)? }
+            else { self.reserve_steward_target(session_id)? };
+        // Only external input operations wake on release. The event worker's
+        // own probes must not wake themselves into a polling loop.
+        guard.wake_on_release = true;
+        Ok(guard)
+    }
+
+    pub(crate) fn input_state_changed(&self) {
+        self.hub.task_state_changed(0);
+        self.hub.wake_stewards();
+    }
+
     pub(crate) fn ensure_steward_active(&self) -> anyhow::Result<()> {
         if self
             .scoped_principal
@@ -580,7 +594,7 @@ impl Hub {
         }
         let wake = committed && sequenced.iter().any(|event| matches!(event.event.kind.as_str(),
             "turnFinished" | "turnInterrupted" | "permission" | "userInputRequested"
-                | "error" | "processExited" | "stewardWaitChanged"));
+                | "error" | "processExited" | "stewardWaitChanged" | "inputDeliveryOutcome" | "interactionResponded"));
         drop(state);
         if wake {
             self.wake_stewards();

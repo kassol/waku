@@ -2226,3 +2226,6 @@ consultation.not_saved:
 
 consultation.not_configured:
   en: Read-only discussion requires an already configured Claude provider.
+
+session.input_queued:
+  en: Input queued

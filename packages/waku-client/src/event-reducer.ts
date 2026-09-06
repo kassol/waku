@@ -115,7 +115,9 @@ export function reduceRuntimeEvent(
     case 'inputDeliveryChanged': {
       const delivery = clone(payload as unknown as InputDelivery)
       session.input_deliveries ??= []
-      if (!session.input_deliveries.some((entry) => entry.id === delivery.id)) session.input_deliveries.push(delivery)
+      const existing = session.input_deliveries.findIndex((entry) => entry.id === delivery.id)
+      if (existing < 0) session.input_deliveries.push(delivery)
+      else if (session.input_deliveries[existing]!.state === 'queued') session.input_deliveries[existing] = delivery
       break
     }
     case 'inputDeliveryOutcome': {

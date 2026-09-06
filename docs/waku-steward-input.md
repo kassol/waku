@@ -10,7 +10,7 @@ both submission and lookup. A target operation excludes concurrent desktop
 input and callback submission. Pending approvals and user questions reject
 ordinary input. Idle targets start one saved turn; busy targets use the current
 provider's native steering path. A missing runtime is a failure with unknown
-capability. An explicit lack of steering support returns `unsupported`.
+capability. An explicit lack of steering support queues the input for the next eligible turn.
 
 The daemon saves `accepted` before crossing the provider boundary and records
 `uncertain` before sending. Codex RPC success confirms provider receipt; Claude
@@ -26,3 +26,26 @@ the transport boundary.
 Delivery records survive stale desktop saves and history rewind. Forks start
 with no delivery records. Native history shows each delivery's text, state,
 confirmation, ID, target turn, and failure reason in an expandable activity.
+
+## Persistent fallback queue
+
+An explicitly unsupported busy runtime records the input as `queued`. A missing
+runtime does not qualify. The existing daemon event worker consumes this queue
+before checking steward callbacks. It does not depend on a connected desktop or
+periodic polling.
+
+Each queued input waits for its predecessor turn. Dequeue rechecks the saved
+caller, direct-child relationship, permission ceiling, pending interactions, and
+predecessor turn. A user-started replacement turn invalidates the queued input.
+When a queued input starts, later entries advance to that new predecessor in the
+same save, retaining FIFO order. An unconfirmed submitted prompt blocks later
+queue entries until its receipt is resolved. A restart preserves pending entries
+and never resends an accepted or uncertain entry.
+
+Queue transitions use the same durable input identity and history activity.
+Shutdown prevents automatic dispatch. A failed validation retains the original
+input with its failure reason.
+
+Cancellation fails queued inputs before provider submission. A restart that loses
+an unanswered provider interaction retains those inputs as failed and requires a
+new user decision.

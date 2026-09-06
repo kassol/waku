@@ -360,15 +360,11 @@ impl ClaudeDriver {
                             }
                             // No TurnStarted and no turn re-arm: the turn the
                             // message joins is already running.
-                            let written = write_line(&mut stdin, &user_message_payload(&text));
-                            if delivery_id.is_some() {
-                                super::input_outcome(&writer_events, delivery_id,
-                                    if written.is_ok() { crate::model::InputDeliveryState::Received } else { crate::model::InputDeliveryState::Uncertain },
-                                    written.as_ref().ok().map(|_| crate::model::InputConfirmation::Transport),
-                                    written.as_ref().err().map(ToString::to_string));
-                                if written.is_err() { break; }
+                            if let Some(id) = delivery_id {
+                                if write_tracked_steer(&mut stdin, &text, id, delivery_epoch, &writer_epoch, &writer_events).is_err() { break; }
                                 continue;
                             }
+                            let written = write_line(&mut stdin, &user_message_payload(&text));
                             match &written {
                                 Ok(()) => {
                                     let _ = writer_events
@@ -589,8 +585,9 @@ impl DriverControl for ClaudeDriver {
     }
 
     fn deliver_input(&self, prompt: String, id: uuid::Uuid, steer: bool) -> anyhow::Result<()> {
-        if steer && !*self.turn_active.lock() { anyhow::bail!("Claude has no active turn"); }
-        self.commands.send(CommandMessage::Deliver { prompt, id, steer, expected_epoch: self.turn_epoch.load(Ordering::Acquire) })
+        let expected_epoch = self.turn_epoch.load(Ordering::Acquire);
+        if steer && (!*self.turn_active.lock() || self.turn_epoch.load(Ordering::Acquire) != expected_epoch) { anyhow::bail!("Claude has no stable active turn"); }
+        self.commands.send(CommandMessage::Deliver { prompt, id, steer, expected_epoch })
             .map_err(|_| anyhow::anyhow!("provider input channel is closed"))
     }
 
@@ -656,6 +653,47 @@ fn write_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()> {
     serde_json::to_writer(&mut *writer, value)?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+// Claude has no expectedTurnId. Recheck the locally observed boundary after
+// the write without holding a reader lock across potentially blocking I/O.
+fn write_tracked_steer(
+    writer: &mut impl Write,
+    text: &str,
+    id: uuid::Uuid,
+    expected_epoch: u64,
+    epoch: &std::sync::atomic::AtomicU64,
+    events: &impl DriverEventSink,
+) -> std::io::Result<()> {
+    if epoch.load(Ordering::Acquire) != expected_epoch {
+        super::input_outcome(
+            events,
+            Some(id),
+            crate::model::InputDeliveryState::Failed,
+            None,
+            Some("Claude turn ended before input delivery; input was not sent".into()),
+        );
+        return Ok(());
+    }
+    let written = write_line(writer, &user_message_payload(text));
+    let turn_changed = epoch.load(Ordering::Acquire) != expected_epoch;
+    let received = written.is_ok() && !turn_changed;
+    super::input_outcome(
+        events,
+        Some(id),
+        if received {
+            crate::model::InputDeliveryState::Received
+        } else {
+            crate::model::InputDeliveryState::Uncertain
+        },
+        received.then_some(crate::model::InputConfirmation::Transport),
+        if turn_changed {
+            Some("Claude turn ended during input delivery; receipt in the intended turn is uncertain".into())
+        } else {
+            written.as_ref().err().map(ToString::to_string)
+        },
+    );
+    written
 }
 
 #[derive(Default)]
@@ -2921,4 +2959,49 @@ mod tests {
         // not the subagent's tokens, not the smaller subagent window.
         assert_eq!(usage, [(Some(120), None), (None, Some(1_000_000))]);
     }
+}
+
+#[cfg(test)]
+mod tracked_input_tests {
+    use super::*;
+
+    #[test]
+    fn tracked_steer_turn_completion_during_write_is_uncertain() {
+        struct EndingWriter<'a>(&'a std::sync::atomic::AtomicU64, Vec<u8>);
+        impl Write for EndingWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.1.extend_from_slice(bytes); Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.fetch_add(1, Ordering::AcqRel); Ok(())
+            }
+        }
+        let epoch = std::sync::atomic::AtomicU64::new(7);
+        let mut writer = EndingWriter(&epoch, Vec::new());
+        let (events, receiver) = crossbeam_channel::unbounded();
+        let id = uuid::Uuid::new_v4();
+        write_tracked_steer(&mut writer, "old turn feedback", id, 7, &epoch, &events).unwrap();
+        assert_eq!(String::from_utf8(writer.1).unwrap().lines().count(), 1);
+        match receiver.try_recv().unwrap() {
+            DriverEvent::InputDeliveryOutcome(outcome) => {
+                assert_eq!(outcome.id, id);
+                assert_eq!(outcome.state, crate::model::InputDeliveryState::Uncertain);
+                assert!(outcome.confirmation.is_none());
+                assert!(outcome.reason.unwrap().contains("turn ended"));
+            }
+            _ => panic!("expected tracked uncertainty"),
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn tracked_steer_known_completed_turn_never_writes() {
+    let epoch = std::sync::atomic::AtomicU64::new(8);
+    let mut writer = Vec::new();
+    let (events, receiver) = crossbeam_channel::unbounded();
+    write_tracked_steer(&mut writer, "stale feedback", uuid::Uuid::new_v4(), 7, &epoch, &events).unwrap();
+    assert!(writer.is_empty());
+    assert!(matches!(receiver.try_recv().unwrap(), DriverEvent::InputDeliveryOutcome(crate::model::InputDeliveryOutcome { state: crate::model::InputDeliveryState::Failed, .. })));
 }

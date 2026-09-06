@@ -911,7 +911,7 @@ pub struct RuntimeEventCursor {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
-pub enum InputDeliveryState { Accepted, Received, Failed, Uncertain, Unsupported }
+pub enum InputDeliveryState { Queued, Accepted, Received, Failed, Uncertain, Unsupported }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]

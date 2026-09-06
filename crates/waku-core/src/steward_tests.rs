@@ -1894,7 +1894,20 @@ fn mcp_input_delivery_is_idempotent_and_queryable() {
     with_creation_daemon_seed(
         |root, path| {
             std::fs::write(root.join("codex-fixture"), include_str!("../tests/fixtures/codex_prompt_cancel.py")).unwrap();
-            seed_query_sessions(root, path)
+            let (project, parent, mut children) = seed_query_sessions(root, path);
+            let attachment_path = root.join("history-attachment.txt");
+            std::fs::write(&attachment_path, "retained attachment").unwrap();
+            children[0].messages[0].display_content = Some("Original displayed prompt".into());
+            children[0].messages[0].attachments.push(crate::model::MessageAttachment {
+                path: attachment_path, mention: "history-attachment.txt".into(), name: "history-attachment.txt".into(),
+                is_dir: false, is_image: false, blob_reference: Some("fixture-history-blob".into()),
+            });
+            let store = StateStore::daemon(root.join("app.db"));
+            let mut state = store.load().unwrap();
+            *state.sessions.iter_mut().find(|session| session.id == children[0].id).unwrap() = children[0].clone();
+            state.mark_session_dirty(children[0].id);
+            store.save(&mut state).unwrap();
+            (project, parent, children)
         },
         |client, _, root, path, address, (project, parent, children)| {
             let (parent, _, config, runtime) = start_steward_saved(&client, root, path, parent, project);
@@ -1937,6 +1950,8 @@ fn mcp_input_delivery_is_idempotent_and_queryable() {
             for turn in &old.turns {
                 assert!(loaded.turns.iter().any(|saved| serde_json::to_value(saved).unwrap() == serde_json::to_value(turn).unwrap()));
             }
+            let other_target = mcp_response(address, token, parent.id, runtime, "waku_prompt", json!({"session_id":children[1].id,"prompt":"durable input","delivery_id":id}));
+            assert_eq!(other_target["result"]["isError"], true);
             let conflict = mcp_response(address, token, parent.id, runtime, "waku_prompt", json!({"session_id":child,"prompt":"different","delivery_id":id}));
             assert_eq!(conflict["result"]["isError"], true);
         },

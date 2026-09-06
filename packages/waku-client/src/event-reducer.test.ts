@@ -419,3 +419,15 @@ test('tracked steering preserves receipt, original turn, and message identity on
   expect(repeated.messages.at(-1)?.turn_id).toBe(turn)
   expect(apply(repeated, 'processExited', null).input_deliveries?.[0]?.state).toBe('received')
 })
+
+test('queued input transitions to its saved new turn without duplicating the ledger', () => {
+  const original = idleSession()
+  const delivery = { id: 'queued-delivery', caller_session_id: 'parent', target_session_id: original.id,
+    prompt: 'Queued feedback', turn_id: original.turns[0]!.id, mode: 'prompt', state: 'queued',
+    confirmation: null, reason: 'Unsupported native steering', created_at: 100 }
+  const queued = apply(original, 'inputDeliveryChanged', delivery)
+  const submitted = apply(queued, 'inputDeliveryChanged', { ...delivery, turn_id: 'new-turn', state: 'accepted', reason: null })
+  const received = apply(submitted, 'inputDeliveryOutcome', { id: delivery.id, state: 'received', confirmation: 'transport', reason: null })
+  expect(received.input_deliveries).toHaveLength(1)
+  expect(received.input_deliveries?.[0]).toMatchObject({ turn_id: 'new-turn', state: 'received' })
+})

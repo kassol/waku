@@ -150,6 +150,7 @@ impl WakuBackend {
                 || parent.pending_permission.is_some()
                 || parent.pending_user_input.is_some()
                 || !parent.queued_messages.is_empty()
+                || parent.input_deliveries.iter().any(|delivery| delivery.state == crate::model::InputDeliveryState::Queued)
             {
                 return Ok(());
             }
@@ -221,7 +222,7 @@ impl WakuBackend {
         )
     }
 
-    fn save_steward_wait(&self, state: &mut PersistedState, parent_id: Uuid) -> anyhow::Result<()> {
+    pub(super) fn save_steward_wait(&self, state: &mut PersistedState, parent_id: Uuid) -> anyhow::Result<()> {
         if let Err(error) = self.task_store.save(state) {
             self.saving_failed.store(true, Ordering::Release);
             self.failed_sessions.lock().insert(parent_id);

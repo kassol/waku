@@ -1081,3 +1081,5 @@ consultation.invalid_response: 服务返回了无效的交流答复。
 consultation.not_saved: 无法确认交流状态。
 
 consultation.not_configured: 只读即时交流需要已配置的 Claude。请先在设置中配置 Claude。
+
+session.input_queued: 输入已排队
