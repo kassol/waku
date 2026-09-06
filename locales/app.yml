@@ -2170,3 +2170,6 @@ session.safe_exit_pending:
   en: "Stopping tasks and saving history before quitting…"
   zh-CN: "正在停止任务并保存历史，完成后退出…"
   ja: "タスクを停止し、履歴を保存してから終了します…"
+
+sidebar.original_parent:
+  en: "Original parent: %{id}"

@@ -200,6 +200,73 @@ describe("WakuClient", () => {
     client.disconnect();
   });
 
+  test("pruned replay replaces history and skips overlapping live events", async () => {
+    const { client, sockets } = fixture();
+    const socket = await connect(client, sockets);
+    const received: Array<[string, number]> = [];
+    client.subscribe("session", "runtime", (event) => received.push([event.event.kind, event.sequence]));
+    const wire = (sequence: number) => ({ sessionId: "session", runtimeId: "runtime", epoch: "epoch", sequence, event: { kind: "textDelta", payload: "x" } });
+    socket.receive({ type: "event", ...wire(20_005) });
+    socket.receive({ type: "event", ...wire(20_006) });
+    const request = JSON.parse(socket.sent.at(-1)!);
+    socket.receive({ type: "response", requestId: request.requestId, outcome: { status: "ok", payload: {
+      type: "historySnapshot",
+      session: { id: "session", messages: [{ content: "complete history" }], history_saved_cursor: { runtime_id: "runtime", epoch: "epoch", sequence: 20_006 } },
+    } } });
+    await Promise.resolve();
+    socket.receive({ type: "event", ...wire(20_007) });
+    expect(received).toEqual([["historySnapshot", 20_006], ["textDelta", 20_007]]);
+    client.disconnect();
+  });
+
+  test("snapshot chunks replace history only after a complete ordered transfer", async () => {
+    const { client, sockets } = fixture();
+    const socket = await connect(client, sockets);
+    const cursor = { runtime_id: "runtime", epoch: "epoch", sequence: 20_005 };
+    const session = { id: "session", history_saved_cursor: cursor, runtime_event_cursor: cursor, messages: [{ content: "保留历史" }] };
+    const serialized = JSON.stringify(session);
+    const parts = [serialized.slice(0, 60), serialized.slice(60)];
+    let resolved: unknown;
+    const pending = client.request({ type: "replayEvents", cursor: { sessionId: "session", runtimeId: "runtime", epoch: "epoch", sequence: 0 } }).then((value) => { resolved = value; });
+    const requestId = JSON.parse(socket.sent.at(-1)!).requestId;
+    const totalBytes = new TextEncoder().encode(serialized).length;
+    socket.receive({ type: "historySnapshotChunk", replay: true, requestId, sessionId: "session", cursor, offset: 0, totalBytes, data: parts[0] });
+    await Promise.resolve();
+    expect(resolved).toBeUndefined();
+    socket.receive({ type: "historySnapshotChunk", replay: true, requestId, sessionId: "session", cursor, offset: new TextEncoder().encode(parts[0]).length, totalBytes, data: parts[1] });
+    await Promise.resolve();
+    expect(resolved).toEqual({ type: "historySnapshot", session });
+    await pending;
+    client.disconnect();
+  });
+
+  test("snapshot chunks reject gaps and changed transfer identities", async () => {
+    for (const change of [{ offset: 2 }, { totalBytes: 11 }, { sessionId: "other" }, { cursor: { runtime_id: "other", epoch: "epoch", sequence: 1 } }]) {
+      const { client, sockets } = fixture();
+      const socket = await connect(client, sockets);
+      const pending = client.request({ type: "replayEvents", cursor: { sessionId: "session", runtimeId: "runtime", epoch: "epoch", sequence: 0 } });
+      const requestId = JSON.parse(socket.sent.at(-1)!).requestId;
+      const chunk = { type: "historySnapshotChunk", replay: true, requestId, sessionId: "session", cursor: { runtime_id: "runtime", epoch: "epoch", sequence: 1 }, offset: 0, totalBytes: 10, data: "{" };
+      socket.receive(chunk);
+      socket.receive({ ...chunk, offset: 1, ...change });
+      await expect(pending).rejects.toThrow("invalid history snapshot chunk");
+      client.disconnect();
+    }
+  });
+
+  test("pruned terminal event still releases the runtime after snapshot recovery", async () => {
+    const { client, sockets } = fixture();
+    const socket = await connect(client, sockets);
+    const received: string[] = [];
+    client.subscribe("session", "runtime", (event) => received.push(event.event.kind));
+    socket.receive({ type: "event", sessionId: "session", runtimeId: "runtime", epoch: "epoch", sequence: 20_005, event: { kind: "processExited", payload: null } });
+    const request = JSON.parse(socket.sent.at(-1)!);
+    socket.receive({ type: "response", requestId: request.requestId, outcome: { status: "ok", payload: { type: "historySnapshot", session: { id: "session", history_saved_cursor: { runtime_id: "runtime", epoch: "epoch", sequence: 20_005 } } } } });
+    await Promise.resolve();
+    expect(received).toEqual(["historySnapshot", "processExited"]);
+    client.disconnect();
+  });
+
   test("saved hot-window pruning restores the complete stream on subscription", async () => {
     const { client, sockets } = fixture();
     const socket = await connect(client, sockets);

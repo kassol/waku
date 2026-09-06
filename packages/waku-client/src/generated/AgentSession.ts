@@ -70,7 +70,11 @@ thread_goal?: ThreadGoal | null,
  * Context-window occupancy from the live stream, kept so a resumed
  * session's meter starts where the conversation left off.
  */
-context_usage?: ContextUsage | null, runtime_event_cursor?: RuntimeEventCursor | null, history_saved_cursor?: RuntimeEventCursor | null, history_save_error?: string | null, pending_permission?: PendingPermission | null, pending_user_input?: UserInputRequest | null,
+context_usage?: ContextUsage | null, runtime_event_cursor?: RuntimeEventCursor | null, history_saved_cursor?: RuntimeEventCursor | null, history_save_error?: string | null,
+/**
+ * Pending provider failure used if the runtime exits before producing a reply.
+ */
+last_driver_error?: string | null, pending_permission?: PendingPermission | null, pending_user_input?: UserInputRequest | null,
 /**
  * Read-only compatibility field for v1 state files. New saves omit it.
  */

@@ -11,5 +11,7 @@ Dropping a connection to an externally managed daemon does not stop it.
 `subscribe_after` starts live delivery before filling any missing persisted
 prefix on a background thread. Replay and live events share cursor deduplication.
 Unsubscribed buffers prune only acknowledged events beyond the 4096-entry hot
-window; opening a session recovers that prefix through paged `ReplayEvents`.
+window; opening a session recovers that prefix through paged `ReplayEvents`
+or a full `HistorySnapshot` when durable events were pruned. The snapshot
+replaces old history, then delivery resumes strictly after its saved cursor.
 Storage acknowledgments remain separate from event receipt.

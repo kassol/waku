@@ -111,7 +111,7 @@ fn connect_remote(
                                 break true;
                             };
                             let persistence = sequenced.event.kind == "historyPersistence";
-                            if !persistence && replay_cursor.is_some_and(|cursor| {
+                            if !persistence && sequenced.event.kind != "processExited" && replay_cursor.is_some_and(|cursor| {
                                 cursor.runtime_id == sequenced.runtime_id
                                     && cursor.epoch == sequenced.epoch
                                     && cursor.sequence >= sequenced.sequence
@@ -123,6 +123,17 @@ fn connect_remote(
                                 epoch: sequenced.epoch,
                                 sequence: sequenced.sequence,
                             };
+                            if sequenced.event.kind == "historySnapshot" {
+                                match serde_json::from_value(sequenced.event.payload) {
+                                    Ok(session) => {
+                                        pending_exit = None;
+                                        replay_cursor = Some(cursor);
+                                        if forwarding_events.send(DriverEvent::HistorySnapshot(Box::new(session))).is_err() { return; }
+                                    }
+                                    Err(error) => { let _ = forwarding_events.send(DriverEvent::Error(format!("invalid history snapshot: {error}"))); return; }
+                                }
+                                continue;
+                            }
                             if persistence {
                                 let error = sequenced.event.payload.get("error").and_then(serde_json::Value::as_str).map(str::to_owned);
                                 let exit_saved = pending_exit.as_ref().is_some_and(|(_, exit_cursor): &(DriverEvent, RuntimeEventCursor)| exit_cursor.runtime_id == cursor.runtime_id && exit_cursor.epoch == cursor.epoch && exit_cursor.sequence <= cursor.sequence);

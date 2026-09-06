@@ -1053,3 +1053,5 @@ usage_error.curl_no_status: curl 未返回 HTTP 状态行
 session.history_saved: 历史已保存
 session.history_pending: 正在保存历史…
 session.history_save_failed: '历史尚未保存：%{error}'
+
+sidebar.original_parent: "原父会话：%{id}"

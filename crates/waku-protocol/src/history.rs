@@ -33,6 +33,7 @@ pub fn apply_rewound_history(current: &mut AgentSession, rewound: AgentSession) 
     current.runtime_event_cursor = rewound.runtime_event_cursor;
     current.history_saved_cursor = rewound.history_saved_cursor;
     current.history_save_error = rewound.history_save_error;
+    current.last_driver_error = rewound.last_driver_error;
     current.pending_permission = rewound.pending_permission;
     current.pending_user_input = rewound.pending_user_input;
     current.status = rewound.status;
@@ -44,6 +45,31 @@ impl HistoryReducer {
     pub fn apply(&mut self, session: &mut AgentSession, event: DriverEvent) -> HistoryEffects {
         let mut effects = HistoryEffects::default();
         match event {
+            DriverEvent::HistorySnapshot(snapshot) => {
+                *session = *snapshot;
+                self.last_driver_error = session.last_driver_error.clone();
+                self.stream_phase = if session
+                    .messages
+                    .last()
+                    .is_some_and(|message| message.streaming)
+                {
+                    Some(StreamPhase::Text)
+                } else {
+                    session
+                        .transcript_blocks
+                        .last()
+                        .filter(|block| block.turn_id == session.active_turn_id())
+                        .map(|block| {
+                            if block.activities.last().is_some_and(|activity| {
+                                activity.reasoning.is_some() && !activity.complete
+                            }) {
+                                StreamPhase::Reasoning
+                            } else {
+                                StreamPhase::Activity
+                            }
+                        })
+                };
+            }
             DriverEvent::PromptSubmitted {
                 message,
                 turn_id,
@@ -59,6 +85,7 @@ impl HistoryReducer {
                     complete_turn_blocks(session);
                     self.stream_phase = None;
                     self.last_driver_error = None;
+                    session.last_driver_error = None;
                     if !turn_has_assistant_message(session) {
                         session.push_message(MessageRole::Assistant, tr!("session.stopped"));
                     }
@@ -91,6 +118,7 @@ impl HistoryReducer {
             }
             DriverEvent::TurnStarted => {
                 self.last_driver_error = None;
+                session.last_driver_error = None;
                 if session.active_turn_id().is_some() {
                     session.mark_active_turn_provider_started();
                     session.status = SessionStatus::Working;
@@ -148,6 +176,7 @@ impl HistoryReducer {
                 session.pending_permission = None;
                 session.pending_user_input = None;
                 self.last_driver_error = None;
+                session.last_driver_error = None;
                 if session.active_turn_id().is_some() {
                     finish_streaming_assistant(session);
                     complete_turn_blocks(session);
@@ -180,6 +209,7 @@ impl HistoryReducer {
             DriverEvent::Error(error) => {
                 let error = compact_driver_error(&error);
                 self.last_driver_error = Some(error.clone());
+                session.last_driver_error = Some(error.clone());
                 if session.active_turn_is_unconfirmed_pursuit() {
                     if let Some(turn_id) = session.active_turn_id() {
                         session.unwind_unstarted_turn(turn_id);
@@ -211,7 +241,9 @@ impl HistoryReducer {
                 let failure_message = self
                     .last_driver_error
                     .take()
+                    .or_else(|| session.last_driver_error.clone())
                     .unwrap_or_else(|| tr!("session.codex_exited_before_response"));
+                session.last_driver_error = None;
                 if session.status.is_busy() {
                     session.status = SessionStatus::Failed;
                     session.updated_at = unix_time();
@@ -226,6 +258,7 @@ impl HistoryReducer {
             }
             DriverEvent::Connected { provider_cursor } => {
                 self.last_driver_error = None;
+                session.last_driver_error = None;
                 if let Some(ProviderResumeCursor::Claude {
                     resume_at: Some(message_id),
                     ..
@@ -558,6 +591,55 @@ pub fn compact_driver_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_preserves_pending_provider_error_until_exit() {
+        let mut current = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        current.begin_turn("task");
+        let mut reducer = HistoryReducer::default();
+        reducer.apply(&mut current, DriverEvent::TurnStarted);
+        reducer.apply(
+            &mut current,
+            DriverEvent::Error("provider lost connection".into()),
+        );
+        let snapshot = serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
+        let mut restored = current.clone();
+        let mut resumed = HistoryReducer::default();
+        resumed.apply(
+            &mut restored,
+            DriverEvent::HistorySnapshot(Box::new(snapshot)),
+        );
+        resumed.apply(&mut restored, DriverEvent::ProcessExited);
+        reducer.apply(&mut current, DriverEvent::ProcessExited);
+        assert_eq!(
+            restored.messages.last().unwrap().content,
+            "provider lost connection"
+        );
+        assert_eq!(
+            restored.messages.last().unwrap().content,
+            current.messages.last().unwrap().content
+        );
+    }
+
+    #[test]
+    fn snapshot_restores_history_and_continues_the_saved_stream() {
+        let mut saved = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        saved.begin_turn("task");
+        let mut reducer = HistoryReducer::default();
+        reducer.apply(&mut saved, DriverEvent::TurnStarted);
+        reducer.apply(&mut saved, DriverEvent::TextDelta("preserved".into()));
+        saved.parent_session_id = Some(Uuid::new_v4());
+        let mut current = AgentSession::new(saved.project_id, ProviderKind::Codex);
+        current.begin_turn("stale");
+        reducer.apply(
+            &mut current,
+            DriverEvent::HistorySnapshot(Box::new(saved.clone())),
+        );
+        reducer.apply(&mut current, DriverEvent::TextDelta(" tail".into()));
+        assert_eq!(current.messages.len(), saved.messages.len());
+        assert_eq!(current.messages.last().unwrap().content, "preserved tail");
+        assert_eq!(current.parent_session_id, saved.parent_session_id);
+    }
 
     #[test]
     fn rewind_keeps_user_changes_made_after_its_snapshot() {

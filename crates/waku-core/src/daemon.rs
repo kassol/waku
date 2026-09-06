@@ -785,14 +785,7 @@ impl WakuBackend {
                 crate::skills::trash_skills(&dirs).map_err(|error| anyhow!(error))?;
                 Ok(ResponsePayload::Ack)
             }
-            Command::ReplayEvents { cursor } => Ok(ResponsePayload::EventReplay {
-                events: self.task_store.replay_events(
-                    cursor.session_id,
-                    cursor.runtime_id,
-                    cursor.epoch,
-                    cursor.sequence,
-                )?,
-            }),
+            Command::ReplayEvents { cursor } => Ok(self.task_store.replay_history(cursor)?),
             Command::LoadTaskState => {
                 let state = self.task_state.lock();
                 Ok(ResponsePayload::TaskState {
@@ -2505,7 +2498,9 @@ pub fn encode_enum<T: Serialize>(value: T) -> anyhow::Result<String> {
 
 fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
     let (kind, payload) = match event {
-        DriverEvent::RuntimeEventCursorAdvanced(_) | DriverEvent::HistoryPersistence { .. } => {
+        DriverEvent::RuntimeEventCursorAdvanced(_)
+        | DriverEvent::HistorySnapshot(_)
+        | DriverEvent::HistoryPersistence { .. } => {
             bail!("client-only runtime cursors cannot be sent by the daemon")
         }
         DriverEvent::Connected { provider_cursor } => {

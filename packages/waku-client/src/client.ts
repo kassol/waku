@@ -1,5 +1,8 @@
 import {
   PROTOCOL_VERSION,
+  MAX_WIRE_MESSAGE_BYTES,
+  type AgentSession,
+  type RuntimeEventCursor,
   type ClientMessage,
   type Command,
   type ReplayCursor,
@@ -83,6 +86,8 @@ export class WakuConnectionError extends Error {
 }
 
 interface PendingRequest {
+  snapshot?: { identity: string; totalBytes: number; received: number; parts: string[] };
+
   resolve: (payload: ResponsePayload) => void;
   reject: (error: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
@@ -355,8 +360,9 @@ export class WakuClient {
     const deliver = (event: SequencedEvent) => {
       if (!active) return;
       if (event.event.kind !== "historyPersistence") {
-        if (applied?.epoch === event.epoch && event.sequence <= applied.sequence) return;
-        applied = { epoch: event.epoch, sequence: event.sequence };
+        if (applied?.epoch === event.epoch && event.sequence <= applied.sequence) {
+          if (event.event.kind !== "processExited") return;
+        } else applied = { epoch: event.epoch, sequence: event.sequence };
       }
       listener(event);
     };
@@ -368,6 +374,12 @@ export class WakuClient {
           const event = backlog[0]!;
           while (active && previous(event) < missing(event) && !event.event.kind.startsWith("terminal")) {
             const response = await this.request({ type: "replayEvents", cursor: { sessionId, runtimeId, epoch: event.epoch, sequence: previous(event) } }, sessionId, runtimeId);
+            if (response.type === "historySnapshot") {
+              const saved = response.session.history_saved_cursor;
+              if (response.session.id !== sessionId || !saved || saved.runtime_id !== runtimeId || saved.epoch !== event.epoch || saved.sequence <= previous(event)) throw new Error("invalid history snapshot cursor");
+              deliver({ sessionId, runtimeId, epoch: saved.epoch, sequence: saved.sequence, event: { kind: "historySnapshot", payload: response.session as unknown as SequencedEvent["event"]["payload"] } });
+              continue;
+            }
             if (response.type !== "eventReplay" || response.events[0]?.sequence !== previous(event) + 1) throw new Error("saved history replay is incomplete");
             for (const entry of response.events) { if (entry.sequence > missing(event)) break; deliver(entry); }
           }
@@ -457,6 +469,33 @@ export class WakuClient {
   }
 
   private handleMessage(message: ServerMessage): void {
+    if (message.type === "historySnapshotChunk") {
+      const pending = this.pending.get(message.requestId);
+      if (!pending) return;
+      try {
+        const bytes = new TextEncoder().encode(message.data).length;
+        const identity = snapshotIdentity(message.sessionId, message.cursor, message.replay);
+        const snapshot = pending.snapshot ?? { identity, totalBytes: message.totalBytes, received: 0, parts: [] };
+        if (!Number.isSafeInteger(message.totalBytes) || message.totalBytes <= 0 || bytes === 0 || bytes > MAX_WIRE_MESSAGE_BYTES / 8 || snapshot.identity !== identity || snapshot.totalBytes !== message.totalBytes || message.offset !== snapshot.received || snapshot.received + bytes > snapshot.totalBytes) throw new Error("invalid history snapshot chunk");
+        snapshot.parts.push(message.data);
+        snapshot.received += bytes;
+        pending.snapshot = snapshot;
+        if (snapshot.received === snapshot.totalBytes) {
+          const session = JSON.parse(snapshot.parts.join("")) as AgentSession;
+          const saved = session.history_saved_cursor;
+          const applied = session.runtime_event_cursor;
+          if (snapshotIdentity(session.id, applied ?? null, message.replay) !== identity || (message.replay && (!saved || snapshotIdentity(session.id, saved, true) !== identity))) throw new Error("invalid history snapshot identity");
+          this.pending.delete(message.requestId);
+          clearTimeout(pending.timeout);
+          pending.resolve(message.replay ? { type: "historySnapshot", session } : { type: "session", session });
+        }
+      } catch (error) {
+        this.pending.delete(message.requestId);
+        clearTimeout(pending.timeout);
+        pending.reject(asError(error));
+      }
+      return;
+    }
     if (message.type === "response") {
       const pending = this.pending.get(message.requestId);
       if (!pending) return;
@@ -556,4 +595,8 @@ function rejectionError(message: string): WakuConnectionError {
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function snapshotIdentity(sessionId: string, cursor: RuntimeEventCursor | null, replay: boolean): string {
+  return JSON.stringify([sessionId, replay, cursor?.runtime_id ?? null, cursor?.epoch ?? null, cursor?.sequence ?? null]);
 }

@@ -300,3 +300,25 @@ test('hydrated pending interactions survive cursor-based attachment and matching
   expect(asked.pending_user_input?.requestId).toBe('question')
   expect(apply(asked, 'turnFinished', { success: true }).pending_user_input).toBeUndefined()
 })
+
+test('history snapshot replaces stale content and resumes the same message', () => {
+  const old = idleSession()
+  const saved = apply(apply(old, 'turnStarted', null), 'textDelta', 'preserved')
+  saved.parent_session_id = 'original-parent'
+  saved.history_saved_cursor = { runtime_id: 'runtime', epoch: 'epoch', sequence: 20_006 }
+  const snapshot = { ...event('historySnapshot', saved), sequence: 20_006 }
+  const restored = reduceRuntimeEvent(old, snapshot, clock).session
+  expect(restored.messages.at(-1)?.content).toBe('preserved')
+  expect(restored.parent_session_id).toBe('original-parent')
+  const continued = reduceRuntimeEvent(restored, { ...event('textDelta', ' tail'), sequence: 20_007 }, clock).session
+  expect(continued.messages.at(-1)?.content).toBe('preserved tail')
+  expect(continued.messages).toHaveLength(saved.messages.length)
+})
+
+test('snapshot preserves the provider error until the exit is settled', () => {
+  const started = apply(idleSession(), 'turnStarted', null)
+  const saved = apply(started, 'error', 'provider lost connection')
+  const restored = reduceRuntimeEvent(started, event('historySnapshot', saved), clock).session
+  const exited = reduceRuntimeEvent(restored, event('processExited', null), clock).session
+  expect(exited.messages.at(-1)?.content).toBe('provider lost connection')
+})

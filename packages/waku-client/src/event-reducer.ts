@@ -42,6 +42,10 @@ export function reduceRuntimeEvent(
   clock: ReducerClock = defaultClock,
   processExitError: string | null = null,
 ): RuntimeEventResult {
+  if (wire.event.kind === 'historySnapshot') {
+    const session = clone(wire.event.payload as unknown as AgentSession)
+    return { session, permission: session.pending_permission ?? null, userInput: session.pending_user_input ?? null, settled: false, removeRuntime: false }
+  }
   const session = clone(current)
   const { kind, payload } = wire.event
   const result: RuntimeEventResult = {
@@ -271,6 +275,7 @@ export function reduceRuntimeEvent(
     case 'error': {
       if (typeof payload !== 'string') break
       result.error = payload
+      session.last_driver_error = payload
       // An optimistic pursuit turn has no submission to fail with. Unwind it
       // so the error cannot strand a spinner; if the pursuit does start
       // later, its own start report recreates the turn.
@@ -308,7 +313,7 @@ export function reduceRuntimeEvent(
       result.settled = settleTurn(
         session,
         'failed',
-        processExitError ?? 'The agent exited before responding.',
+        session.last_driver_error ?? processExitError ?? 'The agent exited before responding.',
         clock,
       )
       result.permission = null
@@ -319,6 +324,9 @@ export function reduceRuntimeEvent(
       break
   }
 
+  if (['cancelRequested', 'connected', 'turnStarted', 'turnFinished', 'processExited'].includes(kind)) {
+    delete session.last_driver_error
+  }
   if (['cancelRequested', 'turnParked', 'turnFinished', 'processExited'].includes(kind)) {
     delete session.pending_permission
     delete session.pending_user_input
@@ -662,10 +670,14 @@ function clone<T>(value: T): T {
 export function reduceRuntimeEventAfterPersistence(
   current: AgentSession,
   wire: SequencedEvent,
-  state: { pendingExit: SequencedEvent | null },
+  state: { pendingExit: SequencedEvent | null; lastDriverError?: string | null },
   clock: ReducerClock = defaultClock,
   processExitError: string | null = null,
 ): RuntimeEventResult | null {
+  if (wire.event.kind === 'historySnapshot') {
+    state.pendingExit = null
+    state.lastDriverError = (wire.event.payload as unknown as AgentSession).last_driver_error ?? null
+  }
   if (wire.event.kind === 'processExited') {
     const saved = current.history_saved_cursor
     if (!saved || saved.runtime_id !== wire.runtimeId || saved.epoch !== wire.epoch || saved.sequence < wire.sequence) {

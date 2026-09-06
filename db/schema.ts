@@ -92,11 +92,13 @@ export const sessionDetails = sqliteTable("session_details", {
   data: text("data").notNull(),
 });
 
-/** Ordered provider events committed with the readable history. No pruning yet. */
+/** Ordered events; only reliably preserved history permits event pruning. */
 export const sessionEvents = sqliteTable("session_events", {
   sessionId: text("session_id").notNull(),
   runtimeId: text("runtime_id").notNull(),
   epoch: text("epoch").notNull(),
   sequence: integer("sequence").notNull(),
   data: text("data").notNull(),
+  /** Unix seconds when history was preserved; NULL events cannot be pruned. */
+  savedAt: integer("saved_at"),
 }, (table) => [primaryKey({ columns: [table.sessionId, table.runtimeId, table.epoch, table.sequence] })]);

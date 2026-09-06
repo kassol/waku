@@ -113,6 +113,26 @@ fn creates_codex_child_in_isolated_worktree_and_restores_its_history() {
         client
             .request(child_id, runtime_id, Command::CloseSession)
             .unwrap();
+        client
+            .request(parent_id, Uuid::nil(), Command::RemoveSession)
+            .unwrap();
+        let ResponsePayload::TaskState { sessions, .. } = observer
+            .request(Uuid::nil(), Uuid::nil(), Command::LoadTaskState)
+            .unwrap()
+        else {
+            panic!("missing session list");
+        };
+        assert!(!sessions.iter().any(|session| session.id == parent_id));
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session.id == child_id
+                    && session.parent_session_id == Some(parent_id))
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("child-result.txt")).unwrap(),
+            "created in isolated worktree\n"
+        );
         let store = StateStore::daemon(root.join("app.db"));
         let mut restored = store.load().unwrap();
         let child = restored
