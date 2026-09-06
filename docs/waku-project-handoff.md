@@ -105,5 +105,5 @@ Matt 流程产生仓库产物时，遵循用户的独立提交及默认 push 约
 ## 后续输入与取消实现边界
 
 - `waku_prompt` 仅接收直属 Claude/Codex 子会话的新轮次；忙碌或等待用户时拒绝。daemon 在同一状态锁内检查并保存输入及 turn_id，随后提交 provider；断连不自动重发，调用方查询当前轮次恢复判断。provider 拒绝提交后保留已保存输入并报告 Failed。
-- `waku_cancel` 返回独立的 accepted 与 stopped。取消受理保留开放轮次；provider 中断、结束或进程退出确认后才显示 Interrupted。取消按当前轮次记录，保留历史和工作区；Codex 忽略旧轮次的迟到结束通知。
+- `waku_cancel` 返回独立的 accepted 与 stopped。取消受理保留开放轮次；provider 中断、结束或进程退出确认后才显示 Interrupted。取消按当前轮次记录，保留历史和工作区；Codex 忽略旧轮次的迟到结束通知。Claude 仍有后台任务时请求关闭原生运行时，保持开放轮次直到进程退出确认。
 - 桌面及共享 TypeScript 客户端沿用同一停止边界。原生可见状态与真实 provider 的完整验收留给 #12；本票自动回归使用临时数据库、Git 目录和可控子进程。

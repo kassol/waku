@@ -1619,12 +1619,19 @@ fn handle_message(
             // the CLI wakes the model itself once the detached work settles,
             // so the turn is parked and its wake continues it. Only a reply
             // with nothing left to wait for settles it.
-            let interrupted = state.cancellation_requested.swap(false, Ordering::AcqRel);
-            if !interrupted && !failed && !state.live_tasks.is_empty() {
+            let interrupted = state.cancellation_requested.load(Ordering::Acquire);
+            if (!failed || interrupted) && !state.live_tasks.is_empty() {
                 state.parked = true;
                 let _ = events.send(DriverEvent::TurnParked);
+                if interrupted {
+                    // A result settles only the foreground reply. Close the
+                    // resident CLI through its existing shutdown path, and
+                    // let ProcessExited confirm the remaining work stopped.
+                    let _ = commands.send(CommandMessage::Shutdown);
+                }
                 return;
             }
+            state.cancellation_requested.store(false, Ordering::Release);
             state.parked = false;
             *turn_active.lock() = false;
             let _ = events.send(if interrupted {
@@ -2617,11 +2624,10 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_result_confirms_stop_even_with_detached_work() {
-        let (events, event_rx, commands, _command_rx, turn, mut state) = harness();
+    fn cancelled_result_waits_for_shutdown_when_detached_work_remains() {
+        let (events, event_rx, commands, command_rx, turn, mut state) = harness();
         state.live_tasks.insert("detached".into());
         state.cancellation_requested.store(true, Ordering::Release);
-        assert!(event_rx.try_recv().is_err());
         handle_message(
             &json!({"type":"result","is_error":false}),
             "s",
@@ -2634,13 +2640,31 @@ mod tests {
         let seen = event_rx.try_iter().collect::<Vec<_>>();
         assert!(
             seen.iter()
-                .any(|event| matches!(event, DriverEvent::TurnInterrupted))
+                .any(|event| matches!(event, DriverEvent::TurnParked))
         );
         assert!(!seen.iter().any(|event| matches!(
             event,
-            DriverEvent::TurnFinished { .. } | DriverEvent::TurnParked
+            DriverEvent::TurnInterrupted | DriverEvent::TurnFinished { .. }
         )));
-        assert!(!*turn.lock());
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(CommandMessage::Shutdown)
+        ));
+        assert!(*turn.lock());
+        let mut session =
+            crate::model::AgentSession::new(Uuid::new_v4(), crate::model::ProviderKind::Claude);
+        session.begin_turn("task");
+        let mut history = waku_protocol::history::HistoryReducer::default();
+        history.apply(&mut session, DriverEvent::CancelRequested);
+        for event in seen {
+            history.apply(&mut session, event);
+        }
+        assert!(session.active_turn_id().is_some());
+        history.apply(&mut session, DriverEvent::ProcessExited);
+        assert_eq!(
+            session.turns.last().unwrap().status,
+            crate::model::TurnStatus::Interrupted
+        );
     }
 
     #[test]

@@ -1442,3 +1442,67 @@ fn mcp_prompt_and_cancel_preserve_durable_turn_boundaries() {
         },
     );
 }
+
+#[test]
+fn mcp_prompt_save_failure_stops_new_work_before_provider_submission() {
+    with_creation_daemon_seed(
+        seed_query_sessions,
+        |client, _, root, path, address, (project, parent, children)| {
+            let (parent, _, config, runtime) =
+                start_steward_saved(&client, root, path, parent, project);
+            let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+                .as_str()
+                .unwrap();
+            let connection = rusqlite::Connection::open(root.join("app.db")).unwrap();
+            connection.execute_batch(&format!(
+                "CREATE TRIGGER reject_prompt_save BEFORE UPDATE ON sessions WHEN NEW.id = '{}' BEGIN SELECT RAISE(FAIL, 'fixture prompt save failure'); END;",
+                children[0].id
+            )).unwrap();
+            let failure = mcp_response(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_prompt",
+                json!({"session_id":children[0].id,"prompt":"write fixture result"}),
+            );
+            assert_eq!(failure["result"]["isError"], true, "{failure}");
+            assert!(failure.to_string().contains("fixture prompt save failure"));
+            let again = mcp_response(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_prompt",
+                json!({"session_id":children[1].id,"prompt":"also must not execute"}),
+            );
+            assert_eq!(again["result"]["isError"], true, "{again}");
+            assert!(again.to_string().contains("new work is disabled"));
+            let ResponsePayload::SessionRuntime { runtime_id, .. } = client
+                .request(children[0].id, Uuid::nil(), Command::AttachSession)
+                .unwrap()
+            else {
+                panic!("unexpected attachment");
+            };
+            assert!(runtime_id.is_none());
+            let saved = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_result",
+                json!({"session_id":children[0].id}),
+            );
+            assert!(
+                saved["session"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("fixture prompt save failure")
+            );
+            assert!(!path.join("child-calls.jsonl").exists());
+            connection
+                .execute_batch("DROP TRIGGER reject_prompt_save")
+                .unwrap();
+        },
+    );
+}
