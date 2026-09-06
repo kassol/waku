@@ -2180,3 +2180,21 @@ session.waiting_for_children:
   en: Waiting for child sessions
 session.cancel_wait:
   en: Cancel wait
+
+session.input_accepted:
+  en: Input accepted
+
+session.input_received_transport:
+  en: Input received by transport
+
+session.input_received_provider:
+  en: Input received by provider
+
+session.input_failed:
+  en: Input failed
+
+session.input_uncertain:
+  en: Input awaiting confirmation — do not resend
+
+session.input_unsupported:
+  en: Input steering unsupported

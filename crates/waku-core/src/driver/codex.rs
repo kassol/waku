@@ -41,6 +41,7 @@ const DISABLE_EXTERNAL_COMPUTER_USE_SKILL: &str =
 const DISABLE_CODEX_NODE_REPL: &str = "mcp_servers.node_repl.enabled=false";
 
 enum CommandMessage {
+    Deliver { prompt: String, id: uuid::Uuid, steer: bool, expected_turn: Option<String> },
     Prompt(String),
     Steer(String),
     Cancel,
@@ -129,6 +130,7 @@ impl BackgroundRpcState {
 }
 
 pub struct CodexDriver {
+    active_turn: Arc<Mutex<Option<String>>>,
     shutdown_requested: Arc<AtomicBool>,
     commands: Sender<CommandMessage>,
     mode: RuntimeMode,
@@ -310,6 +312,8 @@ impl CodexDriver {
             pending: None,
         }));
 
+        let pending_deliveries = Arc::new(Mutex::new(HashMap::new()));
+        let writer_pending_deliveries = pending_deliveries.clone();
         let pending_prompts = Arc::new(Mutex::new(HashSet::new()));
         let writer_pending_prompts = pending_prompts.clone();
         let writer_thread_id = thread_id.clone();
@@ -431,9 +435,15 @@ impl CodexDriver {
 
                 let mut next_request_id = 10_u64;
                 while let Ok(command) = command_rx.recv() {
+                    let (command, delivery_id, delivery_turn) = match command {
+                        CommandMessage::Deliver { prompt, id, steer, expected_turn } => (if steer { CommandMessage::Steer(prompt) } else { CommandMessage::Prompt(prompt) }, Some(id), expected_turn),
+                        command => (command, None, None),
+                    };
+
                     let message = match command {
                         CommandMessage::Prompt(text) => {
                             let Some(thread_id) = wait_for_thread_id(&writer_thread_id) else {
+                                super::input_outcome(&writer_events, delivery_id, crate::model::InputDeliveryState::Failed, None, Some("Codex thread did not open; input was not sent".into()));
                                 let _ = writer_events.send(DriverEvent::Error(tr!(
                                     "errors.codex_thread_open_incomplete"
                                 )));
@@ -453,6 +463,7 @@ impl CodexDriver {
                             }
                             next_request_id += 1;
                             writer_pending_prompts.lock().insert(next_request_id);
+                            if let Some(id) = delivery_id { writer_pending_deliveries.lock().insert(next_request_id, (id, false)); }
                             let mut params = turn_start_params(
                                 &thread_id,
                                 text,
@@ -476,13 +487,22 @@ impl CodexDriver {
                             })
                         }
                         CommandMessage::Steer(text) => {
+                            if delivery_id.is_some() && (delivery_turn.is_none() || *writer_turn_id.lock() != delivery_turn) {
+                                super::input_outcome(&writer_events, delivery_id, crate::model::InputDeliveryState::Failed, None, Some("Codex active turn changed before input delivery".into()));
+                                continue;
+                            }
                             let (thread_id, active_turn_id) = (
                                 writer_thread_id.lock().clone(),
-                                writer_turn_id.lock().clone(),
+                                if delivery_id.is_some() { delivery_turn.clone() } else { writer_turn_id.lock().clone() },
                             );
                             let (Some(thread_id), Some(expected_turn_id)) =
                                 (thread_id, active_turn_id)
                             else {
+                                if delivery_id.is_some() {
+                                    super::input_outcome(&writer_events, delivery_id, crate::model::InputDeliveryState::Failed, None, Some("Codex no longer has an active turn".into()));
+                                    continue;
+                                }
+
                                 let _ = writer_events.send(DriverEvent::SteerRejected {
                                     message: text,
                                     reason: tr!(
@@ -494,9 +514,11 @@ impl CodexDriver {
                             };
                             next_request_id += 1;
                             let request_id = next_request_id;
-                            writer_pending_steers
-                                .lock()
-                                .insert(request_id, text.clone());
+                            if let Some(id) = delivery_id {
+                                writer_pending_deliveries.lock().insert(request_id, (id, true));
+                            } else {
+                                writer_pending_steers.lock().insert(request_id, text.clone());
+                            }
                             let message = json!({
                                 "method": "turn/steer",
                                 "id": request_id,
@@ -506,6 +528,12 @@ impl CodexDriver {
                                     "input": [{"type": "text", "text": text}]
                                 }
                             });
+                            if delivery_id.is_some() {
+                                if let Err(error) = write_json_line(&mut stdin, &message) {
+                                    super::input_outcome(&writer_events, delivery_id, crate::model::InputDeliveryState::Uncertain, None, Some(error.to_string()));
+                                }
+                                continue;
+                            }
                             if let Err(error) = write_json_line(&mut stdin, &message)
                                 && let Some(text) = writer_pending_steers.lock().remove(&request_id)
                             {
@@ -757,6 +785,7 @@ impl CodexDriver {
                                 "params": {"threadId": thread_id, "name": title}
                             })
                         }
+                        CommandMessage::Deliver { .. } => unreachable!(),
                         CommandMessage::Shutdown => break,
                     };
                     if let Err(error) = write_json_line(&mut stdin, &message) {
@@ -786,6 +815,7 @@ impl CodexDriver {
             .spawn(move || {
                 let mut stream_state = CodexStreamState {
                     pending_prompts,
+                    pending_deliveries,
                     ..CodexStreamState::default()
                 };
                 for line in BufReader::new(stdout).lines() {
@@ -936,6 +966,7 @@ impl CodexDriver {
             })?;
 
         Ok(Self {
+            active_turn: turn_id,
             shutdown_requested,
             commands,
             mode,
@@ -1090,6 +1121,11 @@ fn handle_goal_response(
 impl DriverControl for CodexDriver {
     fn prompt(&self, prompt: String) {
         let _ = self.commands.send(CommandMessage::Prompt(prompt));
+    }
+
+    fn deliver_input(&self, prompt: String, id: uuid::Uuid, steer: bool) -> anyhow::Result<()> {
+        self.commands.send(CommandMessage::Deliver { prompt, id, steer, expected_turn: self.active_turn.lock().clone() })
+            .map_err(|_| anyhow::anyhow!("provider input channel is closed"))
     }
 
     fn supports_steer(&self) -> bool {
@@ -1445,6 +1481,7 @@ const CODEX_CITATION_SEPARATOR: char = '\u{e202}';
 #[derive(Default)]
 struct CodexStreamState {
     pending_prompts: Arc<Mutex<HashSet<u64>>>,
+    pending_deliveries: Arc<Mutex<HashMap<u64, (uuid::Uuid, bool)>>>,
     citations: HashMap<String, String>,
     citation_numbers: HashMap<String, usize>,
     citation_buffer: String,
@@ -1734,6 +1771,18 @@ fn handle_codex_message(
     // the same numeric ID as one of Waku's earlier requests. Only messages
     // without a method are responses to Waku-originated requests.
     let is_response = value.get("method").is_none();
+    let tracked = if is_response {
+        value.get("id").and_then(Value::as_u64)
+            .and_then(|id| stream_state.pending_deliveries.lock().remove(&id))
+    } else { None };
+    if let Some((id, steer)) = tracked {
+        let error = value.get("error").map(|error| error.get("message").and_then(Value::as_str).unwrap_or("Codex rejected input").to_owned());
+        super::input_outcome(events, Some(id),
+            if error.is_some() { crate::model::InputDeliveryState::Failed } else { crate::model::InputDeliveryState::Received },
+            error.is_none().then_some(crate::model::InputConfirmation::Provider), error);
+        if steer { return; }
+    }
+
     if is_response
         && value
             .get("id")
@@ -3027,6 +3076,7 @@ mod tests {
     fn model_changes_reach_the_running_thread_but_mode_changes_ask_for_a_restart() {
         let (commands, command_rx) = unbounded();
         let driver = CodexDriver {
+            active_turn: Arc::new(Mutex::new(None)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             commands,
             mode: RuntimeMode::FullAccess,

@@ -351,6 +351,7 @@ fn steward_wait_saved_callback_is_failed_when_shutdown_starts_before_submission(
             prompt,
             turn_id,
             message_id,
+            None,
             &fixture.sink,
         )
         .unwrap();

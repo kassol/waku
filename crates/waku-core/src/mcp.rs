@@ -28,6 +28,8 @@ struct SpawnArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PromptArguments {
+    #[serde(default)]
+    delivery_id: Option<Uuid>,
     session_id: Uuid,
     prompt: String,
 }
@@ -158,8 +160,13 @@ pub fn run_stdio(
                     },
                     {
                         "name": "waku_prompt",
-                        "description": "Submit a new turn to an idle direct child. Returns turn_id after durable saving. Busy or waiting children reject input. Never automatically retry after a lost response; query waku_status first.",
-                        "inputSchema": {"type":"object", "properties":{"session_id":{"type":"string","format":"uuid"},"prompt":{"type":"string","minLength":1}}, "required":["session_id","prompt"],"additionalProperties":false}
+                        "description": "Deliver input to a direct child: new turn when idle, native steer when working. Provide a stable delivery_id to recover the same input after disconnect. Same id with different text is rejected. Query waku_prompt_status for confirmation; uncertain input must never be resent with a new id. Approvals and questions remain for the user.",
+                        "inputSchema": {"type":"object", "properties":{"session_id":{"type":"string","format":"uuid"},"prompt":{"type":"string","minLength":1},"delivery_id":{"type":"string","format":"uuid"}}, "required":["session_id","prompt"],"additionalProperties":false}
+                    },
+                    {
+                        "name": "waku_prompt_status",
+                        "description": "Read one durable input delivery for a direct child. Received means provider or transport acknowledgment, never model adoption. Do not resend uncertain input.",
+                        "inputSchema": {"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"delivery_id":{"type":"string","format":"uuid"}},"required":["session_id","delivery_id"],"additionalProperties":false}
                     },
                     {
                         "name": "waku_cancel",
@@ -268,7 +275,8 @@ pub fn run_stdio(
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildSessions {sessions} } => (json!({"sessions":sessions}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildStatus {sessions,timed_out} } => (json!({"sessions":sessions,"timed_out":timed_out}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildResult {session,reply,reply_truncated,transcript,transcript_truncated} } => (json!({"session":session,"reply":reply,"reply_truncated":reply_truncated,"transcript":transcript,"transcript_truncated":transcript_truncated}).to_string(),false),
-                                ResponseOutcome::Ok { payload:ResponsePayload::ChildPromptAccepted {turn_id} } => (json!({"turn_id":turn_id}).to_string(),false),
+                                ResponseOutcome::Ok { payload:ResponsePayload::ChildPromptAccepted {turn_id,delivery} } => (json!({"turn_id":turn_id,"delivery":delivery}).to_string(),false),
+                                ResponseOutcome::Ok { payload:ResponsePayload::ChildInputStatus {delivery} } => (json!({"delivery":delivery}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildCancel {session,accepted,stopped} } => (json!({"session":session,"accepted":accepted,"stopped":stopped}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::StewardWait {wait,sessions} } => (json!({"waiting":wait.is_some(),"wait":wait,"sessions":sessions,"next_action":"If waiting=true, end this turn now. A child event will automatically resume you; do not poll. If waiting=false, handle the actionable child states now."}).to_string(),false),
                                 ResponseOutcome::Error {error} => (error.message,true),
@@ -324,7 +332,14 @@ fn tool_command(name: &str, arguments: Value) -> Result<Command, String> {
         Ok(Command::StewardPrompt {
             child_session_id: args.session_id,
             prompt: args.prompt,
+            delivery_id: args.delivery_id,
         })
+    } else if name == "waku_prompt_status" {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Arguments { session_id: Uuid, delivery_id: Uuid }
+        let args: Arguments = serde_json::from_value(arguments).map_err(|e| format!("Invalid tool arguments: {e}"))?;
+        Ok(Command::StewardInputStatus { child_session_id: args.session_id, delivery_id: args.delivery_id })
     } else if name == "waku_wait" {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]

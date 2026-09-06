@@ -44,6 +44,7 @@ use crate::model::{
 };
 
 enum CommandMessage {
+    Deliver { prompt: String, id: uuid::Uuid, steer: bool, expected_epoch: u64 },
     Prompt(String),
     Steer(String),
     Cancel,
@@ -85,6 +86,8 @@ fn stop_task_request(request_id: u64, task_id: &str) -> Value {
 }
 
 pub struct ClaudeDriver {
+    turn_epoch: Arc<std::sync::atomic::AtomicU64>,
+    turn_active: Arc<Mutex<bool>>,
     commands: Sender<CommandMessage>,
     pending_user_inputs: Arc<Mutex<HashMap<String, Value>>>,
     mode: RuntimeMode,
@@ -253,6 +256,9 @@ impl ClaudeDriver {
         let (commands, command_rx) = unbounded();
         let auto_approve = mode != RuntimeMode::Ask;
         let turn_active = Arc::new(Mutex::new(false));
+        let turn_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reader_epoch = turn_epoch.clone();
+        let writer_epoch = turn_epoch.clone();
         let cancellation_requested = Arc::new(AtomicBool::new(false));
         let reader_cancellation_requested = cancellation_requested.clone();
         let pending_task_stops = Arc::new(Mutex::new(HashMap::<String, BackgroundWorkKey>::new()));
@@ -280,6 +286,9 @@ impl ClaudeDriver {
                     let Ok(value) = serde_json::from_str::<Value>(&line) else {
                         continue;
                     };
+                    if value.get("type").and_then(Value::as_str) == Some("result") {
+                        reader_epoch.fetch_add(1, Ordering::AcqRel);
+                    }
                     handle_message(
                         &value,
                         &reader_session,
@@ -293,7 +302,7 @@ impl ClaudeDriver {
             })?;
 
         let writer_events = events.clone();
-        let writer_turn = turn_active;
+        let writer_turn = turn_active.clone();
         let writer_pending_task_stops = pending_task_stops;
         let writer_title_refresh = super::title_refresh::NativeTitleRefresh::default();
         let title_session_id = session_id;
@@ -304,9 +313,15 @@ impl ClaudeDriver {
                 let mut next_request_id = 0_u64;
                 let mut current_model = launch_model;
                 while let Ok(message) = command_rx.recv() {
+                    let (message, delivery_id, delivery_epoch) = match message {
+                        CommandMessage::Deliver { prompt, id, steer, expected_epoch } => (if steer { CommandMessage::Steer(prompt) } else { CommandMessage::Prompt(prompt) }, Some(id), expected_epoch),
+                        message => (message, None, 0),
+                    };
+
                     let written = match message {
                         CommandMessage::Prompt(text) => {
                             cancellation_requested.store(false, Ordering::Release);
+                            writer_epoch.fetch_add(1, Ordering::AcqRel);
                             *writer_turn.lock() = true;
                             start_claude_title_refresh(
                                 &writer_title_refresh,
@@ -314,7 +329,12 @@ impl ClaudeDriver {
                                 &writer_events,
                             );
                             let _ = writer_events.send(DriverEvent::TurnStarted);
-                            write_line(&mut stdin, &user_message_payload(&text))
+                            let written = write_line(&mut stdin, &user_message_payload(&text));
+                            super::input_outcome(&writer_events, delivery_id,
+                                if written.is_ok() { crate::model::InputDeliveryState::Received } else { crate::model::InputDeliveryState::Uncertain },
+                                written.as_ref().ok().map(|_| crate::model::InputConfirmation::Transport),
+                                written.as_ref().err().map(ToString::to_string));
+                            written
                         }
                         CommandMessage::Steer(text) => {
                             // A mid-turn user message is held by the CLI and
@@ -323,7 +343,12 @@ impl ClaudeDriver {
                             // isReplay echo marks the moment it is absorbed.
                             // Verified against the real CLI (2.1.223). Unlike
                             // Amp, no marker is needed: folding is the default.
-                            if !*writer_turn.lock() {
+                            if !*writer_turn.lock() || (delivery_id.is_some() && writer_epoch.load(Ordering::Acquire) != delivery_epoch) {
+                                if delivery_id.is_some() {
+                                    super::input_outcome(&writer_events, delivery_id, crate::model::InputDeliveryState::Failed, None, Some("Claude no longer has the expected active turn".into()));
+                                    continue;
+                                }
+
                                 let _ = writer_events.send(DriverEvent::SteerRejected {
                                     message: text,
                                     reason: tr!(
@@ -336,6 +361,14 @@ impl ClaudeDriver {
                             // No TurnStarted and no turn re-arm: the turn the
                             // message joins is already running.
                             let written = write_line(&mut stdin, &user_message_payload(&text));
+                            if delivery_id.is_some() {
+                                super::input_outcome(&writer_events, delivery_id,
+                                    if written.is_ok() { crate::model::InputDeliveryState::Received } else { crate::model::InputDeliveryState::Uncertain },
+                                    written.as_ref().ok().map(|_| crate::model::InputConfirmation::Transport),
+                                    written.as_ref().err().map(ToString::to_string));
+                                if written.is_err() { break; }
+                                continue;
+                            }
                             match &written {
                                 Ok(()) => {
                                     let _ = writer_events
@@ -472,6 +505,7 @@ impl ClaudeDriver {
                                 .insert(request_id, key.clone());
                             write_line(&mut stdin, &stop_task_request(next_request_id, &control_id))
                         }
+                        CommandMessage::Deliver { .. } => unreachable!(),
                         CommandMessage::Shutdown => break,
                     };
                     if let Err(error) = written {
@@ -540,6 +574,8 @@ impl ClaudeDriver {
             })?;
 
         Ok(Self {
+            turn_epoch,
+            turn_active,
             commands,
             pending_user_inputs,
             mode,
@@ -550,6 +586,12 @@ impl ClaudeDriver {
 impl DriverControl for ClaudeDriver {
     fn prompt(&self, prompt: String) {
         let _ = self.commands.send(CommandMessage::Prompt(prompt));
+    }
+
+    fn deliver_input(&self, prompt: String, id: uuid::Uuid, steer: bool) -> anyhow::Result<()> {
+        if steer && !*self.turn_active.lock() { anyhow::bail!("Claude has no active turn"); }
+        self.commands.send(CommandMessage::Deliver { prompt, id, steer, expected_epoch: self.turn_epoch.load(Ordering::Acquire) })
+            .map_err(|_| anyhow::anyhow!("provider input channel is closed"))
     }
 
     fn supports_steer(&self) -> bool {
@@ -2060,6 +2102,8 @@ mod tests {
     fn steering_is_advertised_and_rides_the_command_channel() {
         let (commands, command_rx) = unbounded();
         let driver = ClaudeDriver {
+            turn_active: Arc::new(Mutex::new(false)),
+            turn_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             commands,
             pending_user_inputs: Arc::new(Mutex::new(HashMap::new())),
             mode: RuntimeMode::FullAccess,

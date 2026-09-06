@@ -39,6 +39,7 @@ pub fn apply_rewound_history(current: &mut AgentSession, rewound: AgentSession) 
     current.pending_user_input = rewound.pending_user_input;
     current.status = rewound.status;
     current.steward_wait = rewound.steward_wait;
+    // Delivery acknowledgments cannot be rewound or re-sent with conversation history.
     current.updated_at = current.updated_at.max(rewound.updated_at);
 }
 
@@ -52,6 +53,32 @@ impl HistoryReducer {
     pub fn apply(&mut self, session: &mut AgentSession, event: DriverEvent) -> HistoryEffects {
         let mut effects = HistoryEffects::default();
         match event {
+            DriverEvent::InputDeliveryChanged(delivery) => {
+                if !session.input_deliveries.iter().any(|entry| entry.id == delivery.id) {
+                    session.input_deliveries.push(delivery.clone());
+                }
+                effects.invalidated_activity_diff = self.update_activity(session, input_delivery_activity(&delivery));
+            }
+            DriverEvent::InputDeliveryOutcome(outcome) => {
+                let mut changed = None;
+                if let Some(delivery) = session.input_deliveries.iter_mut().find(|d| d.id == outcome.id) {
+                    if matches!(delivery.state, InputDeliveryState::Accepted | InputDeliveryState::Uncertain) {
+                        delivery.state = outcome.state;
+                        delivery.confirmation = outcome.confirmation;
+                        delivery.reason = outcome.reason;
+                        changed = Some(delivery.clone());
+                        if delivery.state == InputDeliveryState::Received && delivery.mode == InputDeliveryMode::Steer {
+                            let turn_id = delivery.turn_id;
+                            let prompt = delivery.prompt.clone();
+                            session.steward_wait = None;
+                            session.messages.push(Message::new_for_turn(MessageRole::User, prompt, turn_id));
+                        }
+                    }
+                }
+                if let Some(delivery) = changed {
+                    effects.invalidated_activity_diff = self.update_activity(session, input_delivery_activity(&delivery));
+                }
+            }
             DriverEvent::StewardWaitChanged(wait) => {
                 if wait.as_ref().is_none_or(|wait| {
                     session
@@ -108,6 +135,7 @@ impl HistoryReducer {
                 session.context_usage = snapshot.context_usage;
                 session.last_reply_at = session.last_reply_at.max(snapshot.last_reply_at);
                 session.detail_loaded = true;
+                session.input_deliveries = snapshot.input_deliveries.clone();
                 apply_rewound_history(session, *snapshot);
                 self.last_driver_error = session.last_driver_error.clone();
                 self.stream_phase = if session
@@ -319,6 +347,13 @@ impl HistoryReducer {
                 }
             }
             DriverEvent::ProcessExited => {
+                for delivery in &mut session.input_deliveries {
+                    if delivery.state == InputDeliveryState::Accepted {
+                        delivery.state = InputDeliveryState::Uncertain;
+                        delivery.reason = Some("Provider exited before acknowledging input; do not resend automatically".into());
+                    }
+                }
+
                 if session.cancellation_requested_turn_id.is_some()
                     && session.cancellation_requested_turn_id == session.active_turn_id()
                 {
@@ -575,6 +610,24 @@ impl HistoryReducer {
         self.stream_phase = Some(StreamPhase::Activity);
         None
     }
+}
+
+fn input_delivery_activity(delivery: &InputDelivery) -> ActivityItem {
+    let state = match delivery.state {
+        InputDeliveryState::Accepted => tr!("session.input_accepted"),
+        InputDeliveryState::Received => match delivery.confirmation {
+            Some(InputConfirmation::Transport) => tr!("session.input_received_transport"),
+            _ => tr!("session.input_received_provider"),
+        },
+        InputDeliveryState::Failed => tr!("session.input_failed"),
+        InputDeliveryState::Uncertain => tr!("session.input_uncertain"),
+        InputDeliveryState::Unsupported => tr!("session.input_unsupported"),
+    };
+    ActivityItem::new(Some(format!("input-{}", delivery.id)), ActivityKind::Tool, state,
+        Some(delivery.prompt.clone()), true)
+        .with_output(Some(format!("{}\n\nDelivery: {}\nTurn: {}\n{}", delivery.prompt, delivery.id, delivery.turn_id,
+            delivery.reason.as_deref().unwrap_or(""))))
+        .with_failed(delivery.state == InputDeliveryState::Failed)
 }
 
 pub fn finish_streaming_assistant(session: &mut AgentSession) {

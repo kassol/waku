@@ -909,6 +909,40 @@ pub struct RuntimeEventCursor {
     pub sequence: u64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum InputDeliveryState { Accepted, Received, Failed, Uncertain, Unsupported }
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum InputDeliveryMode { Prompt, Steer }
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum InputConfirmation { Provider, Transport }
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct InputDelivery {
+    pub id: Uuid,
+    pub caller_session_id: Uuid,
+    pub target_session_id: Uuid,
+    pub prompt: String,
+    pub turn_id: Uuid,
+    pub mode: InputDeliveryMode,
+    pub state: InputDeliveryState,
+    pub confirmation: Option<InputConfirmation>,
+    pub reason: Option<String>,
+    pub created_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct InputDeliveryOutcome {
+    pub id: Uuid,
+    pub state: InputDeliveryState,
+    pub confirmation: Option<InputConfirmation>,
+    pub reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct StewardWaitTarget {
     pub session_id: Uuid,
@@ -930,6 +964,8 @@ pub struct AgentSession {
     pub parent_session_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steward_wait: Option<StewardWait>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_deliveries: Vec<InputDelivery>,
     /// A title explicitly chosen by the user. [`Self::DEFAULT_TITLE`] means
     /// no explicit title has been set, so [`Self::auto_title`] may be shown.
     pub title: String,
@@ -1035,6 +1071,7 @@ impl AgentSession {
             id: Uuid::new_v4(),
             parent_session_id: None,
             steward_wait: None,
+            input_deliveries: Vec::new(),
             title: Self::DEFAULT_TITLE.to_owned(),
             auto_title: None,
             project_id,
@@ -1080,6 +1117,7 @@ impl AgentSession {
             id: self.id,
             parent_session_id: self.parent_session_id,
             steward_wait: self.steward_wait.clone(),
+            input_deliveries: self.input_deliveries.clone(),
             title: self.title.clone(),
             auto_title: self.auto_title.clone(),
             project_id: self.project_id,
@@ -1620,6 +1658,7 @@ impl AgentSession {
         fork.id = fork_id;
         fork.parent_session_id = None;
         fork.steward_wait = None;
+        fork.input_deliveries.clear();
         fork.title = Self::DEFAULT_TITLE.to_owned();
         fork.auto_title = Some(fork_title.to_owned());
         fork.status = SessionStatus::Idle;
@@ -1856,6 +1895,8 @@ impl ActivityKind {
 
 #[derive(Clone, Debug)]
 pub enum DriverEvent {
+    InputDeliveryChanged(InputDelivery),
+    InputDeliveryOutcome(InputDeliveryOutcome),
     StewardWaitChanged(Option<StewardWait>),
     /// Client-only acknowledgement that every daemon event through this
     /// sequence has been incorporated into the local session projection.

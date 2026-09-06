@@ -27,6 +27,8 @@ use crate::persistence::{ComposerDraftStore, PersistedState, StateStore};
 use crate::settings::DaemonSettingsStore;
 use waku_protocol::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
 
+#[path = "steward_input.rs"]
+mod steward_input;
 #[path = "steward.rs"]
 mod steward;
 #[path = "steward_wait.rs"]
@@ -76,11 +78,21 @@ impl WakuBackend {
             // transcript lazy; a failed startup can still have an open turn.
             if task_state.sessions[index].status == SessionStatus::Idle
                 && task_state.sessions[index].steward_wait.is_none()
+                && task_state.sessions[index].input_deliveries.is_empty()
             {
                 continue;
             }
             task_store.hydrate(&mut task_state.sessions[index])?;
             let session = &mut task_state.sessions[index];
+            for delivery in &mut session.input_deliveries {
+                if delivery.state == crate::model::InputDeliveryState::Accepted {
+                    delivery.state = crate::model::InputDeliveryState::Uncertain;
+                    delivery.reason = Some("Daemon restarted before input confirmation; do not resend automatically".into());
+                    cleared_waits.push(session.id);
+                    recovered = true;
+                }
+            }
+
             if session.steward_wait.as_ref().is_some_and(|wait| {
                 session.turns.last().is_none_or(|turn| {
                     turn.id != wait.parent_turn_id
@@ -403,6 +415,9 @@ impl Backend for WakuBackend {
     }
 
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
+        if let Command::StewardInputStatus { child_session_id, delivery_id } = &request.command {
+            return self.steward_input_status(request.session_id, *child_session_id, *delivery_id, &events);
+        }
         if let Command::StewardQuery { query } = &request.command {
             return self.steward_query(request.session_id, query, &events);
         }
@@ -616,7 +631,8 @@ impl WakuBackend {
             Command::StewardPrompt {
                 child_session_id,
                 prompt,
-            } => self.steward_prompt(session_id, child_session_id, prompt, &events),
+                delivery_id,
+            } => self.steward_prompt(session_id, child_session_id, prompt, delivery_id, &events),
             Command::StewardCancel { child_session_id } => {
                 self.steward_cancel(session_id, child_session_id, &events)
             }
@@ -821,6 +837,7 @@ impl WakuBackend {
                     .collect::<Vec<_>>();
                 for mut session in sessions {
                     session.steward_wait = None;
+                    session.input_deliveries.clear();
                     if let Some(existing) = state
                         .sessions
                         .iter_mut()
@@ -831,6 +848,7 @@ impl WakuBackend {
                         self.task_store.hydrate(existing)?;
                         session.parent_session_id = existing.parent_session_id;
                         session.steward_wait = existing.steward_wait.clone();
+                        session.input_deliveries = existing.input_deliveries.clone();
                         if existing.runtime_event_cursor.is_some()
                             || session_projection_precedes(
                                 existing,
@@ -2391,7 +2409,8 @@ fn handle_driver_command(
             let cursor = Some(serde_json::to_value(driver.fork(turns_to_remove)?)?);
             return Ok(ResponsePayload::Cursor { cursor });
         }
-        Command::StewardQuery { .. }
+        Command::StewardInputStatus { .. }
+        | Command::StewardQuery { .. }
         | Command::StewardWait { .. }
         | Command::StewardPrompt { .. }
         | Command::StewardCancel { .. }
@@ -2480,6 +2499,8 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
         }
         DriverEvent::TurnStarted => ("turnStarted", Value::Null),
         DriverEvent::TurnParked => ("turnParked", Value::Null),
+        DriverEvent::InputDeliveryChanged(delivery) => ("inputDeliveryChanged", serde_json::to_value(delivery)?),
+        DriverEvent::InputDeliveryOutcome(outcome) => ("inputDeliveryOutcome", serde_json::to_value(outcome)?),
         DriverEvent::StewardWaitChanged(wait) => ("stewardWaitChanged", serde_json::to_value(wait)?),
         DriverEvent::TextDelta(text) => ("textDelta", Value::String(text)),
         DriverEvent::ReasoningDelta(text) => ("reasoningDelta", Value::String(text)),
@@ -2585,6 +2606,8 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         "availableCommands" => DriverEvent::AvailableCommands(serde_json::from_value(payload)?),
         "turnStarted" => DriverEvent::TurnStarted,
         "turnParked" => DriverEvent::TurnParked,
+        "inputDeliveryChanged" => DriverEvent::InputDeliveryChanged(serde_json::from_value(payload)?),
+        "inputDeliveryOutcome" => DriverEvent::InputDeliveryOutcome(serde_json::from_value(payload)?),
         "stewardWaitChanged" => DriverEvent::StewardWaitChanged(serde_json::from_value(payload)?),
         "textDelta" => DriverEvent::TextDelta(serde_json::from_value(payload)?),
         "reasoningDelta" => DriverEvent::ReasoningDelta(serde_json::from_value(payload)?),

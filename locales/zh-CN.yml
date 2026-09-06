@@ -1059,3 +1059,10 @@ sidebar.original_parent: "原父会话：%{id}"
 
 session.waiting_for_children: 正在等待子会话
 session.cancel_wait: 取消等待
+
+session.input_accepted: 输入已受理
+session.input_received_transport: 输入已写入提供方通道
+session.input_received_provider: 提供方已确认接收输入
+session.input_failed: 输入投递失败
+session.input_uncertain: 输入等待确认，请勿重发
+session.input_unsupported: 提供方不支持运行中输入

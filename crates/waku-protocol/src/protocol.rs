@@ -10,7 +10,7 @@ use crate::computer_use::ComputerPermissions;
 use crate::model::{
     AgentSession, GoalOperation, Project, ProviderKind, ProviderProbe, ProviderResumeCursor,
     ProviderSessionHistory, ProviderSessionSummary, RuntimeEventCursor, RuntimeMode, SessionStatus,
-    StewardWait, TurnStatus, UserInputAnswer,
+    StewardWait, InputDelivery, TurnStatus, UserInputAnswer,
 };
 use crate::persistence::{ComposerDraftChange, ComposerDrafts, SessionMessageMatch};
 use crate::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
@@ -149,7 +149,10 @@ pub enum Command {
     StewardPrompt {
         child_session_id: Uuid,
         prompt: String,
+        #[serde(default)]
+        delivery_id: Option<Uuid>,
     },
+    StewardInputStatus { child_session_id: Uuid, delivery_id: Uuid },
     StewardCancel {
         child_session_id: Uuid,
     },
@@ -498,8 +501,11 @@ pub enum ResponsePayload {
         wait: Option<StewardWait>,
         sessions: Vec<ChildSessionSummary>,
     },
+    ChildInputStatus { delivery: InputDelivery },
     ChildPromptAccepted {
         turn_id: Uuid,
+        #[serde(default)]
+        delivery: Option<InputDelivery>,
     },
     ChildCancel {
         session: ChildSessionSummary,

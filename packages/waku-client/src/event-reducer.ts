@@ -1,5 +1,6 @@
 import type {
   ActivityItem,
+  InputDelivery,
   ActivityKind,
   AgentSession,
   ProviderResumeCursor,
@@ -111,6 +112,27 @@ export function reduceRuntimeEvent(
   }
 
   switch (kind) {
+    case 'inputDeliveryChanged': {
+      const delivery = clone(payload as unknown as InputDelivery)
+      session.input_deliveries ??= []
+      if (!session.input_deliveries.some((entry) => entry.id === delivery.id)) session.input_deliveries.push(delivery)
+      break
+    }
+    case 'inputDeliveryOutcome': {
+      const outcome = payload as unknown as Pick<InputDelivery, 'id' | 'state' | 'confirmation' | 'reason'>
+      const delivery = session.input_deliveries?.find((entry) => entry.id === outcome.id)
+      if (delivery && (delivery.state === 'accepted' || delivery.state === 'uncertain')) {
+        delivery.state = outcome.state
+        delivery.confirmation = outcome.confirmation
+        delivery.reason = outcome.reason
+        if (delivery.state === 'received' && delivery.mode === 'steer') {
+          delete session.steward_wait
+          session.messages.push({ id: clock.randomUUID(), role: 'user', content: delivery.prompt,
+            turn_id: delivery.turn_id, created_at: clock.nowSeconds(), streaming: false })
+        }
+      }
+      break
+    }
     case 'stewardWaitChanged': {
       const wait = asRecord(payload)
       if (payload === null) delete session.steward_wait
@@ -380,6 +402,12 @@ export function reduceRuntimeEvent(
       break
     }
     case 'processExited':
+      for (const delivery of session.input_deliveries ?? []) {
+        if (delivery.state === 'accepted') {
+          delivery.state = 'uncertain'
+          delivery.reason = 'Provider exited before acknowledging input; do not resend automatically'
+        }
+      }
       if (activeTurn(session) || ['connecting', 'working', 'waiting', 'background'].includes(session.status)) {
         delete session.steward_wait
       }

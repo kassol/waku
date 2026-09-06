@@ -156,6 +156,8 @@ impl Waku {
             }
             event @ (DriverEvent::RuntimeEventCursorAdvanced(_)
             | DriverEvent::HistoryPersistence { .. }
+            | DriverEvent::InputDeliveryChanged(_)
+            | DriverEvent::InputDeliveryOutcome(_)
             | DriverEvent::StewardWaitChanged(_)
             | DriverEvent::AgentPresetSelected(_)
             | DriverEvent::AutoTitleUpdated(_)

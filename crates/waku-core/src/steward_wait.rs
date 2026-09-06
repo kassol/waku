@@ -217,7 +217,7 @@ impl WakuBackend {
             (parent, project_path, prompt, turn_id, message_id)
         };
         self.send_saved_steward_turn(
-            prepared.0, prepared.1, prepared.2, prepared.3, prepared.4, events,
+            prepared.0, prepared.1, prepared.2, prepared.3, prepared.4, None, events,
         )
     }
 

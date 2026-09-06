@@ -99,6 +99,10 @@ impl DriverHandle {
         self.inner.steer(prompt);
     }
 
+    pub fn deliver_input(&self, prompt: String, id: uuid::Uuid, steer: bool) -> anyhow::Result<()> {
+        self.inner.deliver_input(prompt, id, steer)
+    }
+
     pub fn cancel(&self) {
         self.inner.cancel();
     }
@@ -159,6 +163,9 @@ pub trait DriverControl: Send + Sync {
     /// the outcome asynchronously through `DriverEvent::SteerAccepted` or
     /// `DriverEvent::SteerRejected`.
     fn steer(&self, _prompt: String) {}
+    fn deliver_input(&self, _prompt: String, _id: uuid::Uuid, _steer: bool) -> anyhow::Result<()> {
+        anyhow::bail!("provider does not support tracked input")
+    }
     fn cancel(&self);
     fn cancel_computer_use(&self) {}
     fn refresh_background_work(&self) {}
@@ -267,5 +274,11 @@ mod tests {
         ));
         assert!(matches!(received.try_recv(), Ok(DriverEvent::TextDelta(text)) if text == "one"));
         assert!(matches!(received.try_recv(), Ok(DriverEvent::TextDelta(text)) if text == "two"));
+    }
+}
+
+fn input_outcome(events: &impl DriverEventSink, id: Option<uuid::Uuid>, state: crate::model::InputDeliveryState, confirmation: Option<crate::model::InputConfirmation>, reason: Option<String>) {
+    if let Some(id) = id {
+        let _ = events.send(DriverEvent::InputDeliveryOutcome(crate::model::InputDeliveryOutcome { id, state, confirmation, reason }));
     }
 }

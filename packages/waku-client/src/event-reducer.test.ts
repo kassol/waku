@@ -402,3 +402,20 @@ test('durable child waiting follows completion, replay, and user intervention', 
   expect(apply(registered, 'processExited', null).steward_wait).toBeUndefined()
   expect(apply(completed, 'stewardWaitChanged', null).steward_wait).toBeUndefined()
 })
+
+
+test('tracked steering preserves receipt, original turn, and message identity on replay', () => {
+  const original = idleSession()
+  const turn = original.turns[0]!.id
+  const delivery = { id: 'delivery', caller_session_id: 'parent', target_session_id: original.id,
+    prompt: 'Check the boundary', turn_id: turn, mode: 'steer', state: 'accepted',
+    confirmation: null, reason: null, created_at: 100 }
+  const accepted = apply(original, 'inputDeliveryChanged', delivery)
+  const uncertain = apply(accepted, 'inputDeliveryOutcome', { id: delivery.id, state: 'uncertain', confirmation: null, reason: 'No confirmation' })
+  const received = apply(uncertain, 'inputDeliveryOutcome', { id: delivery.id, state: 'received', confirmation: 'provider', reason: null })
+  const repeated = apply(received, 'inputDeliveryOutcome', { id: delivery.id, state: 'received', confirmation: 'provider', reason: null })
+  expect(repeated.input_deliveries?.[0]?.state).toBe('received')
+  expect(repeated.messages.filter((message) => message.content === delivery.prompt)).toHaveLength(1)
+  expect(repeated.messages.at(-1)?.turn_id).toBe(turn)
+  expect(apply(repeated, 'processExited', null).input_deliveries?.[0]?.state).toBe('received')
+})

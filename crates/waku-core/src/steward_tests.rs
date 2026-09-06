@@ -165,7 +165,7 @@ fn mcp_stdio_creates_real_child_and_rejects_spoofed_arguments() {
             .collect();
         assert_eq!(replies.len(), 6);
         assert_eq!(replies[5]["error"]["code"], -32600);
-        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 8);
         assert_eq!(replies[2]["error"]["code"], -32602);
         assert_eq!(replies[3]["result"]["isError"], true);
         assert_eq!(replies[4]["result"]["isError"], false);
@@ -1302,6 +1302,7 @@ fn mcp_prompt_and_cancel_preserve_durable_turn_boundaries() {
                     assert_eq!(reply["result"]["isError"], true, "{reply}");
                 }
             }
+            let delivery_id = Uuid::new_v4();
             let results = std::thread::scope(|scope| {
                 let requests = (0..2)
                     .map(|_| {
@@ -1312,7 +1313,7 @@ fn mcp_prompt_and_cancel_preserve_durable_turn_boundaries() {
                                 parent.id,
                                 runtime,
                                 "waku_prompt",
-                                json!({"session_id":child,"prompt":"continue"}),
+                                json!({"session_id":child,"prompt":"continue","delivery_id":delivery_id}),
                             )
                         })
                     })
@@ -1322,14 +1323,7 @@ fn mcp_prompt_and_cancel_preserve_durable_turn_boundaries() {
                     .map(|request| request.join().unwrap())
                     .collect::<Vec<_>>()
             });
-            assert_eq!(
-                results
-                    .iter()
-                    .filter(|r| r["result"]["isError"] == false)
-                    .count(),
-                1,
-                "{results:?}"
-            );
+            assert!(results.iter().any(|r| r["result"]["isError"] == false), "{results:?}");
             let accepted = results
                 .iter()
                 .find(|r| r["result"]["isError"] == false)
@@ -1426,6 +1420,7 @@ fn mcp_prompt_and_cancel_preserve_durable_turn_boundaries() {
                         command: Command::StewardPrompt {
                             child_session_id: child,
                             prompt: "after disconnect".into(),
+                            delivery_id: None,
                         },
                     }))
                     .unwrap()
@@ -1892,4 +1887,147 @@ fn check_wait_provider_completion(provider: ProviderKind) {
             .request(child.id, Uuid::nil(), Command::CloseSession)
             .unwrap();
     });
+}
+
+#[test]
+fn mcp_input_delivery_is_idempotent_and_queryable() {
+    with_creation_daemon_seed(
+        |root, path| {
+            std::fs::write(root.join("codex-fixture"), include_str!("../tests/fixtures/codex_prompt_cancel.py")).unwrap();
+            seed_query_sessions(root, path)
+        },
+        |client, _, root, path, address, (project, parent, children)| {
+            let (parent, _, config, runtime) = start_steward_saved(&client, root, path, parent, project);
+            let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"].as_str().unwrap();
+            let child = children[0].id;
+            let id = Uuid::new_v4();
+            let args = json!({"session_id": child, "prompt": "durable input", "delivery_id": id});
+            let accepted = mcp_tool(address, token, parent.id, runtime, "waku_prompt", args.clone());
+            let retry = mcp_tool(address, token, parent.id, runtime, "waku_prompt", args);
+            assert_eq!(accepted["turn_id"], retry["turn_id"]);
+            assert_eq!(retry["delivery"]["id"], id.to_string());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let status = mcp_tool(address, token, parent.id, runtime, "waku_prompt_status", json!({"session_id":child,"delivery_id":id}));
+                if status["delivery"]["state"] == "received" {
+                    assert_eq!(status["delivery"]["confirmation"], "provider");
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "{status}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(std::fs::read_to_string(path.join("prompt-calls.jsonl")).unwrap().lines().count(), 1);
+            let mut legacy = serde_json::to_value(&children[0]).unwrap();
+            legacy.as_object_mut().unwrap().remove("input_deliveries");
+            legacy.as_object_mut().unwrap().remove("inputDeliveries");
+            let old: AgentSession = serde_json::from_value(legacy).unwrap();
+            assert!(old.input_deliveries.is_empty());
+            client.request(Uuid::nil(), Uuid::nil(), Command::SaveTaskState {
+                projects: vec![], sessions: vec![old.clone()], live_session_ids: vec![child],
+            }).unwrap();
+            let reopened = StateStore::daemon(root.join("app.db"));
+            let mut loaded = reopened.load().unwrap().sessions.into_iter().find(|s| s.id == child).unwrap();
+            reopened.hydrate(&mut loaded).unwrap();
+            assert_eq!(loaded.input_deliveries.len(), 1);
+            assert_eq!(loaded.input_deliveries[0].state, crate::model::InputDeliveryState::Received);
+            for message in &old.messages {
+                let saved = loaded.messages.iter().find(|m| m.id == message.id).unwrap();
+                assert_eq!(serde_json::to_value(saved).unwrap(), serde_json::to_value(message).unwrap());
+            }
+            for turn in &old.turns {
+                assert!(loaded.turns.iter().any(|saved| serde_json::to_value(saved).unwrap() == serde_json::to_value(turn).unwrap()));
+            }
+            let conflict = mcp_response(address, token, parent.id, runtime, "waku_prompt", json!({"session_id":child,"prompt":"different","delivery_id":id}));
+            assert_eq!(conflict["result"]["isError"], true);
+        },
+    );
+}
+
+#[test]
+fn mcp_input_delivery_reports_native_ack_rejection_and_uncertainty() {
+    with_creation_daemon_seed(
+        |root, path| {
+            std::fs::write(root.join("codex-fixture"), include_str!("../tests/fixtures/codex_input_delivery.py")).unwrap();
+            seed_query_sessions(root, path)
+        },
+        |client, _, root, path, address, (project, parent, children)| {
+            let (parent, _, config, runtime) = start_steward_saved(&client, root, path, parent, project);
+            let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"].as_str().unwrap();
+            let child = children[0].id;
+            let initial = mcp_tool(address, token, parent.id, runtime, "waku_prompt", json!({"session_id": child,"prompt":"initial","delivery_id":Uuid::new_v4()}));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !path.join("input-calls.jsonl").exists() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            for (prompt, expected) in [("adjust", "received"), ("reject", "failed"), ("uncertain", "uncertain")] {
+                let id = Uuid::new_v4();
+                let args = json!({"session_id":child,"prompt":prompt,"delivery_id":id});
+                let accepted = mcp_tool(address, token, parent.id, runtime, "waku_prompt", args.clone());
+                assert_eq!(accepted["turn_id"], initial["turn_id"]);
+                loop {
+                    let result = mcp_tool(address, token, parent.id, runtime, "waku_prompt_status", json!({"session_id":child,"delivery_id":id}));
+                    if result["delivery"]["state"] == expected { break; }
+                    assert!(std::time::Instant::now() < deadline,"{result}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let retry = mcp_tool(address, token, parent.id, runtime, "waku_prompt", args);
+                assert_eq!(retry["delivery"]["state"], expected);
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let calls = loop {
+                let text = std::fs::read_to_string(path.join("input-calls.jsonl")).unwrap();
+                if text.lines().count() == 4 { break text; }
+                assert!(std::time::Instant::now() < deadline, "{text}");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            for line in calls.lines().skip(1) {
+                let call: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_eq!(call["method"], "turn/steer");
+                assert_eq!(call["params"]["expectedTurnId"], "native-turn");
+            }
+        },
+    );
+}
+
+#[test]
+fn mcp_input_delivery_claude_confirms_transport_without_claiming_adoption() {
+    with_creation_daemon_seed(
+        |root, path| {
+            std::fs::write(root.join("claude-child-fixture"), include_str!("../tests/fixtures/claude_input_delivery.py")).unwrap();
+            let (project, parent, mut children) = seed_query_sessions(root, path);
+            children[0].provider = ProviderKind::Claude;
+            let store = StateStore::daemon(root.join("app.db"));
+            let mut state = store.load().unwrap();
+            *state.sessions.iter_mut().find(|s| s.id == children[0].id).unwrap() = children[0].clone();
+            state.mark_session_dirty(children[0].id);
+            store.save(&mut state).unwrap();
+            (project, parent, children)
+        },
+        |client, _, root, path, address, (project, parent, children)| {
+            let (parent, _, config, runtime) = start_steward_saved(&client, root, path, parent, project);
+            let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"].as_str().unwrap();
+            for prompt in ["initial", "adjust"] {
+                let id = Uuid::new_v4();
+                mcp_tool(address, token, parent.id, runtime, "waku_prompt", json!({"session_id":children[0].id,"prompt":prompt,"delivery_id":id}));
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let status = mcp_tool(address, token, parent.id, runtime, "waku_prompt_status", json!({"session_id":children[0].id,"delivery_id":id}));
+                    if status["delivery"]["state"] == "received" {
+                        assert_eq!(status["delivery"]["confirmation"], "transport");
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "{status}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let calls = std::fs::read_to_string(path.join("claude-input-calls.jsonl")).unwrap_or_default();
+                if calls.lines().count() == 2 { break; }
+                assert!(std::time::Instant::now() < deadline, "{calls}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        },
+    );
 }

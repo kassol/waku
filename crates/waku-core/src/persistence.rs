@@ -1201,20 +1201,23 @@ impl StateStore {
         // Recover durable waits without hydrating any transcript. This runs
         // once when opening the store; later catalogs use the in-memory projection.
         let mut waits = connection
-            .prepare("SELECT session_id, json_extract(data, '$.steward_wait') FROM session_details")
+            .prepare("SELECT session_id, json_extract(data, '$.steward_wait'), json_extract(data, '$.input_deliveries') FROM session_details")
             .map_err(to_io_error)?;
         let mut waits_by_session = HashMap::new();
+        let mut inputs_by_session = HashMap::new();
         for row in waits
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)))
             .map_err(to_io_error)?
         {
-            let (id, wait) = row.map_err(to_io_error)?;
+            let (id, wait, inputs) = row.map_err(to_io_error)?;
+            if let Some(inputs) = inputs { inputs_by_session.insert(id.clone(), serde_json::from_str(&inputs).map_err(to_io_error)?); }
             if let Some(wait) = wait {
                 waits_by_session.insert(id, serde_json::from_str(&wait).map_err(to_io_error)?);
             }
         }
         for session in &mut state.sessions {
             session.steward_wait = waits_by_session.remove(&session.id.to_string());
+            session.input_deliveries = inputs_by_session.remove(&session.id.to_string()).unwrap_or_default();
         }
         drop(waits);
 
@@ -1312,6 +1315,7 @@ impl StateStore {
         session.last_driver_error = stored.last_driver_error;
         session.cancellation_requested_turn_id = stored.cancellation_requested_turn_id;
         session.steward_wait = stored.steward_wait;
+        session.input_deliveries = stored.input_deliveries;
         session.pending_permission = stored.pending_permission;
         session.pending_user_input = stored.pending_user_input;
 
@@ -1764,6 +1768,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         id: Uuid::parse_str(&id).ok()?,
         parent_session_id: parent_session_id.and_then(|id| Uuid::parse_str(&id).ok()),
         steward_wait: None,
+        input_deliveries: Vec::new(),
         title,
         auto_title,
         project_id: Uuid::parse_str(&project_id).ok()?,

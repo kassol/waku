@@ -289,70 +289,12 @@ impl WakuBackend {
     }
 
     pub(super) fn steward_prompt(
-        &self,
-        parent_id: Uuid,
-        child_id: Uuid,
-        prompt: String,
-        events: &EventSink,
+        &self, parent_id: Uuid, child_id: Uuid, prompt: String,
+        delivery_id: Option<Uuid>, events: &EventSink,
     ) -> anyhow::Result<ResponsePayload> {
-        if prompt.trim().is_empty() {
-            bail!("prompt must not be empty");
-        }
         events.ensure_steward_active()?;
-        let _operation = events.reserve_steward_target(child_id)?;
-        let exited = self
-            .forwarders
-            .lock()
-            .get(&child_id)
-            .is_some_and(|(_, forwarder)| forwarder.is_finished());
-        if exited {
-            self.authorized_child(&mut self.task_state.lock(), parent_id, child_id, events)?;
-            self.close_runtime(child_id, None)?;
-        }
-        let (child, project_path, turn_id, message_id) = {
-            let mut state = self.task_state.lock();
-            let (child, project_path) =
-                self.authorized_child(&mut state, parent_id, child_id, events)?;
-            validate_child_options(
-                &self.task_store,
-                &mut state,
-                child_id,
-                child.provider,
-                child.runtime_mode,
-            )?;
-            if child.active_turn_id().is_some()
-                || child.status.is_busy()
-                || child.pending_permission.is_some()
-                || child.pending_user_input.is_some()
-            {
-                bail!(
-                    "child is busy or waiting for the user; query status before submitting a new turn"
-                );
-            }
-            let session = state
-                .sessions
-                .iter_mut()
-                .find(|s| s.id == child_id)
-                .unwrap();
-            let turn_id = session.begin_turn(prompt.clone());
-            let message_id = session.messages.last().unwrap().id;
-            session.status = SessionStatus::Connecting;
-            session.last_driver_error = None;
-            state.mark_session_dirty(child_id);
-            if let Err(error) = self.task_store.save(&mut state) {
-                self.saving_failed.store(true, Ordering::Release);
-                state
-                    .sessions
-                    .iter_mut()
-                    .find(|s| s.id == child_id)
-                    .unwrap()
-                    .history_save_error = Some(error.to_string());
-                bail!("could not save child input; query state before retrying: {error}");
-            }
-            (child, project_path, turn_id, message_id)
-        };
-        self.send_saved_steward_turn(child, project_path, prompt, turn_id, message_id, events)?;
-        Ok(ResponsePayload::ChildPromptAccepted { turn_id })
+        self.authorized_child(&mut self.task_state.lock(), parent_id, child_id, events)?;
+        self.deliver_authorized_input(parent_id, child_id, prompt, delivery_id, events)
     }
 
     pub(super) fn send_saved_steward_turn(
@@ -362,6 +304,7 @@ impl WakuBackend {
         prompt: String,
         turn_id: Uuid,
         message_id: Uuid,
+        delivery_id: Option<Uuid>,
         events: &EventSink,
     ) -> anyhow::Result<()> {
         let child_id = child.id;
@@ -410,6 +353,21 @@ impl WakuBackend {
                 )?;
             }
             self.ensure_accepting_work()?;
+            if let Some(id) = delivery_id {
+                let delivery = child.input_deliveries.iter().find(|d| d.id == id).cloned()
+                    .ok_or_else(|| anyhow!("saved input is unavailable"))?;
+                child_events.send(event_to_wire(DriverEvent::InputDeliveryChanged(delivery))?)?;
+                child_events.send(event_to_wire(DriverEvent::PromptSubmitted {
+                    message: prompt.clone(), turn_id, message_id,
+                })?)?;
+                child_events.send(event_to_wire(DriverEvent::InputDeliveryOutcome(crate::model::InputDeliveryOutcome {
+                    id, state: crate::model::InputDeliveryState::Uncertain, confirmation: None,
+                    reason: Some("Awaiting provider confirmation; do not resend automatically".into()),
+                }))?)?;
+                let driver = self.sessions.lock().get(&child_id).map(|(_, driver)| driver.clone())
+                    .ok_or_else(|| anyhow!("provider runtime is unavailable"))?;
+                driver.deliver_input(prompt, id, false)?;
+            } else {
             self.handle_accepted(
                 Request {
                     request_id: Uuid::new_v4(),
@@ -423,9 +381,16 @@ impl WakuBackend {
                 },
                 child_events.clone(),
             )?;
+            }
             Ok(())
         };
         if let Err(error) = send() {
+            if let Some(id) = delivery_id {
+                child_events.send(event_to_wire(DriverEvent::InputDeliveryOutcome(crate::model::InputDeliveryOutcome {
+                    id, state: crate::model::InputDeliveryState::Failed, confirmation: None, reason: Some(error.to_string()),
+                }))?)?;
+            }
+
             child_events.send_batch(vec![
                 event_to_wire(DriverEvent::Error(format!(
                     "could not run saved turn {turn_id}: {error:#}"
