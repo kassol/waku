@@ -360,6 +360,7 @@ impl WakuBackend {
             source_id,
             source_id,
             saved.instructions[index].prompt.clone(),
+            Some(saved.instructions[index].instruction.clone()),
             Some(id),
             events,
         ) {

@@ -38,6 +38,7 @@ impl WakuBackend {
         caller: Uuid,
         target: Uuid,
         prompt: String,
+        display_content: Option<String>,
         id: Option<Uuid>,
         events: &EventSink,
     ) -> anyhow::Result<ResponsePayload> {
@@ -133,7 +134,7 @@ impl WakuBackend {
                     None,
                 )
             } else {
-                let turn_id = session.begin_turn(prompt.clone());
+                let turn_id = session.begin_turn_with_presentation(prompt.clone(), display_content.clone(), Vec::new());
                 session.status = SessionStatus::Connecting;
                 session.last_driver_error = None;
                 (turn_id, Some(session.messages.last().unwrap().id))
@@ -143,6 +144,7 @@ impl WakuBackend {
                 caller_session_id: caller,
                 target_session_id: target,
                 prompt: prompt.clone(),
+                display_content,
                 turn_id,
                 mode: if busy && supported {
                     InputDeliveryMode::Steer
@@ -370,7 +372,7 @@ impl WakuBackend {
             };
             self.ensure_accepting_work()?;
             let session = state.sessions.iter_mut().find(|s| s.id == target).unwrap();
-            let turn_id = session.begin_turn(queued.prompt.clone());
+            let turn_id = session.begin_turn_with_presentation(queued.prompt.clone(), queued.display_content.clone(), Vec::new());
             session.status = SessionStatus::Connecting;
             session.last_driver_error = None;
             let message_id = session.messages.last().unwrap().id;

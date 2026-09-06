@@ -3,4 +3,8 @@ import type { InputConfirmation } from "./InputConfirmation";
 import type { InputDeliveryMode } from "./InputDeliveryMode";
 import type { InputDeliveryState } from "./InputDeliveryState";
 
-export type InputDelivery = { id: string, caller_session_id: string, target_session_id: string, prompt: string, turn_id: string, mode: InputDeliveryMode, state: InputDeliveryState, confirmation: InputConfirmation | null, reason: string | null, created_at: number, };
+export type InputDelivery = { id: string, caller_session_id: string, target_session_id: string, prompt: string,
+/**
+ * Original user text when the provider input includes additional context.
+ */
+display_content?: string | null, turn_id: string, mode: InputDeliveryMode, state: InputDeliveryState, confirmation: InputConfirmation | null, reason: string | null, created_at: number, };

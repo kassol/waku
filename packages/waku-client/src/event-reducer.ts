@@ -133,6 +133,7 @@ export function reduceRuntimeEvent(
         if (delivery.state === 'received' && delivery.mode === 'steer') {
           if (session.steward_wait?.parent_turn_id === delivery.turn_id) delete session.steward_wait
           session.messages.push({ id: clock.randomUUID(), role: 'user', content: delivery.prompt,
+            display_content: delivery.display_content,
             turn_id: delivery.turn_id, created_at: clock.nowSeconds(), streaming: false })
         }
       }
@@ -492,6 +493,9 @@ function adoptSubmittedPrompt(
   clock: ReducerClock,
 ) {
   const now = clock.nowSeconds()
+  const displayContent = session.input_deliveries?.find(delivery =>
+    delivery.turn_id === turnId && delivery.mode === 'prompt' && delivery.prompt === message,
+  )?.display_content
   const active = activeTurn(session)
   if (active) {
     const hasPrompt = session.messages.some(
@@ -503,6 +507,7 @@ function adoptSubmittedPrompt(
       turn_id: active.id,
       role: 'user',
       content: message,
+      display_content: displayContent,
       created_at: now,
       streaming: false,
     })
@@ -524,6 +529,7 @@ function adoptSubmittedPrompt(
     turn_id: turnId,
     role: 'user',
     content: message,
+    display_content: displayContent,
     created_at: now,
     streaming: false,
   })

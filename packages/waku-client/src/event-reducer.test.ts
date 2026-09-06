@@ -466,3 +466,21 @@ test('snapshot restores task evidence without rewinding its revision', () => {
   saved.managed_workspace = undefined
   expect(reduceRuntimeEvent(retained, event('historySnapshot', saved), clock).session.managed_workspace?.integration_commit).toBe('accepted')
 })
+
+test('consultation input displays the instruction while retaining provider context', () => {
+  for (const mode of ['prompt', 'steer']) {
+    const original = idleSession()
+    const delivery = { id: 'consultation-input', caller_session_id: original.id, target_session_id: original.id,
+      prompt: 'Full provider context with recent_discussion and pending_child_targets',
+      display_content: 'Only change the dependent result.', turn_id: mode === 'steer' ? original.turns[0]!.id : 'new-turn',
+      mode, state: 'accepted', confirmation: null, reason: null, created_at: 100 }
+    let session = apply(original, 'inputDeliveryChanged', delivery)
+    if (mode === 'prompt') session = apply(session, 'promptSubmitted', {
+      message: delivery.prompt, turnId: delivery.turn_id, messageId: 'consultation-message',
+    })
+    session = apply(session, 'inputDeliveryOutcome', { id: delivery.id, state: 'received', confirmation: 'provider', reason: null })
+    const message = session.messages.find(message => message.content === delivery.prompt)
+    expect(message?.display_content).toBe(delivery.display_content)
+    expect(session.input_deliveries?.[0]?.prompt).toBe(delivery.prompt)
+  }
+})

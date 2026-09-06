@@ -927,6 +927,9 @@ pub struct InputDelivery {
     pub caller_session_id: Uuid,
     pub target_session_id: Uuid,
     pub prompt: String,
+    /// Original user text when the provider input includes additional context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_content: Option<String>,
     pub turn_id: Uuid,
     pub mode: InputDeliveryMode,
     pub state: InputDeliveryState,
@@ -1588,6 +1591,11 @@ impl AgentSession {
     ) -> bool {
         self.steward_wait = None;
         let now = unix_time();
+        let display_content = self.input_deliveries.iter().find(|delivery| {
+            delivery.turn_id == turn_id
+                && delivery.mode == InputDeliveryMode::Prompt
+                && delivery.prompt == message
+        }).and_then(|delivery| delivery.display_content.clone());
         if let Some(active) = self.active_turn_id() {
             let has_prompt = self.messages.iter().any(|candidate| {
                 candidate.turn_id == Some(active) && candidate.role == MessageRole::User
@@ -1595,7 +1603,8 @@ impl AgentSession {
             if has_prompt {
                 return false;
             }
-            let mut prompt = Message::new_for_turn(MessageRole::User, message, active);
+            let mut prompt = Message::new_for_turn(MessageRole::User, message, active)
+                .with_presentation(display_content, Vec::new());
             prompt.id = message_id;
             self.messages.push(prompt);
             self.updated_at = now;
@@ -1612,7 +1621,8 @@ impl AgentSession {
             completed_at: None,
             checkpoint: None,
         });
-        let mut prompt = Message::new_for_turn(MessageRole::User, message, turn_id);
+        let mut prompt = Message::new_for_turn(MessageRole::User, message, turn_id)
+            .with_presentation(display_content, Vec::new());
         prompt.id = message_id;
         self.messages.push(prompt);
         self.status = SessionStatus::Connecting;
@@ -1879,8 +1889,8 @@ pub struct Message {
     pub turn_id: Option<Uuid>,
     pub role: MessageRole,
     pub content: String,
-    /// User-visible text before provider-facing attachment mentions were
-    /// appended. Plain and legacy messages omit it.
+    /// User-visible text before provider-facing context or attachment mentions
+    /// were appended. Plain and legacy messages omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

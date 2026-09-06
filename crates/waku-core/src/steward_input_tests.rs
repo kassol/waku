@@ -658,6 +658,7 @@ fn input_queue_user_source_waits_for_an_existing_callback_operation() {
             child.id,
             child.id,
             "user feedback".into(),
+            None,
             Some(Uuid::new_v4()),
             &sink,
         ))
@@ -1249,5 +1250,55 @@ impl Backend for CoordinationBackend {
 impl WakuBackend {
     pub(crate) fn fixture_with_unsteerable_parent(self: Arc<Self>) -> Arc<dyn Backend> {
         Arc::new(CoordinationBackend(self))
+    }
+}
+
+#[test]
+fn consultation_instruction_presentation_survives_delivery_and_restart() {
+    for mode in ["idle", "steer", "queued"] {
+        let (root, parent, _) = seed_queue();
+        let server = QueueServer::open(&root);
+        server.backend.steer.store(mode == "steer", Ordering::Release);
+        let client = if mode == "idle" {
+            let client = server.connect();
+            server.start(&client, &root, parent.id);
+            client
+        } else {
+            begin_queue_work(&server, &root, parent.id).0
+        };
+        let id = Uuid::new_v4();
+        let instruction = "只修改 dependent.txt，保留当前成果。";
+        client.request(Uuid::nil(), Uuid::nil(), Command::ExecuteConsultation {
+            source_session_id: parent.id, delivery_id: id, instruction: instruction.into(),
+        }).unwrap();
+        if mode == "queued" {
+            assert!(server.calls.try_recv().is_err());
+            server.finish(parent.id);
+        }
+        let (target, prompt) = server.calls.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(target, parent.id);
+        assert!(prompt.contains("recent_discussion"));
+        assert!(prompt.contains(instruction));
+        let verify = |client: &DaemonClient| {
+            let ResponsePayload::Session { session: Some(session) } = client.request(
+                Uuid::nil(), Uuid::nil(), Command::HydrateSession { session_id: parent.id },
+            ).unwrap() else { panic!("source is missing"); };
+            let delivery = session.input_deliveries.iter().find(|delivery| delivery.id == id).unwrap();
+            assert_eq!(delivery.prompt, prompt, "audit keeps the complete provider input");
+            assert_eq!(delivery.state, InputDeliveryState::Received);
+            let message = session.messages.iter().find(|message| message.content == prompt).unwrap();
+            assert_eq!(message.visible_content(), instruction, "{mode}: show the user's original instruction");
+            assert_eq!(message.display_content.as_deref(), Some(instruction));
+        };
+        verify(&client);
+        server.finish(parent.id);
+        drop(client);
+        drop(server);
+        let reopened = QueueServer::open(&root);
+        let client = reopened.connect();
+        verify(&client);
+        drop(client);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

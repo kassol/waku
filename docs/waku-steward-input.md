@@ -56,6 +56,9 @@ and the pending child targets in the discussion record before submission. This
 user-only command targets the source task; scoped MCP clients cannot use it.
 `LoadConsultation` reads current delivery states without resending any input.
 A retry reuses the saved prompt and ID, including after restart.
+The optional delivery `display_content` preserves the original instruction in
+the user message, including after queued submission and restart. The provider
+input and delivery audit retain the complete prompt and discussion context.
 
 An accepted or uncertain user steer holds the previous wait for that same turn.
 It cannot automatically resume the old plan while the new direction is unresolved.

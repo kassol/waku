@@ -72,10 +72,12 @@ impl HistoryReducer {
                         if delivery.state == InputDeliveryState::Received && delivery.mode == InputDeliveryMode::Steer {
                             let turn_id = delivery.turn_id;
                             let prompt = delivery.prompt.clone();
+                            let display_content = delivery.display_content.clone();
                             if session.steward_wait.as_ref().is_some_and(|wait| wait.parent_turn_id == turn_id) {
                                 session.steward_wait = None;
                             }
-                            session.messages.push(Message::new_for_turn(MessageRole::User, prompt, turn_id));
+                            session.messages.push(Message::new_for_turn(MessageRole::User, prompt, turn_id)
+                                .with_presentation(display_content, Vec::new()));
                         }
                     }
                 }
@@ -743,6 +745,40 @@ pub fn compact_driver_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consultation_receipts_preserve_instruction_presentation() {
+        for mode in [InputDeliveryMode::Prompt, InputDeliveryMode::Steer] {
+            let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+            let turn_id = if mode == InputDeliveryMode::Steer {
+                session.begin_turn("existing task")
+            } else {
+                Uuid::new_v4()
+            };
+            let delivery: InputDelivery = serde_json::from_value(serde_json::json!({
+                "id": Uuid::new_v4(), "caller_session_id": session.id,
+                "target_session_id": session.id, "turn_id": turn_id,
+                "prompt": "Full provider context with recent_discussion and pending_child_targets",
+                "display_content": "Only change the dependent result.",
+                "mode": mode, "state": "accepted", "created_at": 100
+            })).unwrap();
+            let mut history = HistoryReducer::default();
+            let wire = crate::event_to_wire(DriverEvent::InputDeliveryChanged(delivery.clone())).unwrap();
+            history.apply(&mut session, crate::event_from_wire(wire).unwrap());
+            if mode == InputDeliveryMode::Prompt {
+                history.apply(&mut session, DriverEvent::PromptSubmitted {
+                    message: delivery.prompt.clone(), turn_id, message_id: Uuid::new_v4(),
+                });
+            }
+            history.apply(&mut session, DriverEvent::InputDeliveryOutcome(InputDeliveryOutcome {
+                id: delivery.id, state: InputDeliveryState::Received,
+                confirmation: Some(InputConfirmation::Provider), reason: None,
+            }));
+            let message = session.messages.iter().find(|message| message.content == delivery.prompt).unwrap();
+            assert_eq!(message.visible_content(), delivery.display_content.as_deref().unwrap());
+            assert_eq!(session.input_deliveries[0].prompt, delivery.prompt);
+        }
+    }
 
     #[test]
     fn steward_wait_survives_completion_and_stale_snapshot_until_new_input() {

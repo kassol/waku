@@ -336,7 +336,7 @@ impl WakuBackend {
     ) -> anyhow::Result<ResponsePayload> {
         events.ensure_steward_active()?;
         self.authorized_child(&mut self.task_state.lock(), parent_id, child_id, events)?;
-        self.deliver_authorized_input(parent_id, child_id, prompt, delivery_id, events)
+        self.deliver_authorized_input(parent_id, child_id, prompt, None, delivery_id, events)
     }
 
     pub(super) fn send_saved_steward_turn(

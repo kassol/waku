@@ -4,7 +4,7 @@ import type { MessageRole } from "./MessageRole";
 
 export type Message = { id: string, turn_id: string | null, role: MessageRole, content: string,
 /**
- * User-visible text before provider-facing attachment mentions were
- * appended. Plain and legacy messages omit it.
+ * User-visible text before provider-facing context or attachment mentions
+ * were appended. Plain and legacy messages omit it.
  */
 display_content?: string | null, attachments?: Array<MessageAttachment>, created_at: number, streaming: boolean, };
