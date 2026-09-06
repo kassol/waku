@@ -1,8 +1,8 @@
 # 管家一期任务清单
 
-父规格：[kassol/waku#1](https://github.com/kassol/waku/issues/1)。状态：用户已确认拆分，11 张子任务已发布为 #2–#12，均标记 ready-for-agent。
+父规格：[kassol/waku#1](https://github.com/kassol/waku/issues/1)。状态：11 张子任务 #2–#12 已完成，逐票证据见 GitHub，整体证据见[一期验收](waku-steward-acceptance.md)。
 
-T 编号保留为拆分记录；实际执行使用下表的 GitHub Issue 和原生阻塞关系。正文保留获批的验收范围，GitHub 任务另含每票共用的回归与评审要求。父规格原文和状态保持不变。
+T 编号保留为拆分记录；实际执行使用下表的 GitHub Issue 和原生阻塞关系。正文保留获批的验收范围，GitHub 任务另含每票共用的回归与评审要求。下方勾选框保留创建时的验收清单，完成状态以 GitHub 和验收记录为准。
 
 每票在自己的行为范围完成接口、持久化、必要的界面及回归验证；前置票可从现有 daemon 协议验收，MCP 可用后优先从工具入口验收。协议变化同步检查 Rust 和共享 TypeScript 客户端。使用隔离测试资源，每票完成 Standards / Spec 两轴评审；测试通过后再提交。所有新增控件在所属票内具备键盘路径，性能与可访问性不留到末票补做。
 
