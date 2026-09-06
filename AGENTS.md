@@ -7,6 +7,9 @@
   current decisions, implementation boundary, and installed-app isolation rules.
 - Fetch updates only from `upstream` (`egoist/waku`). Push development changes
   only to `origin` (`kassol/waku`); do not send contributions or messages upstream.
+- Before syncing upstream, read [the sync procedure and ledger](docs/upstream-sync.md).
+  Adapt changes to this fork's product direction. Record each completed review's
+  full upstream SHA and decisions so the next sync reviews only the new range.
 
 ## Development runtime
 

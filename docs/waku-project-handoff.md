@@ -21,6 +21,7 @@
 
 - **测试 App 必须与已安装的原版 Waku 隔离**（2026-09-06 新增）：不得覆盖、退出、升级或修改原版 App，不得写入原版配置、数据库、会话及工作目录，不得连接或控制原版 daemon。测试使用独立应用标识、数据目录、daemon 与测试工作区；首次启动前完成隔离核查。当前仅检查源码，尚未完成隔离实现或运行验证。Debug 已有独立应用标识与数据库路径，但 daemon 配置默认路径仍为 `~/.waku/settings.json`（`crates/waku-protocol/src/settings.rs` 的 `DaemonSettings::default_path`），`worktree::create` 仍使用 `~/.waku/worktrees`，`src/daemon.rs` 还支持通过环境变量连接外部 daemon。首次启动前需核查并补齐这些隔离边界。此约束不改变暂缓工具链安装与功能实现的状态。
 - **只做单向同步**：仅从 `egoist/waku` 拉取并同步更新；开发提交只推送 `kassol/waku`。禁止向上游推送代码、创建 PR、Issue、评论或发送其他内容。
+- **按产品方向融合上游**：逐项评估上游变更，选择采纳、适配、跳过或延期。每轮记录完整上游 SHA 与处理结论；流程和增量基线统一维护在[上游同步记录](upstream-sync.md)。
 - 该约束已保存到 Nowledge Mem：`65a49358-e7c5-428f-aad8-4d1b4f61f145`。
 - 当前仅记录了操作约束；未配置 upstream 的技术性推送禁用措施，Git remote 仍显示其正常 push URL。
 - 延续原先暂缓安装 Rust、暂未实现的状态。此次 fork、clone 与 handoff 不代表授权开始功能实现或安装工具链。
