@@ -1358,13 +1358,21 @@ impl WakuBackend {
             }
             command => {
                 if let Command::ApplyOptions { options } = &command {
-                    validate_child_options(
-                        &self.task_store,
-                        &mut self.task_state.lock(),
-                        session_id,
-                        ProviderKind::Codex,
-                        decode_enum(&options.mode)?,
-                    )?;
+                    let mut state = self.task_state.lock();
+                    if let Some(provider) = state
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == session_id)
+                        .map(|session| session.provider)
+                    {
+                        validate_child_options(
+                            &self.task_store,
+                            &mut state,
+                            session_id,
+                            provider,
+                            decode_enum(&options.mode)?,
+                        )?;
+                    }
                 }
                 let driver = {
                     let sessions = self.sessions.lock();

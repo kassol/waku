@@ -77,6 +77,27 @@ fn claude_child_runs_and_exposes_its_own_scoped_mcp() {
         let env = &child_config["mcpServers"]["waku"]["env"];
         assert_eq!(env["WAKU_MCP_SESSION"], child_id.to_string());
         assert_ne!(env["WAKU_MCP_TOKEN"], token);
+        let child_runtime = Uuid::parse_str(env["WAKU_MCP_RUNTIME"].as_str().unwrap()).unwrap();
+        let options = |mode: &str| Command::ApplyOptions {
+            options: crate::WireSessionOptions {
+                mode: mode.into(),
+                model: Some("fixture-model".into()),
+                reasoning_effort: None,
+                service_tier: None,
+                context_window: None,
+            },
+        };
+        assert!(matches!(
+            client
+                .request(child_id, child_runtime, options("ask"))
+                .unwrap(),
+            ResponsePayload::OptionsApplied { applied: true }
+        ));
+        assert!(
+            client
+                .request(child_id, child_runtime, options("fullAccess"))
+                .is_err()
+        );
         let args: Vec<String> =
             serde_json::from_str(&std::fs::read_to_string(path.join("claude-args.json")).unwrap())
                 .unwrap();

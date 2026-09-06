@@ -45,7 +45,7 @@ Projectless task directories are daemon-owned too and live beneath
 The protocol types use Serde's tagged JSON representation and are exported by
 `waku-protocol`, including checked-in TypeScript bindings.
 
-`CreateSession` creates one Codex child from the request's parent session ID.
+`CreateSession` creates one Claude or Codex child from the request's parent session ID.
 The daemon validates the existing parent and Git project, creates a worktree
 beneath the task database directory, saves the child, and submits its first
 prompt. Success follows the provider's durable first-turn acceptance and
