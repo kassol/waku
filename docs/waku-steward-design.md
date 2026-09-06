@@ -2,6 +2,8 @@
 
 > 设计记录，尚未实现。代码依据来自临时克隆 `0988a1c`，需按当前源码复核。当前约束、待复核矛盾与授权边界见[项目交接](waku-project-handoff.md)；本文保留原设计，不作为已完成的验收规格。
 
+> 2026-09-06 澄清：本文中的事件直接裁剪、队列丢弃、父会话默认筛选、退出后保留运行等表述，以[一期澄清记录](waku-steward-scope.md)和相关 ADR 为准。工具数量与观测分期也以该记录为准。下文的“现有防线已经够用”及 serde 保证旧快照不丢字段的判断已被当前源码复核否定。
+
 ## 一句话方案
 
 给 `waku-daemon` 加一个 `mcp` 子命令，它作为 stdio MCP server 启动、内部用 WebSocket 连回同一个 daemon；daemon 新增一条 `CreateSession` 命令与一张事件日志表，管家会话（跑在原生 Claude Code 上）通过 `--mcp-config` 挂上这个 shim，就能派生、驱动、观测子会话，且转录由 daemon 自己落库、App 关掉也不丢。
