@@ -200,7 +200,10 @@ pub fn run_stdio(
         } else if method == "tools/call" {
             match tool_command(
                 message["params"]["name"].as_str().unwrap_or(""),
-                message["params"]["arguments"].clone(),
+                message["params"]
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
             ) {
                 Err(error) => Err((-32602, error)),
                 Ok(command) => {

@@ -133,14 +133,10 @@ impl WakuBackend {
         if session.pending_user_input.is_some() {
             waiting_for.push(ChildWaitingReason::UserInput);
         }
-        let error = session.history_save_error.clone().or_else(|| {
-            session.runtime_event_cursor.and_then(|cursor| {
-                self.history
-                    .lock()
-                    .get(&(session.id, cursor.runtime_id))
-                    .and_then(|reducer| reducer.last_driver_error.clone())
-            })
-        });
+        let error = session
+            .history_save_error
+            .clone()
+            .or_else(|| session.last_driver_error.clone());
         ChildSessionSummary {
             session_id: session.id,
             title: session.display_title().to_owned(),

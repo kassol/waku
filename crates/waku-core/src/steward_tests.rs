@@ -1078,3 +1078,105 @@ fn result_queries_progress_while_provider_events_are_persisted() {
             .unwrap();
     });
 }
+
+#[test]
+fn query_preserves_failed_turn_reason_across_storage_restart() {
+    fn seed_failed(root: &Path, path: &Path) -> (Project, AgentSession, Vec<AgentSession>) {
+        let (project, parent, mut children) = seed_query_sessions(root, path);
+        let child = &mut children[0];
+        child.begin_turn("fail after partial output");
+        let mut reducer = waku_protocol::history::HistoryReducer::default();
+        reducer.apply(child, crate::model::DriverEvent::TurnStarted);
+        reducer.apply(
+            child,
+            crate::model::DriverEvent::TextDelta("partial".into()),
+        );
+        reducer.apply(
+            child,
+            crate::model::DriverEvent::Error("provider lost connection".into()),
+        );
+        reducer.apply(child, crate::model::DriverEvent::ProcessExited);
+        reducer.apply(
+            child,
+            crate::model::DriverEvent::Connected {
+                provider_cursor: None,
+            },
+        );
+        let store = StateStore::daemon(root.join("app.db"));
+        let mut state = store.load().unwrap();
+        *state
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == child.id)
+            .unwrap() = child.clone();
+        state.mark_session_dirty(child.id);
+        store.save(&mut state).unwrap();
+        (project, parent, children)
+    }
+    with_creation_daemon_seed(
+        seed_failed,
+        |client, _, root, project_path, address, (project, parent, children)| {
+            let (parent, _, config, runtime) =
+                start_steward_saved(&client, root, project_path, parent, project);
+            let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+                .as_str()
+                .unwrap();
+            let result = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_result",
+                json!({"session_id":children[0].id}),
+            );
+            assert_eq!(result["session"]["error"], "provider lost connection");
+            assert_eq!(result["session"]["turn"]["status"], "failed");
+            assert_eq!(result["reply"], "partial");
+            let status = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_status",
+                json!({"session_ids":[children[0].id]}),
+            );
+            assert_eq!(status["sessions"][0]["error"], "provider lost connection");
+            let mut next = children[0].clone();
+            let mut reducer = waku_protocol::history::HistoryReducer::default();
+            reducer.apply(
+                &mut next,
+                crate::model::DriverEvent::PromptSubmitted {
+                    message: "retry".into(),
+                    turn_id: Uuid::new_v4(),
+                    message_id: Uuid::new_v4(),
+                },
+            );
+            next.updated_at += 1;
+            client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::SaveTaskState {
+                        projects: vec![],
+                        sessions: vec![next],
+                        live_session_ids: vec![children[0].id],
+                    },
+                )
+                .unwrap();
+            let next = mcp_tool(
+                address,
+                token,
+                parent.id,
+                runtime,
+                "waku_result",
+                json!({"session_id":children[0].id}),
+            );
+            assert!(next["session"]["error"].is_null());
+            assert_eq!(next["session"]["turn"]["status"], "running");
+            assert_eq!(next["reply"], "");
+            client
+                .request(parent.id, runtime, Command::CloseSession)
+                .unwrap();
+        },
+    );
+}
