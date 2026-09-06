@@ -1,6 +1,6 @@
 # 管家协作扩展验收记录
 
-2026-09-07。合同为 [Issue #13](https://github.com/kassol/waku/issues/13) 的[协作规格](waku-steward-orchestration-spec.md)和 [#14–#22 纵向任务](waku-steward-orchestration-tickets.md)。本轮实现、公共组合流程、自动化检查及签名 Debug App 原生交互验收已通过。用户已明确授权验收后推送、关闭任务并更新安装 Waku Steward；本文更新时 #14–#22 待关闭，Steward 待安装，安装后结果另行补记。原版 Waku 的隔离保护继续有效。
+2026-09-07。合同为 [Issue #13](https://github.com/kassol/waku/issues/13) 的[协作规格](waku-steward-orchestration-spec.md)和 [#14–#22 纵向任务](waku-steward-orchestration-tickets.md)。本轮实现、公共组合流程、自动化检查及签名 Debug App 原生交互验收已通过。用户已明确授权验收后推送、关闭任务并更新安装 Waku Steward；Steward 已更新安装，#13–#22 已全部关闭。原版 Waku 的隔离保护继续有效。
 
 ## 检查边界
 
@@ -80,4 +80,12 @@ Waku 当前消息数增加不影响“原有 784 条均保留且未修改”的�
 - 最终任务 `e7fc2f0f-b46e-4324-8bf3-6ccab53e7da0` 完成两项依赖子任务的固定提交验收、整合和交付，交付提交为 `3fabaa2877b89010c7cc628c24dfa515316d83a9`。`ui-delivery-evidence.json` 记录 `accepted.txt` 精确为 `DIRECTION_UI_ACCEPTED\n`，`dependent.txt` 精确为 `Dependent acceptance passed\n`，父任务最终为 `idle`，历史保存游标追平运行游标。
 - 成果 popover 经原生 Home/End 展示依赖提交、验收证据及全部 `Removed` 清理状态；清理后消息与成果历史仍可查看。该成功任务独立于首次辅助脚本失败实验。
 
-实施与验收完成；Issue 关闭、Steward 安装及安装后历史保护核验的执行结果待补记。
+## 本机安装验证
+
+2026-09-07，`CARGO_BUILD_JOBS=2 sh scripts/bundle.sh steward` 完成优化构建。Apple 时间戳服务首次暂时失败，幂等重试后 App、daemon、REPL、helper、Sparkle 的完整签名验证通过。包身份为 `sh.waku.steward`，更新源已移除。
+
+正常退出旧 Steward 后，将已验证包安装至 `/Applications/Waku Steward.app`。后台启动、显示既有历史、正常 Cmd+Q 退出和再次后台启动全部通过，自有 daemon 随退出结束。安装后二进制摘要与候选包一致；4 个既有会话、146 条消息以及轮次、转录记录未缺失或修改。原版 Waku 的 39 个基线会话及 860 条消息保留，安装文件摘要不变；核对时共有 862 条消息，新增内容不归因为本次操作。
+
+一致性 SQLite 备份、安装基线及检查结果保存于证据目录的 `install-20260907/`；构建与签名日志为 `steward-build-final-20260907.log`、`steward-final-verification-20260907.log`。可重复安装包为 `~/Downloads/Waku-Steward-2026-09-07-orchestration.zip`。使用本机 Apple Development 证书签名，未做面向其他设备分发的公证。
+
+本轮临时实现分支及工作树已清理。三个原生 UI 测试仓库均仅保留原检出和证据；测试 provider 设置已恢复，测试进程已结束。

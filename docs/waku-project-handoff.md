@@ -4,11 +4,11 @@
 
 ## 当前扩展与交付边界
 
-2026-09-07，管家协作扩展已按 [Issue #13](https://github.com/kassol/waku/issues/13) 的[协作规格](waku-steward-orchestration-spec.md)实现可靠 steer/反馈排队、独立即时交流、动态分工与任务集成分支、安全清理。`c431614` 的 Rust 全量 985 项通过、29 项忽略、0 失败，共享客户端 46 项及三端类型检查通过。9 张纵向任务 #14–#22 的公共组合流程和签名 Debug App 原生交互验收完成，任务待关闭；见[任务清单](waku-steward-orchestration-tickets.md)和[本轮验收记录](waku-steward-orchestration-acceptance.md)。原生复核覆盖真实 Claude 只读长答复、讨论前后父子快照不变、对话框键盘循环、明确指令原文与接收回执，以及两项依赖成果整合交付、清理状态和保留历史。
+2026-09-07，管家协作扩展已按 [Issue #13](https://github.com/kassol/waku/issues/13) 的[协作规格](waku-steward-orchestration-spec.md)实现可靠 steer/反馈排队、独立即时交流、动态分工与任务集成分支、安全清理。`c431614` 的 Rust 全量 985 项通过、29 项忽略、0 失败，共享客户端 46 项及三端类型检查通过。9 张纵向任务 #14–#22 的公共组合流程和签名 Debug App 原生交互验收完成，#13–#22 已关闭；见[任务清单](waku-steward-orchestration-tickets.md)和[本轮验收记录](waku-steward-orchestration-acceptance.md)。原生复核覆盖真实 Claude 只读长答复、讨论前后父子快照不变、对话框键盘循环、明确指令原文与接收回执，以及两项依赖成果整合交付、清理状态和保留历史。
 
 用户已批准新增 `waku_wait`，详见[管家等待与完成通知](waku-steward-wait.md)。一期六工具验收仍为历史基线。管家登记持久等待后结束当前轮；父轮成功结束且子轮次可处理时，由 daemon 的事件回调自动开启一次通知轮。即时交流查询保留等待。经可靠输入提交的用户 steer 在受理或待核实时暂停旧等待回调，接收确认后撤销同轮旧等待，明确失败允许旧等待继续；新计划按需登记新等待。普通新轮输入、取消及父轮失败或中断继续遵循原有撤销边界。
 
-用户已明确授权验收后推送、关闭任务并更新安装 `Waku Steward.app`，此前暂缓替换的边界已更新。当前 Steward 待安装；安装后须补记签名、启动与既有历史保护核验。原版 `Waku.app` 继续保持隔离，不得替换或修改。以下历史构建、安装与验收记录不代表本次扩展的安装状态。
+用户已明确授权验收后推送、关闭任务并更新安装 `Waku Steward.app`，此前暂缓替换的边界已更新。Steward 已更新安装至 `/Applications/Waku Steward.app`，签名、后台启动、正常退出及重开验证通过；4 个既有会话、146 条消息和轮次完整保留。可重复安装包为 `~/Downloads/Waku-Steward-2026-09-07-orchestration.zip`。原版 `Waku.app` 继续保持隔离，不得替换或修改。以下历史构建、安装与验收记录不代表本次扩展的安装状态。
 
 ## 已有资料（引用，不重做）
 
