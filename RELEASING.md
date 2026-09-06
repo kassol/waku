@@ -270,14 +270,9 @@ secrets first:
   at the DMG.
 - **Debug builds never update themselves.** `Updater::init` returns `None`
   under `debug_assertions`, so the dev watcher's app can't offer to replace
-  itself with a production Waku. Set `WAKU_FORCE_UPDATER=1` to exercise the
-  real Sparkle flow from a debug bundle anyway. A bare `cargo run` binary has
-  no embedded framework and also degrades to no updater. For UI-only testing,
-  start the watcher with `WAKU_PREVIEW_UPDATE=1`; the sidebar immediately
-  shows an available update and clicking it changes to the spinner without
-  installing anything. The preview flag fakes only that sidebar result;
-  **Check for Updates…** still uses the embedded Sparkle framework and its
-  real standard window.
+  itself with a production Waku. macOS Debug ignores `WAKU_FORCE_UPDATER`
+  and `WAKU_PREVIEW_UPDATE`. A bare `cargo run` binary has no embedded
+  framework and also degrades to no updater.
 - **Automatic and explicit checks have separate presentation.** Scheduled
   checks stay silent until the sidebar update button appears. Choosing
   **Check for Updates…** promotes an existing silent result into Sparkle's

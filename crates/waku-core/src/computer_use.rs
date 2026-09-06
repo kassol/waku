@@ -265,10 +265,19 @@ pub fn pi_extension_path() -> anyhow::Result<PathBuf> {
 /// helper its own TCC identity while the signed app bundle remains the source
 /// shipped with Waku.
 fn install_helper_app(source: &Path) -> anyhow::Result<PathBuf> {
-    let application_support =
-        dirs::data_dir().ok_or_else(|| anyhow!("Application Support directory is unavailable"))?;
-    let install_root = application_support.join("Waku").join("Computer Use");
-    crate::fs_ext::create_private_dir_all(&install_root)
+    let install_root = if cfg!(debug_assertions) {
+        crate::identity::configuration_directory().join("Computer Use")
+    } else {
+        dirs::data_dir()
+            .ok_or_else(|| anyhow!("Application Support directory is unavailable"))?
+            .join("Waku")
+            .join("Computer Use")
+    };
+    install_helper_app_at(source, &install_root)
+}
+
+fn install_helper_app_at(source: &Path, install_root: &Path) -> anyhow::Result<PathBuf> {
+    crate::fs_ext::create_private_dir_all(install_root)
         .with_context(|| format!("could not create {}", install_root.display()))?;
     let bundle_name = source
         .file_name()
@@ -361,6 +370,43 @@ fn host_executable_path() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_helper_install_and_replace_leave_original_sentinel_unchanged() {
+        let temporary =
+            std::env::temp_dir().join(format!("waku-helper-isolation-{}", Uuid::new_v4()));
+        let name = format!("Waku Debug Test {}.app", Uuid::new_v4());
+        let source = temporary.join("test").join(&name);
+        let original = temporary.join("original").join(&name);
+        let fingerprint = "Contents/Resources/.waku-helper-fingerprint";
+        fs::create_dir_all(source.join("Contents/Resources")).unwrap();
+        fs::create_dir_all(original.join("Contents/Resources")).unwrap();
+        fs::write(original.join(fingerprint), "original").unwrap();
+        fs::write(source.join(fingerprint), "test-v1").unwrap();
+        let install_root = temporary.join("installed");
+        let installed = install_helper_app_at(&source, &install_root).unwrap();
+        assert_eq!(installed, install_root.join(&name));
+        assert_eq!(
+            fs::read_to_string(installed.join(fingerprint)).unwrap(),
+            "test-v1"
+        );
+        fs::write(source.join(fingerprint), "test-v2").unwrap();
+        assert_eq!(
+            install_helper_app_at(&source, &install_root).unwrap(),
+            installed
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join(fingerprint)).unwrap(),
+            "test-v2"
+        );
+        assert_eq!(
+            fs::read_to_string(original.join(fingerprint)).unwrap(),
+            "original"
+        );
+        fs::remove_dir_all(installed).unwrap();
+        fs::remove_dir_all(temporary).unwrap();
+    }
 
     #[test]
     fn app_grants_preserve_bundle_identity() {

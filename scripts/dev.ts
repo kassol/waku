@@ -3,10 +3,10 @@
 import { $ } from "bun";
 import { watch, type FSWatcher } from "node:fs";
 import { join, resolve } from "node:path";
+import { launchDevelopmentApp, stopDevelopmentApp } from "./dev-process";
 
 const root = resolve(import.meta.dir, "..");
 const isMacOS = process.platform === "darwin";
-const appName = "Waku Debug";
 const targetDir = resolve(root, process.env.CARGO_TARGET_DIR || "target");
 const executableSuffix = process.platform === "win32" ? ".exe" : "";
 const appPath = isMacOS
@@ -32,7 +32,7 @@ type HyprlandContext = {
 
 $.cwd(root);
 
-let app: ReturnType<typeof Bun.spawn> | undefined;
+let app: ReturnType<typeof launchDevelopmentApp> | undefined;
 let stopping = false;
 let building = false;
 let queuedBuild: BuildTarget | undefined;
@@ -334,25 +334,12 @@ async function buildDaemon(): Promise<boolean> {
 async function stopApp(): Promise<void> {
   const waiter = app;
   app = undefined;
-  if (isMacOS) {
-    await $`pkill -TERM -x ${appName}`.quiet().nothrow();
-  } else if (waiter?.exitCode === null) {
-    waiter.kill("SIGTERM");
-  }
-  if (waiter?.exitCode === null) {
-    await waiter.exited;
-  }
+  await stopDevelopmentApp(waiter);
 }
 
-function launchApp(): ReturnType<typeof Bun.spawn> {
+function launchApp(): ReturnType<typeof launchDevelopmentApp> {
   console.log(`[waku-dev] Launching ${appPath}`);
-  const command = isMacOS ? ["open", "-n", "-W", appPath] : [appPath];
-  const launchedApp = Bun.spawn(command, {
-    cwd: root,
-    env: { ...process.env, WAKU_DAEMON_PATH: daemonPath },
-    stdout: "inherit",
-    stderr: "inherit",
-  });
+  const launchedApp = launchDevelopmentApp(appPath, daemonPath, root);
   void launchedApp.exited.then(async (exitCode) => {
     if (stopping || app !== launchedApp) return;
     app = undefined;

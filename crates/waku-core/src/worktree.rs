@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use anyhow::{Context as _, anyhow, bail};
+use anyhow::{Context as _, bail};
 use uuid::Uuid;
 
 const DEFAULT_SLUG: &str = "new-worktree";
@@ -24,9 +24,7 @@ pub fn create(
     prompt: &str,
     base_branch: Option<&str>,
 ) -> anyhow::Result<CreatedWorktree> {
-    let root = dirs::home_dir()
-        .ok_or_else(|| anyhow!("could not locate the home directory for ~/.waku/worktrees"))?
-        .join(".waku/worktrees");
+    let root = crate::identity::configuration_directory().join("worktrees");
     create_in(
         project_path,
         &root,

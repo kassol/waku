@@ -6,7 +6,9 @@ use std::sync::{OnceLock, RwLock};
 fn workspace_root_slot() -> &'static RwLock<Option<PathBuf>> {
     static ROOT: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
     ROOT.get_or_init(|| {
-        RwLock::new(dirs::home_dir().map(|home| home.join(".waku").join("projects")))
+        RwLock::new(Some(
+            crate::identity::configuration_directory().join("projects"),
+        ))
     })
 }
 
@@ -22,7 +24,11 @@ pub fn workspace_root() -> Option<PathBuf> {
 
 pub fn home_directory() -> Option<PathBuf> {
     let root = workspace_root()?;
-    root.parent()?.parent().map(Path::to_path_buf)
+    let configuration = root.parent()?;
+    if configuration.file_name()? != ".waku" {
+        return None;
+    }
+    configuration.parent().map(Path::to_path_buf)
 }
 
 pub fn is_projectless_path(path: &Path) -> bool {

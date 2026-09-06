@@ -7,10 +7,7 @@
 //! layout; package-manager-owned builds continue to defer to their manager.
 //!
 //! Debug builds stay dormant so the dev watcher's app never offers to replace
-//! itself with a production build. `WAKU_PREVIEW_UPDATE=1` fakes only the
-//! automatic sidebar result while retaining the real Sparkle flow for the
-//! Check for Updates menu; `WAKU_FORCE_UPDATER=1` exercises everything for
-//! real from a debug bundle.
+//! itself with a production build. macOS Debug ignores updater overrides.
 
 use gpui::Global;
 
@@ -582,15 +579,14 @@ mod macos {
 
     impl Updater {
         /// Load Sparkle and start its updater. Returns `None` when this build
-        /// cannot update itself: debug builds unless forced, and binaries
+        /// cannot update itself: debug builds, and binaries
         /// running outside a bundle with an embedded framework.
         pub fn init() -> Option<Self> {
-            let preview = cfg!(debug_assertions)
-                && std::env::var_os("WAKU_PREVIEW_UPDATE").is_some_and(|value| value == "1");
-            let forced = std::env::var_os("WAKU_FORCE_UPDATER").is_some_and(|value| value == "1");
-            if cfg!(debug_assertions) && !forced && !preview {
+            // Debug must never install an upstream release over the test bundle.
+            if cfg!(debug_assertions) {
                 return None;
             }
+            let preview = false;
 
             let mtm = MainThreadMarker::new()?;
             let library = sparkle_library_path()?;

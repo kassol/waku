@@ -1,14 +1,14 @@
 # Waku 正式仓库交接
 
-日期：2026-09-06。当前项目已接续交接，一期规格及 11 张实施任务已发布，尚未开始实现。本文为当前入口；原始交接与设计稿中的历史状态以本文为准。
+日期：2026-09-06。当前项目已接续交接，一期规格及 11 张实施任务已发布，已完成 #2 隔离任务，继续按依赖实现后续任务。本文为当前入口；原始交接与设计稿中的历史状态以本文为准。
 
 ## 已有资料（引用，不重做）
 
 - 原始设计交接：[原始设计交接](waku-steward-handoff.md)。
 - 设计 v2：[设计 v2](waku-steward-design.md)。
 - 当前一期澄清：[澄清记录](waku-steward-scope.md)，包含逐项已确认决策、ADR 与当前源码证据。
-- 已发布规格：[GitHub Issue #1](https://github.com/kassol/waku/issues/1)；仓库副本见[一期规格](waku-steward-spec.md)。规格和测试边界已确认，尚未实施。
-- 已发布任务：[11 张纵向任务清单](waku-steward-tickets.md)，对应 GitHub #2–#12，具备原生阻塞关系。首张无任务阻塞的票为 [#2 测试 App 独立启动与资源隔离](https://github.com/kassol/waku/issues/2)。
+- 已发布规格：[GitHub Issue #1](https://github.com/kassol/waku/issues/1)；仓库副本见[一期规格](waku-steward-spec.md)。规格和测试边界已确认；本轮已获实现授权。
+- 已发布任务：[11 张纵向任务清单](waku-steward-tickets.md)，对应 GitHub #2–#12，具备原生阻塞关系。已完成 [#2 测试 App 独立启动与资源隔离](https://github.com/kassol/waku/issues/2)，下一张为 [#3 历史持久化](https://github.com/kassol/waku/issues/3)。
 - 先读上述文件，再读取正式仓库及其父目录适用的 `AGENTS.md` / `CONTEXT.md`。迁移前已读取正式仓库根规范，并检查测试 App 隔离相关源码；期 1 源码复核仍待执行。
 
 ## 建仓时的核验记录（2026-09-06）
@@ -22,13 +22,13 @@
 
 ## 用户明确约束
 
-- **测试 App 必须与已安装的原版 Waku 隔离**（2026-09-06 新增）：不得覆盖、退出、升级或修改原版 App，不得写入原版配置、数据库、会话及工作目录，不得连接或控制原版 daemon。测试使用独立应用标识、数据目录、daemon 与测试工作区；首次启动前完成隔离核查。当前仅检查源码，尚未完成隔离实现或运行验证。Debug 已有独立应用标识与数据库路径，但 daemon 配置默认路径仍为 `~/.waku/settings.json`（`crates/waku-protocol/src/settings.rs` 的 `DaemonSettings::default_path`），`worktree::create` 仍使用 `~/.waku/worktrees`，`src/daemon.rs` 还支持通过环境变量连接外部 daemon。首次启动前需核查并补齐这些隔离边界。此约束不改变暂缓工具链安装与功能实现的状态。
+- **测试 App 必须与已安装的原版 Waku 隔离**（2026-09-06 新增）：不得覆盖、退出、升级或修改原版 App，不得写入原版配置、数据库、会话及工作目录，不得连接或控制原版 daemon。测试使用独立应用标识、数据目录、daemon 与测试工作区；首次启动前完成隔离核查。本轮源码已将 Debug daemon 设置、projectless/worktree 与辅助程序放入 checkout 的 `temp/`，沿用独立数据库、缓存及应用身份。Debug 启动只使用自有 daemon，watcher 验证 `sh.waku.dev` 身份并按进程句柄停止；Debug 自动更新关闭。launcher、辅助程序、真实 daemon 保存/重开/停止及路径隔离回归通过；`cargo check --workspace` 和 watcher 构建通过，签名 App 已启动，原版进程 PID 和核对文件摘要保持不变。#2 已验收。
 - **只做单向同步**：仅从 `egoist/waku` 拉取并同步更新；开发提交只推送 `kassol/waku`。禁止向上游推送代码、创建 PR、Issue、评论或发送其他内容。
 - 测试隔离的明确例外：用户允许共用原生 Claude/Codex 配置和会话目录，测试产生的原生会话可与现有环境共存；具体边界见 [ADR-0004](adr/0004-isolate-waku-and-share-native-harness-config.md)。
 - **按产品方向融合上游**：逐项评估上游变更，选择采纳、适配、跳过或延期。每轮记录完整上游 SHA 与处理结论；流程和增量基线统一维护在[上游同步记录](upstream-sync.md)。
 - 该约束已保存到 Nowledge Mem：`65a49358-e7c5-428f-aad8-4d1b4f61f145`。
 - 当前仅记录了操作约束；未配置 upstream 的技术性推送禁用措施，Git remote 仍显示其正常 push URL。
-- 延续原先暂缓安装 Rust、暂未实现的状态。此次 fork、clone 与 handoff 不代表授权开始功能实现或安装工具链。
+- 2026-09-06 用户已授权使用 Homebrew 安装工具链，当前已安装 Rust 1.98.0（Cargo、rustfmt、Clippy），已有 Bun 1.4.2。随后用户明确授权通过 subagents 完成全部 Issue 并进行隔离端到端验证。先前暂缓安装与实现的记录仅描述历史状态。
 - 中文简洁回复。遵循当前会话实际加载的用户规范及项目规范；原交接中观察到的偏好不能覆盖现行指令。
 
 ## 建议的下一步及授权边界
@@ -37,10 +37,10 @@
 
 1. 工程技能配置已完成：任务使用 `kassol/waku` GitHub Issues，保留默认 triage 标签，领域文档采用单一上下文；配置见 `docs/agents/`，无需重复初始化。
 2. 一期规格和任务已发布，实施以对应 Issue 和 ADR 为准；新增范围或对外行为决策仍需用户确认。
-3. 从 #2 的测试隔离与构建基线开始，按依赖推进到 Claude 管家创建 Codex 子会话、查询完成状态和读取结果。仅发布任务不解除暂缓安装工具链和功能实现的约束。
-4. 后续实现逐票完成必要回归检查与 Standards / Spec 两轴评审。
+3. 隔离与构建基线已通过；从 #3 历史持久化开始，按依赖推进到 Claude 管家创建 Codex 子会话、查询完成状态和读取结果。本轮授权已覆盖安装、实现与隔离验证；完成构建及隔离检查后方可启动测试 App。
+4. 后续实现逐票完成必要回归检查与 Standards / Spec 两轴评审，凭实际验收证据关闭对应 Issue。
 
-以下建仓时疑点已在本轮澄清中处理，详细决策和源码证据见[一期澄清记录](waku-steward-scope.md)，实现仍未开始：
+以下建仓时疑点已在本轮澄清中处理，详细决策和源码证据见[一期澄清记录](waku-steward-scope.md)；隔离任务已完成，以下功能仍待后续任务验证：
 
 - 用户确认历史保留、持久化失败停止、异常退出仅保证已确认保存的数据。
 - 一期六个会话工具，观测 B/C/D 沿用四至六期。
@@ -57,3 +57,9 @@
 - `implement` / `tdd` / `code-review`：开始实现后使用，本次交接不自动开启实现。
 
 Matt 流程产生仓库产物时，遵循用户的独立提交及默认 push 约定；push 目标只能是 origin，并先检查就近项目规范。交接与设计现已迁入 `docs/`，后续在项目内维护；迁移本身不代表授权开始功能实现。
+
+## 当前验证基线
+
+- 2026-09-06：隔离 Debug App 由唯一 `bun ./scripts/dev.ts` watcher 构建和启动；签名验证通过，身份 `sh.waku.dev`。
+- Rust 隔离回归及共享 TypeScript 客户端类型检查、22 项测试通过。
+- Rust 1.98 的全仓格式检查存在既有差异；在临时目录提取未修改 HEAD 后复核，输出与当前工作区完全一致。本票未重排无关代码。

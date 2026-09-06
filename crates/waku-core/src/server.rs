@@ -1191,6 +1191,135 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn isolated_daemon_saves_reopens_and_stops_without_touching_original_resources() {
+        let root = std::env::temp_dir().join(format!("waku-daemon-isolation-{}", Uuid::new_v4()));
+        let test_root = root.join("test");
+        let original_root = root.join("original");
+        std::fs::create_dir_all(&test_root).unwrap();
+        std::fs::create_dir_all(&original_root).unwrap();
+        let original_settings = original_root.join("settings.json");
+        let original_database = original_root.join("app.db");
+        std::fs::write(&original_settings, "original settings").unwrap();
+        std::fs::write(&original_database, "original database").unwrap();
+        let mut original_process = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let project = Project::from_path(test_root.join("workspace"));
+            std::fs::create_dir_all(&project.path).unwrap();
+            let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+            session.title = "isolated saved session".into();
+            session.begin_turn("isolated input");
+            for first_start in [true, false] {
+                let backend = WakuBackend::new(
+                    DaemonSettingsStore::open(test_root.join("settings.json")).unwrap(),
+                    StateStore::daemon(test_root.join("app.db")),
+                )
+                .unwrap();
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let server_shutdown = shutdown.clone();
+                let server = std::thread::spawn(move || {
+                    serve(
+                        listener,
+                        "isolated-secret".into(),
+                        Arc::new(backend),
+                        server_shutdown,
+                        ServerOptions {
+                            allow_shutdown: true,
+                            ..ServerOptions::default()
+                        },
+                    )
+                    .unwrap()
+                });
+                let round_trip = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let client =
+                        DaemonClient::connect(&address.to_string(), "isolated-secret".into())
+                            .unwrap();
+                    if first_start {
+                        assert!(matches!(
+                            client
+                                .request(
+                                    Uuid::nil(),
+                                    Uuid::nil(),
+                                    Command::SaveTaskState {
+                                        projects: vec![project.clone()],
+                                        live_session_ids: vec![session.id],
+                                        sessions: vec![session.clone()],
+                                    }
+                                )
+                                .unwrap(),
+                            ResponsePayload::TaskStateSaved { .. }
+                        ));
+                        client
+                            .request(
+                                Uuid::nil(),
+                                Uuid::nil(),
+                                Command::UpdateSettings {
+                                    settings: DaemonSettings {
+                                        disabled_providers: vec![ProviderKind::Pi],
+                                        ..DaemonSettings::default()
+                                    },
+                                },
+                            )
+                            .unwrap();
+                    }
+                    let ResponsePayload::Session {
+                        session: Some(saved),
+                    } = client
+                        .request(
+                            session.id,
+                            Uuid::nil(),
+                            Command::HydrateSession {
+                                session_id: session.id,
+                            },
+                        )
+                        .unwrap()
+                    else {
+                        panic!("saved session must remain readable");
+                    };
+                    assert_eq!(saved.title, "isolated saved session");
+                    assert_eq!(
+                        serde_json::to_value(&saved.messages).unwrap(),
+                        serde_json::to_value(&session.messages).unwrap()
+                    );
+                    let ResponsePayload::Settings { settings } = client
+                        .request(Uuid::nil(), Uuid::nil(), Command::GetSettings)
+                        .unwrap()
+                    else {
+                        panic!("expected daemon settings");
+                    };
+                    assert_eq!(settings.disabled_providers, [ProviderKind::Pi]);
+                    client.shutdown();
+                }));
+                shutdown.store(true, Ordering::Release);
+                server.join().unwrap();
+                if let Err(error) = round_trip {
+                    std::panic::resume_unwind(error);
+                }
+                assert!(original_process.try_wait().unwrap().is_none());
+                assert_eq!(
+                    std::fs::read_to_string(&original_settings).unwrap(),
+                    "original settings"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&original_database).unwrap(),
+                    "original database"
+                );
+            }
+        }));
+        let _ = original_process.kill();
+        original_process.wait().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stale_projection_cannot_resurrect_a_removed_session() {
         let root = std::env::temp_dir().join(format!("waku-remove-race-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
