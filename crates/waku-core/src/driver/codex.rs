@@ -853,25 +853,25 @@ impl CodexDriver {
         thread::Builder::new()
             .name("waku-codex-process".into())
             .spawn(move || {
-                let status = child.wait();
-                let _ = reader_thread.join();
-                let _ = stderr_thread.join();
-                match status {
-                    Ok(status) if !status.success() && last_visible_stderr.lock().is_none() => {
-                        let _ = events.send(DriverEvent::Error(tr!(
-                            "errors.provider_exited",
-                            provider = "Codex app-server",
-                            status = status
-                        )));
-                    }
+                let status = match child.wait() {
+                    Ok(status) => status,
                     Err(error) => {
                         let _ = events.send(DriverEvent::Error(tr!(
                             "errors.read_provider_exit_status",
                             provider = "Codex app-server",
                             error = error
                         )));
+                        return;
                     }
-                    _ => {}
+                };
+                let _ = reader_thread.join();
+                let _ = stderr_thread.join();
+                if !status.success() && last_visible_stderr.lock().is_none() {
+                    let _ = events.send(DriverEvent::Error(tr!(
+                        "errors.provider_exited",
+                        provider = "Codex app-server",
+                        status = status
+                    )));
                 }
                 let _ = events.send(DriverEvent::ProcessExited);
             })?;

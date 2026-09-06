@@ -172,7 +172,10 @@ fn with_creation_daemon(
             "fixture".into(),
             service,
             stop,
-            ServerOptions::default(),
+            ServerOptions {
+                allow_shutdown: true,
+                ..ServerOptions::default()
+            },
         )
         .unwrap()
     });
@@ -715,5 +718,242 @@ fn concurrent_creation_retransmissions_share_one_child_and_the_same_response() {
                 .count(),
             1
         );
+    });
+}
+
+#[test]
+fn owned_shutdown_waits_for_child_creation_then_drains_its_saved_runtime() {
+    with_creation_daemon(|client, observer, root, project_path, _address| {
+        let project = Project::from_path(project_path.to_owned());
+        let mut parent = AgentSession::new(project.id, ProviderKind::Codex);
+        parent.runtime_mode = RuntimeMode::Ask;
+        parent.begin_turn("Delegate");
+        let parent_id = parent.id;
+        client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project],
+                    live_session_ids: vec![parent_id],
+                    sessions: vec![parent],
+                },
+            )
+            .unwrap();
+        let create = |prompt: &str| Command::CreateSession {
+            provider: ProviderKind::Codex,
+            prompt: prompt.into(),
+            model: None,
+            title: None,
+            runtime_mode: None,
+        };
+        let creation = std::thread::spawn(move || {
+            observer.request(parent_id, Uuid::nil(), create("hold fixture turn"))
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (child_id, path) = loop {
+            let store = StateStore::daemon(root.join("app.db"));
+            let mut state = store.load().unwrap();
+            if let Some(child) = state
+                .sessions
+                .iter_mut()
+                .find(|session| session.parent_session_id == Some(parent_id))
+            {
+                store.hydrate(child).unwrap();
+                if let crate::model::SessionWorkspace::Worktree { path, .. } = &child.workspace {
+                    if path.join("creation-waiting").exists() {
+                        break (child.id, path.clone());
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "provider never reached the controlled wait"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let exiting_client = client.clone();
+        let exiting = std::thread::spawn(move || {
+            exiting_client.request(Uuid::nil(), Uuid::nil(), Command::PrepareShutdown)
+        });
+        // An empty prompt has no side effects if it arrives before the exit
+        // worker. Its error changes once the daemon has closed the work gate.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let error = client
+                .request(parent_id, Uuid::nil(), create(""))
+                .unwrap_err();
+            if error.to_string().contains("shutting down") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exit never rejected new work: {error:#}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !exiting.is_finished(),
+            "safe exit must wait for the accepted creation"
+        );
+        assert!(
+            !creation.is_finished(),
+            "the provider has not accepted the first prompt yet"
+        );
+        let rejected = client
+            .request(parent_id, Uuid::nil(), create("write fixture result"))
+            .unwrap_err();
+        assert!(rejected.to_string().contains("shutting down"));
+        std::fs::write(path.join("creation-release"), "continue").unwrap();
+        let ResponsePayload::SessionCreated {
+            session,
+            runtime_id,
+            ..
+        } = creation.join().unwrap().unwrap()
+        else {
+            panic!("missing creation result")
+        };
+        assert_eq!(session.id, child_id);
+        assert!(matches!(
+            exiting.join().unwrap().unwrap(),
+            ResponsePayload::Ack
+        ));
+        assert!(matches!(
+            client
+                .request(child_id, Uuid::nil(), Command::AttachSession)
+                .unwrap(),
+            ResponsePayload::SessionRuntime {
+                runtime_id: None,
+                ..
+            }
+        ));
+        let store = StateStore::daemon(root.join("app.db"));
+        let mut state = store.load().unwrap();
+        assert_eq!(
+            state
+                .sessions
+                .iter()
+                .filter(|session| session.parent_session_id == Some(parent_id))
+                .count(),
+            1
+        );
+        let child = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == child_id)
+            .unwrap();
+        store.hydrate(child).unwrap();
+        assert_eq!(child.messages[0].content, "hold fixture turn");
+        assert!(child.active_turn_id().is_none());
+        assert_eq!(child.history_save_error, None);
+        let saved = child
+            .history_saved_cursor
+            .expect("exit acknowledges durable history");
+        assert_eq!(Some(saved), child.runtime_event_cursor);
+        assert_eq!(saved.runtime_id, runtime_id);
+        let ResponsePayload::EventReplay { events } = client
+            .request(
+                child_id,
+                runtime_id,
+                Command::ReplayEvents {
+                    cursor: ReplayCursor {
+                        session_id: child_id,
+                        runtime_id,
+                        epoch: saved.epoch,
+                        sequence: 0,
+                    },
+                },
+            )
+            .unwrap()
+        else {
+            panic!("missing durable replay")
+        };
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event.kind == "processExited")
+        );
+        assert_eq!(events.last().unwrap().sequence, saved.sequence);
+        assert_eq!(
+            std::fs::read_to_string(path.join("child-calls.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
+fn failed_initial_child_save_disables_new_creation_before_provider_start() {
+    with_creation_daemon(|client, _observer, root, project_path, _address| {
+        let project = Project::from_path(project_path.to_owned());
+        let project_id = project.id;
+        let mut parent = AgentSession::new(project_id, ProviderKind::Codex);
+        parent.runtime_mode = RuntimeMode::Ask;
+        parent.begin_turn("Delegate");
+        let parent_id = parent.id;
+        client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project],
+                    live_session_ids: vec![parent_id],
+                    sessions: vec![parent],
+                },
+            )
+            .unwrap();
+        let connection = rusqlite::Connection::open(root.join("app.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_child_save BEFORE INSERT ON sessions
+             WHEN NEW.parent_session_id IS NOT NULL
+             BEGIN SELECT RAISE(FAIL, 'fixture child save failure'); END;",
+            )
+            .unwrap();
+        let create = || Command::CreateSession {
+            provider: ProviderKind::Codex,
+            prompt: "write fixture result".into(),
+            model: None,
+            title: None,
+            runtime_mode: None,
+        };
+        let failed_save = client
+            .request(parent_id, Uuid::nil(), create())
+            .unwrap_err();
+        assert!(
+            failed_save.to_string().contains("could not save child"),
+            "{failed_save:#}"
+        );
+        connection
+            .execute_batch("DROP TRIGGER reject_child_save;")
+            .unwrap();
+        let rejected = client
+            .request(parent_id, Uuid::nil(), create())
+            .unwrap_err();
+        assert!(
+            rejected
+                .to_string()
+                .contains("history saving failed; new work is disabled"),
+            "{rejected:#}"
+        );
+        let state = StateStore::daemon(root.join("app.db")).load().unwrap();
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].id, parent_id);
+        let worktrees = std::fs::read_dir(root.join("worktrees").join(project_id.to_string()))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            worktrees.len(),
+            1,
+            "failed save retains its directory; retry allocates nothing"
+        );
+        assert!(
+            !worktrees[0].join("child-calls.jsonl").exists(),
+            "no provider prompt may run after the failed initial save"
+        );
+        assert!(!worktrees[0].join("child-result.txt").exists());
     });
 }

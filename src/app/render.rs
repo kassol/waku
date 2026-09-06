@@ -268,6 +268,16 @@ impl Render for Waku {
         // whether each native browser webview belongs on screen this frame —
         // it floats above everything GPUI paints.
         self.sync_browser_webviews(cx);
+        if self.quit_in_progress {
+            let content = div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(tr!("session.safe_exit_pending"))
+                .into_any_element();
+            return self.render_window_frame(content, window, cx);
+        }
         if self.fps_counter_visible {
             self.tick_fps(window);
         }

@@ -9,10 +9,11 @@ use crate::{
     WorkspaceResult,
 };
 use anyhow::{Context as _, anyhow, bail};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 use crate::attachments::AttachmentStore;
@@ -28,8 +29,13 @@ use waku_protocol::provider_session::{ProviderSessionFork, ProviderSessionForkRe
 
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
+    work_gate: RwLock<()>,
+    quitting: AtomicBool,
+    saving_failed: AtomicBool,
+    failed_sessions: Mutex<HashSet<Uuid>>,
     terminals: Mutex<HashMap<Uuid, (Uuid, crate::terminal::DaemonTerminal)>>,
-    forwarders: Mutex<HashMap<Uuid, (Uuid, std::thread::JoinHandle<()>)>>,
+    forwarders: Mutex<HashMap<Uuid, (Uuid, std::thread::JoinHandle<bool>)>>,
+    unconfirmed_exits: Mutex<HashMap<Uuid, Uuid>>,
     settings: DaemonSettingsStore,
     task_store: StateStore,
     task_state: Mutex<PersistedState>,
@@ -50,6 +56,42 @@ impl WakuBackend {
             .load()
             .context("could not load Waku task database")?;
         migrate_projectless_state(&task_store, &mut task_state)?;
+        // This daemon owns no provider processes yet. Never resume a saved
+        // approval or replay a prompt after an unclean process exit.
+        let mut recovered = false;
+        for index in 0..task_state.sessions.len() {
+            // Idle is the reducer's closed-turn state. Keep its historical
+            // transcript lazy; a failed startup can still have an open turn.
+            if task_state.sessions[index].status == SessionStatus::Idle {
+                continue;
+            }
+            task_store.hydrate(&mut task_state.sessions[index])?;
+            let session = &mut task_state.sessions[index];
+            if session.status.is_busy()
+                || session.active_turn_id().is_some()
+                || session.pending_permission.is_some()
+                || session.pending_user_input.is_some()
+            {
+                session.finish_active_turn(crate::model::TurnStatus::Interrupted);
+                session.status = SessionStatus::Idle;
+                session.pending_permission = None;
+                session.pending_user_input = None;
+                for message in &mut session.messages {
+                    message.streaming = false;
+                }
+                for block in &mut session.transcript_blocks {
+                    for activity in &mut block.activities {
+                        activity.complete = true;
+                    }
+                }
+                let id = session.id;
+                task_state.mark_session_dirty(id);
+                recovered = true;
+            }
+        }
+        if recovered {
+            task_store.save(&mut task_state)?;
+        }
         let composer_drafts = ComposerDraftStore::for_state_path(task_store.path());
         let attachments = AttachmentStore::new(
             task_store
@@ -65,7 +107,12 @@ impl WakuBackend {
             .to_owned();
         Ok(Self {
             sessions: Mutex::new(HashMap::new()),
+            work_gate: RwLock::new(()),
+            quitting: AtomicBool::new(false),
+            saving_failed: AtomicBool::new(false),
+            failed_sessions: Mutex::new(HashSet::new()),
             forwarders: Mutex::new(HashMap::new()),
+            unconfirmed_exits: Mutex::new(HashMap::new()),
             history: Mutex::new(HashMap::new()),
             pending_history: Mutex::new(HashMap::new()),
             terminals: Mutex::new(HashMap::new()),
@@ -80,6 +127,18 @@ impl WakuBackend {
             usage_rates_dir,
             default_cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         })
+    }
+
+    pub(crate) fn ensure_accepting_work(&self) -> anyhow::Result<()> {
+        if self.saving_failed.load(Ordering::Acquire) {
+            bail!(
+                "history saving failed; new work is disabled until the daemon is safely restarted"
+            );
+        }
+        if self.quitting.load(Ordering::Acquire) {
+            bail!("Waku is shutting down and no longer accepts new work");
+        }
+        Ok(())
     }
 
     /// Stop the provider and wait until its final event has reached persistence.
@@ -107,10 +166,13 @@ impl WakuBackend {
                 None
             }
         };
-        if let Some((_, forwarder)) = forwarder {
-            forwarder
-                .join()
-                .map_err(|_| anyhow!("the provider event forwarder panicked"))?;
+        if let Some((id, forwarder)) = forwarder {
+            // A disconnected channel or a panicking forwarder does not prove
+            // that the provider exited. Keep that uncertainty across retries.
+            self.unconfirmed_exits.lock().insert(session_id, id);
+            if matches!(forwarder.join(), Ok(true)) {
+                self.unconfirmed_exits.lock().remove(&session_id);
+            }
         }
         let pending = self
             .pending_history
@@ -135,6 +197,14 @@ impl WakuBackend {
             .and_then(|session| session.history_save_error.as_ref())
         {
             bail!("could not save the stopped task: {error}");
+        }
+        if self
+            .unconfirmed_exits
+            .lock()
+            .get(&session_id)
+            .is_some_and(|id| runtime_id.is_none_or(|runtime| runtime == *id))
+        {
+            bail!("the provider exit could not be confirmed; normal exit remains blocked");
         }
         Ok(())
     }
@@ -295,6 +365,8 @@ impl Backend for WakuBackend {
         if let Err(error) = self.task_store.save_events(&mut state, pending) {
             state.sessions[index].history_saved_cursor = previous_saved;
             state.sessions[index].history_save_error = Some(error.to_string());
+            self.saving_failed.store(true, Ordering::Release);
+            self.failed_sessions.lock().insert(first.session_id);
             return Err(error.into());
         }
         pending.clear();
@@ -302,6 +374,122 @@ impl Backend for WakuBackend {
     }
 
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
+        if matches!(
+            request.command,
+            Command::PrepareShutdown | Command::ShutdownDaemon
+        ) {
+            self.quitting.store(true, Ordering::Release);
+            let _gate = self.work_gate.write();
+            let ids = self
+                .sessions
+                .lock()
+                .keys()
+                .copied()
+                .chain(
+                    self.pending_history
+                        .lock()
+                        .keys()
+                        .map(|(session, _)| *session),
+                )
+                .chain(self.unconfirmed_exits.lock().keys().copied())
+                .collect::<HashSet<_>>();
+            let mut failures = Vec::new();
+            for id in ids {
+                if let Err(error) = self.close_runtime(id, None) {
+                    failures.push(format!("{id}: {error:#}"));
+                }
+            }
+            // Every runtime is stopped even if one tail cannot be saved.
+            let terminals = std::mem::take(&mut *self.terminals.lock());
+            drop(terminals);
+            if !failures.is_empty() {
+                bail!(
+                    "unsaved history prevents safe exit: {}",
+                    failures.join("; ")
+                );
+            }
+            self.task_store.save(&mut self.task_state.lock())?;
+            return Ok(ResponsePayload::Ack);
+        }
+        let starts_work = matches!(
+            request.command,
+            Command::CreateSession { .. }
+                | Command::Start { .. }
+                | Command::Prompt { .. }
+                | Command::Steer { .. }
+                | Command::OpenTerminal { .. }
+                | Command::Goal { .. }
+                | Command::RunComputerTool { .. }
+                | Command::Fork { .. }
+                | Command::Rollback { .. }
+                | Command::ForkSessionFromResponse { .. }
+                | Command::ForkProviderSession { .. }
+                | Command::RewindSessionToMessage { .. }
+        );
+        if starts_work {
+            self.ensure_accepting_work()?;
+        }
+        let _gate = self.work_gate.read();
+        if starts_work {
+            self.ensure_accepting_work()?;
+        }
+        self.handle_accepted(request, events)
+    }
+
+    fn prepare_start(
+        &self,
+        session_id: Uuid,
+        options: &crate::WireDriverStartOptions,
+    ) -> anyhow::Result<()> {
+        let _gate = self.work_gate.read();
+        self.ensure_accepting_work()?;
+        validate_child_options(
+            &self.task_store,
+            &mut self.task_state.lock(),
+            session_id,
+            decode_enum(&options.provider)?,
+            decode_enum(&options.mode)?,
+        )?;
+        self.close_runtime(session_id, None)
+    }
+
+    fn stop_failed_work(&self) {
+        let _gate = self.work_gate.write();
+        let ids = self
+            .failed_sessions
+            .lock()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for id in ids {
+            if let Err(error) = self.close_runtime(id, None) {
+                eprintln!("stopped task {id} still has unsaved history: {error:#}");
+            }
+        }
+    }
+
+    fn shutdown(&self) {
+        self.quitting.store(true, Ordering::Release);
+        let _gate = self.work_gate.write();
+        let ids = self.sessions.lock().keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            if let Err(error) = self.close_runtime(id, None) {
+                eprintln!("daemon exit left unconfirmed history for {id}: {error:#}");
+            }
+        }
+        let terminals = std::mem::take(&mut *self.terminals.lock());
+        drop(terminals);
+    }
+}
+
+impl WakuBackend {
+    // The public entry holds the work gate once across the whole operation.
+    // Child startup reuses this body without recursively acquiring that lock.
+    fn handle_accepted(
+        &self,
+        request: Request,
+        events: EventSink,
+    ) -> anyhow::Result<ResponsePayload> {
         let session_id = request.session_id;
         let runtime_id = request.runtime_id;
         match request.command {
@@ -396,6 +584,7 @@ impl Backend for WakuBackend {
                     )?;
                     state.push_session(child.clone());
                     if let Err(error) = self.task_store.save(&mut state) {
+                        self.saving_failed.store(true, Ordering::Release);
                         state.sessions.retain(|session| session.id != child_id);
                         return Err(error).with_context(|| {
                             format!(
@@ -407,14 +596,14 @@ impl Backend for WakuBackend {
                 }
                 let child_runtime = Uuid::new_v4();
                 let (child_events, creation_started) = events.begin_child(child_id, child_runtime);
-                let start = self.handle(Request {
+                let start = self.handle_accepted(Request {
                     request_id: Uuid::new_v4(), session_id: child_id, runtime_id: child_runtime,
                     command: Command::Start { options: crate::WireDriverStartOptions {
                         provider: "codex".into(), binary, cwd: worktree.path.clone(), mode: serde_json::to_value(mode)?.as_str().unwrap().to_owned(),
                         model, reasoning_effort: None, service_tier: None, context_window: None, agent_preset: None,
                         computer_use_enabled: false, provider_cursor: None,
                     } },
-                }, child_events.clone()).and_then(|_| self.handle(Request {
+                }, child_events.clone()).and_then(|_| self.handle_accepted(Request {
                     request_id: Uuid::new_v4(), session_id: child_id, runtime_id: child_runtime,
                     command: Command::Prompt { prompt, turn_id: Some(turn_id), message_id: Some(message_id) },
                 }, child_events.clone())).and_then(|_| {
@@ -728,7 +917,14 @@ impl Backend for WakuBackend {
                 for session_id in &saved_ids {
                     state.mark_session_dirty(*session_id);
                 }
-                self.task_store.save(&mut state)?;
+                if let Err(error) = self.task_store.save(&mut state) {
+                    self.saving_failed.store(true, Ordering::Release);
+                    self.failed_sessions
+                        .lock()
+                        .extend(saved_ids.iter().copied());
+                    events.stop_failed_work();
+                    return Err(error.into());
+                }
                 let sessions = saved_ids
                     .into_iter()
                     .filter_map(|session_id| {
@@ -1106,48 +1302,7 @@ impl Backend for WakuBackend {
                 let forwarder = std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
                     .spawn(move || {
-                        while let Ok(event) = event_receiver.recv() {
-                            let deadline =
-                                std::time::Instant::now() + std::time::Duration::from_millis(120);
-                            let mut batch = vec![event];
-                            while batch.len() < 128
-                                && matches!(
-                                    batch.last(),
-                                    Some(
-                                        DriverEvent::TextDelta(_) | DriverEvent::ReasoningDelta(_)
-                                    )
-                                )
-                            {
-                                let remaining =
-                                    deadline.saturating_duration_since(std::time::Instant::now());
-                                match event_receiver.recv_timeout(remaining) {
-                                    Ok(event) => batch.push(event),
-                                    Err(_) => break,
-                                }
-                            }
-                            let exited = batch
-                                .iter()
-                                .any(|event| matches!(event, DriverEvent::ProcessExited));
-                            let wire = batch
-                                .into_iter()
-                                .map(|event| {
-                                    event_to_wire(event).unwrap_or_else(|error| {
-                                        WireDriverEvent::new(
-                                            "error",
-                                            Value::String(format!(
-                                                "could not encode daemon event: {error}"
-                                            )),
-                                        )
-                                    })
-                                })
-                                .collect();
-                            if let Err(error) = events.send_batch(wire) {
-                                eprintln!("could not save session {session_id}: {error:#}");
-                            }
-                            if exited {
-                                break;
-                            }
-                        }
+                        forward_runtime_events(provider, session_id, event_receiver, events)
                     })
                     .context("could not start daemon event forwarding thread")?;
                 self.forwarders
@@ -1217,28 +1372,61 @@ impl Backend for WakuBackend {
             }
         }
     }
+}
 
-    fn prepare_start(
-        &self,
-        session_id: Uuid,
-        options: &crate::WireDriverStartOptions,
-    ) -> anyhow::Result<()> {
-        validate_child_options(
-            &self.task_store,
-            &mut self.task_state.lock(),
-            session_id,
-            decode_enum(&options.provider)?,
-            decode_enum(&options.mode)?,
-        )?;
-        self.close_runtime(session_id, None)
+fn forward_runtime_events(
+    provider: ProviderKind,
+    session_id: Uuid,
+    event_receiver: crossbeam_channel::Receiver<DriverEvent>,
+    events: EventSink,
+) -> bool {
+    while let Ok(event) = event_receiver.recv() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(120);
+        let mut batch = vec![event];
+        while batch.len() < 128
+            && matches!(
+                batch.last(),
+                Some(DriverEvent::TextDelta(_) | DriverEvent::ReasoningDelta(_))
+            )
+        {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match event_receiver.recv_timeout(remaining) {
+                Ok(event) => batch.push(event),
+                Err(_) => break,
+            }
+        }
+        let exited = batch
+            .iter()
+            .any(|event| matches!(event, DriverEvent::ProcessExited));
+        let wire = batch
+            .into_iter()
+            .map(|event| {
+                event_to_wire(event).unwrap_or_else(|error| {
+                    WireDriverEvent::new(
+                        "error",
+                        Value::String(format!("could not encode daemon event: {error}")),
+                    )
+                })
+            })
+            .collect();
+        if let Err(error) = events.send_batch(wire) {
+            eprintln!("could not save session {session_id}: {error:#}");
+        }
+        if exited {
+            return true;
+        }
     }
-
-    fn shutdown(&self) {
-        let sessions = std::mem::take(&mut *self.sessions.lock());
-        drop(sessions);
-        let terminals = std::mem::take(&mut *self.terminals.lock());
-        drop(terminals);
+    if matches!(provider, ProviderKind::OpenCode | ProviderKind::DeepSeek) {
+        // These resident transports release all event senders when the runtime
+        // closes; the pooled host can still serve other sessions. Close its
+        // transcript only after the complete runtime event stream has drained.
+        if let Err(error) = events.send(WireDriverEvent::new("processExited", Value::Null)) {
+            eprintln!("could not save session {session_id}: {error:#}");
+        }
+        return true;
     }
+    // Direct CLI/ACP runtimes must report their own confirmed process exit.
+    false
 }
 
 fn validate_child_options(
@@ -2212,6 +2400,8 @@ fn handle_driver_command(
             return Ok(ResponsePayload::Cursor { cursor });
         }
         Command::CreateSession { .. }
+        | Command::PrepareShutdown
+        | Command::ShutdownDaemon
         | Command::AttachSession
         | Command::Start { .. }
         | Command::GetSettings
@@ -2553,6 +2743,641 @@ struct TurnFinishedWire {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ControlledStop(crossbeam_channel::Sender<()>);
+    impl crate::driver::DriverControl for ControlledStop {
+        fn prompt(&self, _: String) {
+            panic!("new work must be rejected while draining");
+        }
+        fn cancel(&self) {}
+        fn respond(&self, _: String, _: String) {}
+        fn rollback(&self, _: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
+            unreachable!()
+        }
+    }
+    impl Drop for ControlledStop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    #[test]
+    fn failed_project_save_refuses_new_work_without_an_existing_session() {
+        let root = std::env::temp_dir().join(format!("waku-save-gate-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.db");
+        let backend: Arc<dyn Backend> = Arc::new(
+            WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(path.clone()),
+            )
+            .unwrap(),
+        );
+        let sink = EventSink::for_test(&backend, Uuid::nil(), Uuid::nil());
+        let fault = rusqlite::Connection::open(path).unwrap();
+        fault.execute_batch("CREATE TRIGGER fail_project BEFORE INSERT ON projects BEGIN SELECT RAISE(ABORT, 'controlled project save failure'); END;").unwrap();
+        let error = backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: Uuid::nil(),
+                    runtime_id: Uuid::nil(),
+                    command: Command::SaveTaskState {
+                        projects: vec![Project::from_path(root.join("repo"))],
+                        live_session_ids: vec![],
+                        sessions: vec![],
+                    },
+                },
+                sink.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("controlled project save failure")
+        );
+        let error = backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: Uuid::new_v4(),
+                    runtime_id: Uuid::new_v4(),
+                    command: Command::Prompt {
+                        prompt: "new work".into(),
+                        turn_id: None,
+                        message_id: None,
+                    },
+                },
+                sink.clone(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("saving failed"));
+        drop(sink);
+        drop(backend);
+        drop(fault);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn safe_exit_does_not_treat_a_disconnected_event_stream_as_provider_exit() {
+        let root = std::env::temp_dir().join(format!("waku-unconfirmed-exit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = Arc::new(
+            WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(root.join("state.db")),
+            )
+            .unwrap(),
+        );
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        let erased: Arc<dyn Backend> = backend.clone();
+        let sink = EventSink::for_test(&erased, session_id, runtime_id);
+        let (stop, _stop_rx) = crossbeam_channel::bounded(1);
+        backend.sessions.lock().insert(
+            session_id,
+            (
+                runtime_id,
+                DriverHandle::from_control(Arc::new(ControlledStop(stop))),
+            ),
+        );
+        let (sender, receiver) = driver::test_event_channel();
+        drop(sender);
+        let forward_events = sink.clone();
+        backend.forwarders.lock().insert(
+            session_id,
+            (
+                runtime_id,
+                std::thread::spawn(move || {
+                    forward_runtime_events(
+                        ProviderKind::Codex,
+                        session_id,
+                        receiver,
+                        forward_events,
+                    )
+                }),
+            ),
+        );
+        for _ in 0..2 {
+            let result = backend.handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: Uuid::nil(),
+                    runtime_id: Uuid::nil(),
+                    command: Command::PrepareShutdown,
+                },
+                sink.clone(),
+            );
+            assert!(
+                result.is_err(),
+                "a missing provider exit confirmation must block every normal exit attempt"
+            );
+        }
+        drop(sink);
+        drop(erased);
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn safe_exit_accepts_drained_pooled_runtimes_without_a_child_exit_event() {
+        for provider in [ProviderKind::OpenCode, ProviderKind::DeepSeek] {
+            let root = std::env::temp_dir().join(format!("waku-pooled-exit-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let backend = Arc::new(
+                WakuBackend::new(
+                    DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                    StateStore::daemon(root.join("state.db")),
+                )
+                .unwrap(),
+            );
+            let session = AgentSession::new(Uuid::new_v4(), provider);
+            let session_id = session.id;
+            let runtime_id = Uuid::new_v4();
+            let erased: Arc<dyn Backend> = backend.clone();
+            let sink = EventSink::for_test(&erased, session_id, runtime_id);
+            backend
+                .handle(
+                    Request {
+                        request_id: Uuid::new_v4(),
+                        session_id,
+                        runtime_id,
+                        command: Command::SaveTaskState {
+                            projects: vec![],
+                            live_session_ids: vec![session_id],
+                            sessions: vec![session],
+                        },
+                    },
+                    sink.clone(),
+                )
+                .unwrap();
+            let (sender, receiver) = driver::test_event_channel();
+            sender
+                .send(DriverEvent::PromptSubmitted {
+                    message: "inspect".into(),
+                    turn_id: Uuid::new_v4(),
+                    message_id: Uuid::new_v4(),
+                })
+                .unwrap();
+            sender.send(DriverEvent::TurnStarted).unwrap();
+            sender
+                .send(DriverEvent::TextDelta("last pooled reply".into()))
+                .unwrap();
+            // Resident transports release every sender when their runtime closes;
+            // the shared host can remain alive for another session.
+            drop(sender);
+            let forward_events = sink.clone();
+            backend.forwarders.lock().insert(
+                session_id,
+                (
+                    runtime_id,
+                    std::thread::spawn(move || {
+                        forward_runtime_events(provider, session_id, receiver, forward_events)
+                    }),
+                ),
+            );
+            let (stop, _stop_rx) = crossbeam_channel::bounded(1);
+            backend.sessions.lock().insert(
+                session_id,
+                (
+                    runtime_id,
+                    DriverHandle::from_control(Arc::new(ControlledStop(stop))),
+                ),
+            );
+            let response = backend.handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id,
+                    command: Command::PrepareShutdown,
+                },
+                sink.clone(),
+            );
+            assert!(
+                matches!(response, Ok(ResponsePayload::Ack)),
+                "{provider:?} did not close: {response:?}"
+            );
+            let ResponsePayload::Session {
+                session: Some(saved),
+            } = backend
+                .handle(
+                    Request {
+                        request_id: Uuid::new_v4(),
+                        session_id,
+                        runtime_id,
+                        command: Command::HydrateSession { session_id },
+                    },
+                    sink.clone(),
+                )
+                .unwrap()
+            else {
+                panic!("missing saved pooled runtime");
+            };
+            assert_eq!(saved.messages.last().unwrap().content, "last pooled reply");
+            assert!(saved.active_turn_id().is_none());
+            assert_eq!(
+                saved.turns.last().unwrap().status,
+                crate::model::TurnStatus::Failed
+            );
+            assert_eq!(saved.history_saved_cursor, saved.runtime_event_cursor);
+            drop(sink);
+            drop(erased);
+            drop(backend);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn safe_exit_waits_for_the_provider_tail_before_acknowledging() {
+        let root = std::env::temp_dir().join(format!("waku-safe-exit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = Arc::new(
+            WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(root.join("state.db")),
+            )
+            .unwrap(),
+        );
+        let session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let session_id = session.id;
+        let runtime_id = Uuid::new_v4();
+        let erased: Arc<dyn Backend> = backend.clone();
+        let sink = EventSink::for_test(&erased, session_id, runtime_id);
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id,
+                    command: Command::SaveTaskState {
+                        projects: vec![],
+                        live_session_ids: vec![session_id],
+                        sessions: vec![session],
+                    },
+                },
+                sink.clone(),
+            )
+            .unwrap();
+        sink.send(
+            event_to_wire(DriverEvent::PromptSubmitted {
+                message: "inspect".into(),
+                turn_id: Uuid::new_v4(),
+                message_id: Uuid::new_v4(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        sink.send(event_to_wire(DriverEvent::TurnStarted).unwrap())
+            .unwrap();
+        let (stopped, stop_rx) = crossbeam_channel::bounded(1);
+        let (release_tail, tail_rx) = crossbeam_channel::bounded(1);
+        let (draining, draining_rx) = crossbeam_channel::bounded(1);
+        backend.sessions.lock().insert(
+            session_id,
+            (
+                runtime_id,
+                DriverHandle::from_control(Arc::new(ControlledStop(stopped))),
+            ),
+        );
+        let tail_sink = sink.clone();
+        let forwarder = std::thread::spawn(move || {
+            stop_rx.recv().unwrap();
+            draining.send(()).unwrap();
+            tail_rx.recv().unwrap();
+            tail_sink
+                .send(
+                    event_to_wire(DriverEvent::TextDelta("final reply after stop".into())).unwrap(),
+                )
+                .unwrap();
+            tail_sink
+                .send(event_to_wire(DriverEvent::ProcessExited).unwrap())
+                .unwrap();
+            true
+        });
+        backend
+            .forwarders
+            .lock()
+            .insert(session_id, (runtime_id, forwarder));
+        let (completed, complete_rx) = crossbeam_channel::bounded(1);
+        let closing = backend.clone();
+        let close_sink = sink.clone();
+        let shutdown = std::thread::spawn(move || {
+            completed
+                .send(closing.handle(
+                    Request {
+                        request_id: Uuid::new_v4(),
+                        session_id: Uuid::nil(),
+                        runtime_id: Uuid::nil(),
+                        command: Command::PrepareShutdown,
+                    },
+                    close_sink,
+                ))
+                .unwrap();
+        });
+        draining_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            complete_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "exit must wait for the provider tail"
+        );
+        assert!(
+            backend
+                .handle(
+                    Request {
+                        request_id: Uuid::new_v4(),
+                        session_id,
+                        runtime_id,
+                        command: Command::Prompt {
+                            prompt: "late input".into(),
+                            turn_id: None,
+                            message_id: None
+                        },
+                    },
+                    sink.clone()
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("shutting down")
+        );
+        release_tail.send(()).unwrap();
+        assert!(matches!(
+            complete_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            ResponsePayload::Ack
+        ));
+        shutdown.join().unwrap();
+        let ResponsePayload::Session {
+            session: Some(saved),
+        } = backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id,
+                    command: Command::HydrateSession { session_id },
+                },
+                sink.clone(),
+            )
+            .unwrap()
+        else {
+            panic!("missing durable tail")
+        };
+        assert_eq!(
+            saved.messages.last().unwrap().content,
+            "final reply after stop"
+        );
+        assert_eq!(saved.runtime_event_cursor.unwrap().sequence, 4);
+        assert_eq!(saved.history_saved_cursor, saved.runtime_event_cursor);
+        assert!(saved.active_turn_id().is_none());
+        drop(sink);
+        drop(erased);
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_failure_stops_the_provider_and_refuses_more_work() {
+        let root = std::env::temp_dir().join(format!("waku-save-stop-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.db");
+        let backend = Arc::new(
+            WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(path.clone()),
+            )
+            .unwrap(),
+        );
+        let session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let session_id = session.id;
+        let healthy = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let healthy_id = healthy.id;
+        let runtime_id = Uuid::new_v4();
+        let erased: Arc<dyn Backend> = backend.clone();
+        let sink = EventSink::for_test(&erased, session_id, runtime_id);
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id,
+                    command: Command::SaveTaskState {
+                        projects: vec![],
+                        live_session_ids: vec![session_id, healthy_id],
+                        sessions: vec![session, healthy],
+                    },
+                },
+                sink.clone(),
+            )
+            .unwrap();
+        let (stopped, stop_rx) = crossbeam_channel::bounded(1);
+        let (healthy_stop, healthy_rx) = crossbeam_channel::bounded(1);
+        backend.sessions.lock().insert(
+            healthy_id,
+            (
+                Uuid::new_v4(),
+                DriverHandle::from_control(Arc::new(ControlledStop(healthy_stop))),
+            ),
+        );
+        backend.sessions.lock().insert(
+            session_id,
+            (
+                runtime_id,
+                DriverHandle::from_control(Arc::new(ControlledStop(stopped))),
+            ),
+        );
+        sink.send(
+            event_to_wire(DriverEvent::PromptSubmitted {
+                message: "saved input".into(),
+                turn_id: Uuid::new_v4(),
+                message_id: Uuid::new_v4(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        sink.send(event_to_wire(DriverEvent::TurnStarted).unwrap())
+            .unwrap();
+        let fault = rusqlite::Connection::open(&path).unwrap();
+        fault.execute_batch("CREATE TRIGGER fail_history BEFORE INSERT ON session_events BEGIN SELECT RAISE(ABORT, 'controlled disk full'); END;").unwrap();
+        assert!(
+            sink.send(event_to_wire(DriverEvent::TextDelta("unsaved reply".into())).unwrap())
+                .is_err()
+        );
+        stop_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("saving failure must stop the affected provider");
+        assert!(
+            healthy_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "an unaffected provider must remain running"
+        );
+        let error = backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id,
+                    command: Command::Prompt {
+                        prompt: "more work".into(),
+                        turn_id: None,
+                        message_id: None,
+                    },
+                },
+                sink.clone(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("saving failed"));
+        let ResponsePayload::Session {
+            session: Some(current),
+        } = backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id,
+                    command: Command::HydrateSession { session_id },
+                },
+                sink.clone(),
+            )
+            .unwrap()
+        else {
+            panic!("missing readable history")
+        };
+        assert_eq!(current.messages.last().unwrap().content, "unsaved reply");
+        assert!(current.history_save_error.is_some());
+        assert!(
+            current.runtime_event_cursor.unwrap().sequence
+                > current.history_saved_cursor.unwrap().sequence
+        );
+        let prepare = || {
+            backend.handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: Uuid::nil(),
+                    runtime_id: Uuid::nil(),
+                    command: Command::PrepareShutdown,
+                },
+                sink.clone(),
+            )
+        };
+        assert!(
+            prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("unsaved history")
+        );
+        fault.execute_batch("DROP TRIGGER fail_history").unwrap();
+        assert!(matches!(prepare().unwrap(), ResponsePayload::Ack));
+        let ResponsePayload::Session {
+            session: Some(saved),
+        } = backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id,
+                    command: Command::HydrateSession { session_id },
+                },
+                sink.clone(),
+            )
+            .unwrap()
+        else {
+            panic!("missing recovered history")
+        };
+        assert_eq!(saved.messages.last().unwrap().content, "unsaved reply");
+        assert_eq!(saved.history_saved_cursor, saved.runtime_event_cursor);
+        assert!(saved.history_save_error.is_none());
+        drop(sink);
+        drop(erased);
+        drop(backend);
+        drop(fault);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_recovery_retains_confirmed_history_and_interrupts_orphaned_turn() {
+        let root = std::env::temp_dir().join(format!("waku-crash-recovery-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.db");
+        let store = StateStore::daemon(path.clone());
+        let mut state = PersistedState::empty();
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let session_id = session.id;
+        let mut reducer = waku_protocol::history::HistoryReducer::default();
+        session.begin_turn("saved input");
+        reducer.apply(&mut session, DriverEvent::TurnStarted);
+        reducer.apply(
+            &mut session,
+            DriverEvent::TextDelta("saved partial reply".into()),
+        );
+        reducer.apply(
+            &mut session,
+            DriverEvent::Permission {
+                request_id: "old permission".into(),
+                title: "approve".into(),
+                detail: "old request".into(),
+                options: vec![],
+            },
+        );
+        reducer.apply(
+            &mut session,
+            DriverEvent::UserInputRequested {
+                request_id: "old question".into(),
+                questions: vec![crate::model::UserInputQuestion {
+                    id: "q1".into(),
+                    header: "Scope".into(),
+                    question: "Which file?".into(),
+                    options: vec![],
+                    multi_select: false,
+                }],
+            },
+        );
+        assert!(session.pending_permission.is_some());
+        assert!(session.pending_user_input.is_some());
+        state.push_session(session);
+        store.save(&mut state).unwrap();
+        drop(store);
+        let backend: Arc<dyn Backend> = Arc::new(
+            WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(path),
+            )
+            .unwrap(),
+        );
+        let ResponsePayload::Session {
+            session: Some(restored),
+        } = backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id: Uuid::nil(),
+                    command: Command::HydrateSession { session_id },
+                },
+                EventSink::for_test(&backend, session_id, Uuid::nil()),
+            )
+            .unwrap()
+        else {
+            panic!("saved session must remain readable");
+        };
+        assert_eq!(
+            restored.turns[0].status,
+            crate::model::TurnStatus::Interrupted
+        );
+        assert_eq!(restored.status, SessionStatus::Idle);
+        assert_eq!(restored.messages[0].content, "saved input");
+        assert_eq!(restored.messages[1].content, "saved partial reply");
+        assert!(restored.pending_permission.is_none());
+        assert!(restored.pending_user_input.is_none());
+        assert!(restored.messages.iter().all(|message| !message.streaming));
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn rewind_commit_retains_metadata_saved_while_the_provider_was_rewinding() {

@@ -39,6 +39,7 @@ mod input;
 mod md;
 mod platform;
 mod query;
+mod quit;
 mod review_diff;
 mod terminal;
 mod theme;
@@ -310,6 +311,7 @@ pub fn run() {
                 KeyBinding::new("escape", BrowserAddressCancel, Some("BrowserAddress")),
             ]);
 
+            #[cfg(target_os = "macos")]
             cx.on_action(|_: &Quit, cx| cx.quit());
 
             // Unlike AppKit, Linux has no Dock activation path that can
@@ -373,6 +375,8 @@ pub fn run() {
                     },
                 )
                 .expect("failed to open Waku window");
+
+            crate::quit::install(window, cx);
 
             cx.on_system_notification_response({
                 let window = window;

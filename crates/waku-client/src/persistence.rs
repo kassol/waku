@@ -1039,7 +1039,7 @@ impl StateStore {
     pub fn prepare_save(
         &self,
         state: &PersistedState,
-    ) -> impl FnOnce() -> io::Result<SaveReceipt> + Send + 'static {
+    ) -> impl FnOnce() -> io::Result<SaveReceipt> + Send + 'static + use<> {
         let revisions = state.dirty_sessions.clone();
         let settings = state.app_settings();
         let app_state = state.app_state();

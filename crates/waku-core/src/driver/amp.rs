@@ -320,14 +320,21 @@ impl AmpDriver {
         thread::Builder::new()
             .name("waku-amp-process".into())
             .spawn(move || {
-                let status = child.wait();
+                let status = match child.wait() {
+                    Ok(status) => status,
+                    Err(error) => {
+                        let _ = events.send(DriverEvent::Error(tr!(
+                            "errors.read_provider_exit_status",
+                            provider = "Amp",
+                            error = error
+                        )));
+                        return;
+                    }
+                };
                 process_pid.store(0, Ordering::Relaxed);
                 let _ = reader_thread.join();
                 let _ = stderr_thread.join();
-                if let Ok(status) = status
-                    && !status.success()
-                    && last_visible_stderr.lock().is_none()
-                {
+                if !status.success() && last_visible_stderr.lock().is_none() {
                     let _ = events.send(DriverEvent::Error(tr!(
                         "errors.provider_exited",
                         provider = "Amp",

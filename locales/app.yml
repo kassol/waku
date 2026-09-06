@@ -2160,3 +2160,13 @@ session.history_pending:
   en: Saving history…
 session.history_save_failed:
   en: 'History not saved: %{error}'
+
+errors.unsafe_quit:
+  en: "Waku could not quit safely: %{error}. Unsaved history remains at risk. Retry Quit after fixing the save failure."
+  zh-CN: "Waku 无法安全退出：%{error}。未保存的历史仍有丢失风险。修复保存故障后请重试退出。"
+  ja: "安全に終了できませんでした：%{error}。未保存の履歴は失われる可能性があります。保存の問題を解決してから終了を再試行してください。"
+
+session.safe_exit_pending:
+  en: "Stopping tasks and saving history before quitting…"
+  zh-CN: "正在停止任务并保存历史，完成后退出…"
+  ja: "タスクを停止し、履歴を保存してから終了します…"

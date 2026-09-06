@@ -1291,6 +1291,7 @@ pub struct Waku {
     stream_state_dirty: bool,
     state_save_executor: gpui::BackgroundExecutor,
     state_save_pending: bool,
+    quit_in_progress: bool,
     state_save_requested: bool,
     state_save_tx: Sender<std::io::Result<waku_client::persistence::SaveReceipt>>,
     state_save_events: Receiver<std::io::Result<waku_client::persistence::SaveReceipt>>,
@@ -1788,10 +1789,7 @@ impl Waku {
             }
             #[cfg(target_os = "linux")]
             crate::updater::UpdaterEvent::QuitAndInstall => {
-                // The helper has already validated both prefixes and now
-                // waits for GPUI's normal asynchronous quit hooks to finish
-                // saving drafts and window state before it swaps them.
-                cx.quit();
+                self.request_quit(cx);
             }
         }
         cx.notify();
@@ -2458,36 +2456,6 @@ impl Waku {
             )
             .detach();
 
-            // A normal Cmd-Q waits briefly for this future, so even an edit
-            // made inside the debounce window is durable before the process
-            // exits. Filesystem work still stays off the UI thread.
-            cx.on_app_quit(|this, cx| {
-                this.capture_current_composer_draft(cx);
-                this.composer_draft_save_generation =
-                    this.composer_draft_save_generation.saturating_add(1);
-                let generation = this.composer_draft_save_generation;
-                let store = this.composer_draft_store.clone();
-                let drafts = this.composer_drafts.clone();
-                let save = cx
-                    .background_executor()
-                    .spawn(async move { store.save(drafts, generation) });
-                async move {
-                    let _ = save.await;
-                }
-            })
-            .detach();
-
-            // Window-frame changes are only mirrored in memory; the quit save
-            // is what lands the final position and size on disk.
-            cx.on_app_quit(|this, cx| {
-                let save = this.store.prepare_save(&this.state);
-                let pending = cx.background_executor().spawn(async move { save() });
-                async move {
-                    let _ = pending.await;
-                }
-            })
-            .detach();
-
             // A changed query re-filters the picker rows and renumbers them,
             // so the drawn selection cannot carry over. While a filter is
             // active the cursor lands on the first match so `enter` has a
@@ -2853,6 +2821,7 @@ impl Waku {
                 stream_state_dirty: false,
                 state_save_executor: cx.background_executor().clone(),
                 state_save_pending: false,
+                quit_in_progress: false,
                 state_save_requested: false,
                 state_save_tx,
                 state_save_events,

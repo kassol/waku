@@ -1274,6 +1274,111 @@ impl Waku {
             .unwrap_or(&[])
     }
 
+    pub(crate) fn request_quit(&mut self, cx: &mut Context<Self>) {
+        if self.quit_in_progress {
+            return;
+        }
+        self.quit_in_progress = true;
+        let daemon = self.daemon.clone();
+        cx.spawn(async move |waku, cx| {
+            let prepare = cx
+                .background_executor()
+                .spawn({
+                    let daemon = daemon.clone();
+                    async move { daemon.prepare_shutdown() }
+                })
+                .await;
+            if let Err(error) = prepare {
+                let _ = waku.update(cx, |waku, cx| waku.quit_failed(error.to_string(), cx));
+                return;
+            }
+            loop {
+                let snapshot = match waku.update(cx, |waku, cx| {
+                    waku.drain_state_save_events();
+                    waku.drain_driver_events(cx);
+                    waku.start_pending_checkpoint_captures(cx);
+                    if waku.state_save_pending
+                        || !waku.submission_preparations.is_empty()
+                        || !waku.goal_runtime_starts.is_empty()
+                        || !waku.checkpoint_captures_in_flight.is_empty()
+                        || !waku.response_fork_preparations.is_empty()
+                    {
+                        return None;
+                    }
+                    waku.capture_current_composer_draft(cx);
+                    waku.composer_draft_save_generation += 1;
+                    waku.state_save_pending = true;
+                    waku.state_save_requested = false;
+                    waku.stream_state_dirty = false;
+                    Some((
+                        waku.store.prepare_save(&waku.state),
+                        waku.composer_draft_store.clone(),
+                        waku.composer_drafts.clone(),
+                        waku.composer_draft_save_generation,
+                    ))
+                }) {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => return,
+                };
+                let Some((save, drafts_store, drafts, generation)) = snapshot else {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(25))
+                        .await;
+                    continue;
+                };
+                let saved = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let receipt = save()?;
+                        drafts_store.save(drafts, generation)?;
+                        Ok::<_, std::io::Error>(receipt)
+                    })
+                    .await;
+                let finished = match waku.update(cx, |waku, cx| {
+                    waku.state_save_pending = false;
+                    match saved {
+                        Ok(receipt) => {
+                            waku.state.acknowledge_save(receipt);
+                            Ok(!waku.state.has_dirty_sessions()
+                                && !waku.state_save_requested
+                                && waku.composer_draft_save_generation == generation)
+                        }
+                        Err(error) => {
+                            waku.quit_failed(error.to_string(), cx);
+                            Err(())
+                        }
+                    }
+                }) {
+                    Ok(result) => result,
+                    Err(_) => return,
+                };
+                match finished {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(()) => return,
+                }
+            }
+            let stopped = cx
+                .background_executor()
+                .spawn(async move { daemon.finish_shutdown() })
+                .await;
+            let _ = waku.update(cx, |waku, cx| match stopped {
+                Ok(()) => crate::quit::complete(true, cx),
+                Err(error) => waku.quit_failed(error.to_string(), cx),
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn quit_failed(&mut self, error: String, cx: &mut Context<Self>) {
+        self.quit_in_progress = false;
+        self.stream_state_dirty = true;
+        self.show_toast(tr!("errors.unsafe_quit", error = error));
+        crate::quit::complete(false, cx);
+        cx.notify();
+    }
+
     pub(super) fn save(&mut self) {
         if self.state_save_pending {
             self.state_save_requested = true;
@@ -2324,6 +2429,9 @@ impl Waku {
     /// drain once the runtime installs. The session stays `Idle` throughout —
     /// no turn begins and nothing lands in the transcript.
     pub(super) fn start_goal_runtime(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        if self.quit_in_progress {
+            return;
+        }
         if self.runtimes.contains_key(&session_id)
             || self.goal_runtime_starts.contains(&session_id)
             || self.submission_preparations.contains(&session_id)
@@ -2535,6 +2643,9 @@ impl Waku {
         submission: ComposerSubmission,
         cx: &mut Context<Self>,
     ) {
+        if self.quit_in_progress {
+            return;
+        }
         let Some(session) = self.selected_session() else {
             return;
         };
@@ -2715,6 +2826,9 @@ impl Waku {
     /// Start the next queued follow-up as a fresh turn. Only called once a
     /// settled turn has been fully closed, so the session is Idle.
     fn drain_queued_message(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        if self.quit_in_progress {
+            return;
+        }
         if self.response_fork_preparations.contains_key(&session_id) {
             return;
         }
@@ -2755,6 +2869,9 @@ impl Waku {
         submission: ComposerSubmission,
         cx: &mut Context<Self>,
     ) {
+        if self.quit_in_progress {
+            return;
+        }
         if self.response_fork_preparations.contains_key(&session_id) {
             return;
         }

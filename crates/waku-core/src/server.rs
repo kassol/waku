@@ -70,6 +70,9 @@ pub trait Backend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Called on a separate worker after event ingestion releases its locks.
+    fn stop_failed_work(&self) {}
+
     fn shutdown(&self) {}
 }
 
@@ -119,6 +122,22 @@ impl EventSink {
 
     pub(crate) fn end_runtime(&self) {
         self.hub.end_runtime(self.session_id, Some(self.runtime_id));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(backend: &Arc<dyn Backend>, session_id: Uuid, runtime_id: Uuid) -> Self {
+        let hub = Arc::new(Hub {
+            backend: Some(Arc::downgrade(backend)),
+            ..Hub::default()
+        });
+        hub.begin_runtime(session_id, runtime_id);
+        hub.event_sink(session_id, runtime_id)
+    }
+
+    pub(crate) fn stop_failed_work(&self) {
+        if let Some(backend) = self.hub.backend.as_ref().and_then(Weak::upgrade) {
+            std::thread::spawn(move || backend.stop_failed_work());
+        }
     }
 
     pub fn send(&self, event: WireDriverEvent) -> anyhow::Result<()> {
@@ -318,6 +337,13 @@ impl Hub {
         }
     }
 
+    fn confirm_all_drained_history(&self) {
+        let runtimes = self.state.lock().active_runtimes.clone();
+        for (session_id, runtime_id) in runtimes {
+            self.confirm_drained_history(session_id, Some(runtime_id));
+        }
+    }
+
     fn end_runtime(&self, session_id: Uuid, runtime_id: Option<Uuid>) {
         let mut state = self.state.lock();
         let matches_active = runtime_id
@@ -380,6 +406,10 @@ impl Hub {
             });
             sequenced.push(event);
         }
+        let was_failed = matches!(
+            state.history_persistence.get(&(session_id, runtime_id)),
+            Some(ServerMessage::HistoryPersistence { error: Some(_), .. })
+        );
         let mut persistence_error = None;
         if replayable && let Some(backend) = self.backend.as_ref().and_then(Weak::upgrade) {
             let result = backend.persist_events(&sequenced);
@@ -406,6 +436,10 @@ impl Hub {
             persistence_error = result.err();
         }
         if let Some(error) = persistence_error {
+            drop(state);
+            if !was_failed && let Some(backend) = self.backend.as_ref().and_then(Weak::upgrade) {
+                std::thread::spawn(move || backend.stop_failed_work());
+            }
             return Err(error);
         }
         if let Some(journal) = state.journal.get_mut(&(session_id, runtime_id)) {
@@ -830,10 +864,72 @@ fn handle_connection(
         match socket.read() {
             Ok(Message::Text(text)) => match serde_json::from_str(text.as_ref()) {
                 Ok(ClientMessage::Request(request)) => {
-                    dispatcher.dispatch(request, outgoing.clone(), subscriber_id);
+                    let exit_command = matches!(
+                        request.command,
+                        Command::PrepareShutdown | Command::ShutdownDaemon
+                    );
+                    if exit_command && !options.allow_shutdown {
+                        write_json(
+                            &mut socket,
+                            &ServerMessage::Response {
+                                request_id: request.request_id,
+                                outcome: ResponseOutcome::Error {
+                                    error: RpcError::from(anyhow::anyhow!(
+                                        "daemon shutdown is managed by its service owner"
+                                    )),
+                                },
+                            },
+                        )?;
+                    } else if matches!(request.command, Command::ShutdownDaemon) {
+                        let result = dispatcher
+                            .backend
+                            .handle(request.clone(), hub.event_sink(Uuid::nil(), Uuid::nil()));
+                        let successful = result.is_ok();
+                        let outcome = match result {
+                            Ok(payload) => ResponseOutcome::Ok { payload },
+                            Err(error) => ResponseOutcome::Error {
+                                error: RpcError::from(error),
+                            },
+                        };
+                        write_json(
+                            &mut socket,
+                            &ServerMessage::Response {
+                                request_id: request.request_id,
+                                outcome,
+                            },
+                        )?;
+                        if successful {
+                            hub.confirm_all_drained_history();
+                            shutdown.store(true, Ordering::Release);
+                            break;
+                        }
+                    } else {
+                        dispatcher.dispatch(request, outgoing.clone(), subscriber_id);
+                    }
                 }
                 Ok(ClientMessage::Shutdown) => {
                     if options.allow_shutdown {
+                        let result = dispatcher.backend.handle(
+                            Request {
+                                request_id: Uuid::new_v4(),
+                                session_id: Uuid::nil(),
+                                runtime_id: Uuid::nil(),
+                                command: Command::PrepareShutdown,
+                            },
+                            hub.event_sink(Uuid::nil(), Uuid::nil()),
+                        );
+                        if let Err(error) = result {
+                            write_json(
+                                &mut socket,
+                                &ServerMessage::Rejected {
+                                    message: format!(
+                                        "unsaved history prevents shutdown: {error:#}"
+                                    ),
+                                },
+                            )?;
+                            continue;
+                        }
+                        hub.confirm_all_drained_history();
                         write_json(&mut socket, &ServerMessage::ShuttingDown)?;
                         shutdown.store(true, Ordering::Release);
                         break;
@@ -1081,6 +1177,7 @@ fn handle_request(
     let session_id = request.session_id;
     let runtime_id = request.runtime_id;
     let task_catalog_action = task_catalog_action(&request.command);
+    let prepares_shutdown = matches!(request.command, Command::PrepareShutdown);
     let starts_runtime = matches!(
         &request.command,
         Command::Start { .. } | Command::OpenTerminal { .. }
@@ -1122,6 +1219,9 @@ fn handle_request(
         }
         (outcome, true)
     };
+    if executed && prepares_shutdown && matches!(&outcome, ResponseOutcome::Ok { .. }) {
+        hub.confirm_all_drained_history();
+    }
     if began_runtime && matches!(&outcome, ResponseOutcome::Error { .. }) {
         hub.end_runtime(session_id, Some(runtime_id));
     }
@@ -1685,6 +1785,111 @@ mod tests {
 
         stale_client.shutdown();
         server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owned_daemon_acknowledges_safe_exit_before_closing_the_connection() {
+        let root = std::env::temp_dir().join(format!("waku-exit-ack-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("state.db")),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stopping = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                stopping,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        assert!(matches!(
+            client
+                .request(Uuid::nil(), Uuid::nil(), Command::PrepareShutdown)
+                .unwrap(),
+            ResponsePayload::Ack
+        ));
+        assert!(!shutdown.load(Ordering::Acquire));
+        let error = client
+            .request(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Command::Prompt {
+                    prompt: "must not start".into(),
+                    turn_id: None,
+                    message_id: None,
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("shutting down"));
+        assert!(matches!(
+            client
+                .request(Uuid::nil(), Uuid::nil(), Command::ShutdownDaemon)
+                .unwrap(),
+            ResponsePayload::Ack
+        ));
+        server.join().unwrap();
+        assert!(shutdown.load(Ordering::Acquire));
+        drop(client);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn service_owned_daemon_rejects_global_exit_commands_and_stays_available() {
+        let root = std::env::temp_dir().join(format!("waku-exit-ownership-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("state.db")),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stopping = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                stopping,
+                ServerOptions::default(),
+            )
+            .unwrap()
+        });
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let external =
+            waku_client::DaemonSupervisor::connect(&address.to_string(), "secret".into()).unwrap();
+        external.prepare_shutdown().unwrap();
+        external.finish_shutdown().unwrap();
+        for command in [Command::PrepareShutdown, Command::ShutdownDaemon] {
+            let error = client
+                .request(Uuid::nil(), Uuid::nil(), command)
+                .unwrap_err();
+            assert!(error.to_string().contains("service owner"));
+        }
+        assert!(matches!(
+            client
+                .request(Uuid::nil(), Uuid::nil(), Command::GetSettings)
+                .unwrap(),
+            ResponsePayload::Settings { .. }
+        ));
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+        drop(client);
+        drop(external);
         std::fs::remove_dir_all(root).unwrap();
     }
 

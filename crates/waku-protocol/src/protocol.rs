@@ -88,6 +88,10 @@ pub enum Command {
         #[serde(default)]
         runtime_mode: Option<RuntimeMode>,
     },
+    /// Stop accepting work and confirm all provider tails are durable.
+    PrepareShutdown,
+    /// Exit a desktop-owned daemon after a successful drain.
+    ShutdownDaemon,
     /// Resolve the daemon-owned provider runtime for an existing task.
     ///
     /// Clients use this after reconnecting or opening the same daemon from a

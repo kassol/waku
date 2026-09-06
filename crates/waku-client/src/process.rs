@@ -244,6 +244,9 @@ impl DaemonProcess {
     }
 
     fn stop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
         self.client.shutdown();
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         while Instant::now() < deadline {
@@ -455,6 +458,9 @@ impl DaemonSupervisor {
             .context("the connected daemon is managed outside Waku Desktop")?
             .clone();
         let _restart = self.inner.restart.lock();
+        if !self.inner.running.load(Ordering::Acquire) {
+            bail!("the owned daemon is preparing to exit");
+        }
         let previous = self
             .inner
             .exposure
@@ -480,6 +486,65 @@ impl DaemonSupervisor {
                 }
             }
         }
+    }
+
+    /// Run off the UI thread. Externally managed daemons retain their runtimes.
+    pub fn prepare_shutdown(&self) -> anyhow::Result<()> {
+        if self.is_remote() {
+            return Ok(());
+        }
+        let _restart = self.inner.restart.lock();
+        self.inner.running.store(false, Ordering::Release);
+        let client = self.client();
+        let settings = self.inner.settings.lock().clone();
+        match client.request(
+            Uuid::nil(),
+            Uuid::nil(),
+            Command::UpdateSettings {
+                settings: settings.clone(),
+            },
+        )? {
+            ResponsePayload::Ack => *self.inner.persisted_settings.lock() = Some(settings),
+            _ => bail!("the daemon did not confirm settings before exit"),
+        }
+        match client.request(Uuid::nil(), Uuid::nil(), Command::PrepareShutdown)? {
+            ResponsePayload::Ack => Ok(()),
+            _ => bail!("the daemon did not confirm saved history before exit"),
+        }
+    }
+
+    /// Confirm the final drain and wait for this supervisor's child to exit.
+    /// No timeout or kill is allowed to stand in for a successful save.
+    pub fn finish_shutdown(&self) -> anyhow::Result<()> {
+        if self.is_remote() {
+            return Ok(());
+        }
+        let _restart = self.inner.restart.lock();
+        let client = self.client();
+        match client.request(Uuid::nil(), Uuid::nil(), Command::ShutdownDaemon)? {
+            ResponsePayload::Ack => {}
+            _ => bail!("the daemon did not acknowledge shutdown"),
+        }
+        let previous = {
+            let mut target = self.inner.target.lock();
+            std::mem::replace(&mut *target, DaemonTarget::Restarting(client))
+        };
+        let DaemonTarget::Local(mut process) = previous else {
+            bail!("the owned daemon process is unavailable; its exit could not be confirmed");
+        };
+        let status = match process.child.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                // Keep ownership on an unconfirmed wait. Dropping this handle
+                // would invoke the emergency timeout/kill fallback.
+                *self.inner.target.lock() = DaemonTarget::Local(process);
+                return Err(error).context("could not confirm daemon exit");
+            }
+        };
+        if !status.success() {
+            bail!("the daemon exited unsuccessfully: {status}");
+        }
+        Ok(())
     }
 
     /// Queue a daemon settings update without blocking the desktop UI thread.
@@ -573,6 +638,9 @@ fn monitor_daemon(
             continue;
         }
         let _restart = inner.restart.lock();
+        if !inner.running.load(Ordering::Acquire) {
+            return;
+        }
         let Some(exposure) = inner.exposure.lock().clone() else {
             return;
         };

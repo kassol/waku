@@ -504,13 +504,20 @@ impl ClaudeDriver {
         thread::Builder::new()
             .name("waku-claude-process".into())
             .spawn(move || {
-                let status = child.wait();
+                let status = match child.wait() {
+                    Ok(status) => status,
+                    Err(error) => {
+                        let _ = events.send(DriverEvent::Error(tr!(
+                            "errors.read_provider_exit_status",
+                            provider = "Claude Code",
+                            error = error
+                        )));
+                        return;
+                    }
+                };
                 let _ = reader_thread.join();
                 let _ = stderr_thread.join();
-                if let Ok(status) = status
-                    && !status.success()
-                    && last_visible_stderr.lock().is_none()
-                {
+                if !status.success() && last_visible_stderr.lock().is_none() {
                     let _ = events.send(DriverEvent::Error(tr!(
                         "errors.provider_exited",
                         provider = "Claude Code",
