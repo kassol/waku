@@ -189,6 +189,45 @@ impl DaemonClient {
                         );
                         let page = match replay {
                             Ok(ResponsePayload::EventReplay { events }) => events,
+                            Ok(ResponsePayload::HistorySnapshot { session }) => {
+                                let Some(saved) = session.history_saved_cursor.filter(|saved| {
+                                    session.id == session_id
+                                        && saved.runtime_id == runtime_id
+                                        && saved.epoch == event.epoch
+                                        && saved.sequence > after
+                                }) else {
+                                    let _ = output.send(SequencedEvent {
+                                        event: waku_protocol::WireDriverEvent::new(
+                                            "error",
+                                            serde_json::json!("invalid history snapshot cursor"),
+                                        ),
+                                        ..event
+                                    });
+                                    return;
+                                };
+                                after = saved.sequence;
+                                applied = Some(LastSequence {
+                                    epoch: saved.epoch,
+                                    sequence: after,
+                                });
+                                if output
+                                    .send(SequencedEvent {
+                                        session_id,
+                                        runtime_id,
+                                        epoch: saved.epoch,
+                                        sequence: after,
+                                        event: waku_protocol::WireDriverEvent::new(
+                                            "historySnapshot",
+                                            serde_json::to_value(session)
+                                                .expect("session serializes"),
+                                        ),
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
                             other => {
                                 if client.is_disconnected() {
                                     return;
@@ -235,8 +274,8 @@ impl DaemonClient {
                 let previous = applied
                     .filter(|previous| previous.epoch == event.epoch)
                     .map_or(0, |previous| previous.sequence);
-                if persistence || event.sequence > previous {
-                    if !persistence {
+                if persistence || event.sequence > previous || event.event.kind == "processExited" {
+                    if !persistence && event.sequence > previous {
                         applied = Some(LastSequence {
                             epoch: event.epoch,
                             sequence: event.sequence,
@@ -366,12 +405,22 @@ fn daemon_url(address: &str) -> anyhow::Result<String> {
     Ok(url.into())
 }
 
+struct SnapshotTransfer {
+    session_id: Uuid,
+    cursor: Option<waku_protocol::model::RuntimeEventCursor>,
+    replay: bool,
+    total_bytes: u64,
+    data: String,
+}
+
 fn run_client(
     mut socket: WebSocket<MaybeTlsStream<TcpStream>>,
     outgoing: Receiver<Outgoing>,
     inner: Arc<ClientInner>,
 ) {
+    let mut snapshots: HashMap<Uuid, SnapshotTransfer> = HashMap::new();
     'connection: loop {
+        snapshots.retain(|id, _| inner.pending.lock().contains_key(id));
         while let Ok(message) = outgoing.try_recv() {
             match message {
                 Outgoing::Message(message) => {
@@ -403,6 +452,83 @@ fn run_client(
                                 ResponseOutcome::Error { error } => Err(error),
                             };
                             let _ = pending.send(result);
+                        }
+                    }
+                    ServerMessage::HistorySnapshotChunk {
+                        request_id,
+                        session_id,
+                        cursor,
+                        replay,
+                        offset,
+                        total_bytes,
+                        data,
+                    } => {
+                        if !inner.pending.lock().contains_key(&request_id) {
+                            continue;
+                        }
+                        let transfer =
+                            snapshots
+                                .entry(request_id)
+                                .or_insert_with(|| SnapshotTransfer {
+                                    session_id,
+                                    cursor,
+                                    replay,
+                                    total_bytes,
+                                    data: String::new(),
+                                });
+                        let invalid = total_bytes == 0
+                            || data.is_empty()
+                            || data.len() > MAX_WIRE_MESSAGE_BYTES / 8
+                            || transfer.session_id != session_id
+                            || transfer.cursor != cursor
+                            || transfer.replay != replay
+                            || transfer.total_bytes != total_bytes
+                            || offset != transfer.data.len() as u64
+                            || offset
+                                .checked_add(data.len() as u64)
+                                .is_none_or(|end| end > total_bytes);
+                        if invalid {
+                            snapshots.remove(&request_id);
+                            if let Some(pending) = inner.pending.lock().remove(&request_id) {
+                                let _ = pending.send(Err(RpcError {
+                                    message: "invalid history snapshot chunk".into(),
+                                }));
+                            }
+                            continue;
+                        }
+                        transfer.data.push_str(&data);
+                        if transfer.data.len() as u64 == total_bytes {
+                            let transfer = snapshots.remove(&request_id).unwrap();
+                            let result =
+                                serde_json::from_str::<waku_protocol::model::AgentSession>(
+                                    &transfer.data,
+                                )
+                                .map_err(|error| RpcError {
+                                    message: format!("invalid history snapshot: {error}"),
+                                })
+                                .and_then(|session| {
+                                    if session.id == session_id
+                                        && session.runtime_event_cursor == cursor
+                                        && (!replay
+                                            || (cursor.is_some()
+                                                && session.history_saved_cursor == cursor))
+                                    {
+                                        Ok(if replay {
+                                            ResponsePayload::HistorySnapshot { session }
+                                        } else {
+                                            ResponsePayload::Session {
+                                                session: Some(session),
+                                            }
+                                        })
+                                    } else {
+                                        Err(RpcError {
+                                            message: "invalid history snapshot identity".into(),
+                                        })
+                                    }
+                                });
+                            if let Some(pending) = inner.pending.lock().remove(&request_id) {
+                                let _ = pending.send(result);
+                            }
                         }
                     }
                     ServerMessage::Event(event) => {

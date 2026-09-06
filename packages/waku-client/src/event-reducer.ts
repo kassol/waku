@@ -42,6 +42,41 @@ export function reduceRuntimeEvent(
   clock: ReducerClock = defaultClock,
   processExitError: string | null = null,
 ): RuntimeEventResult {
+  if (wire.event.kind === 'historySnapshot') {
+    const snapshot = clone(wire.event.payload as unknown as AgentSession)
+    if (historySnapshotIsStale(current, snapshot)) {
+      const session = clone(current)
+      return { session, permission: session.pending_permission ?? null, userInput: session.pending_user_input ?? null, settled: false, removeRuntime: false }
+    }
+    const session: AgentSession = {
+      ...snapshot,
+      id: current.id,
+      project_id: current.project_id,
+      provider: current.provider,
+      created_at: current.created_at,
+      title: current.title,
+      model: current.model,
+      workspace: current.workspace,
+      runtime_mode: current.runtime_mode,
+      reasoning_effort: current.reasoning_effort,
+      service_tier: current.service_tier,
+      context_window: current.context_window,
+      agent_preset: current.agent_preset,
+      queued_messages: clone(current.queued_messages ?? []),
+      updated_at: Math.max(current.updated_at, snapshot.updated_at),
+      last_reply_at: Math.max(current.last_reply_at ?? 0, snapshot.last_reply_at ?? 0) || undefined,
+    }
+    const savedCount = snapshot.turns.at(-1)?.turn_count ?? 0
+    const localTurns = current.turns.filter((turn) => turn.turn_count > savedCount)
+    if (localTurns.length) {
+      const localIds = new Set(localTurns.map((turn) => turn.id))
+      session.turns.push(...clone(localTurns))
+      session.messages.push(...clone(current.messages.filter((message) => message.turn_id && localIds.has(message.turn_id))))
+      session.transcript_blocks.push(...clone(current.transcript_blocks.filter((block) => block.turn_id && localIds.has(block.turn_id))))
+      session.status = current.status
+    }
+    return { session, permission: session.pending_permission ?? null, userInput: session.pending_user_input ?? null, settled: false, removeRuntime: false }
+  }
   const session = clone(current)
   const { kind, payload } = wire.event
   const result: RuntimeEventResult = {
@@ -271,6 +306,7 @@ export function reduceRuntimeEvent(
     case 'error': {
       if (typeof payload !== 'string') break
       result.error = payload
+      session.last_driver_error = payload
       // An optimistic pursuit turn has no submission to fail with. Unwind it
       // so the error cannot strand a spinner; if the pursuit does start
       // later, its own start report recreates the turn.
@@ -308,7 +344,7 @@ export function reduceRuntimeEvent(
       result.settled = settleTurn(
         session,
         'failed',
-        processExitError ?? 'The agent exited before responding.',
+        session.last_driver_error ?? processExitError ?? 'The agent exited before responding.',
         clock,
       )
       result.permission = null
@@ -319,6 +355,9 @@ export function reduceRuntimeEvent(
       break
   }
 
+  if (['cancelRequested', 'connected', 'turnStarted', 'turnFinished', 'processExited'].includes(kind)) {
+    delete session.last_driver_error
+  }
   if (['cancelRequested', 'turnParked', 'turnFinished', 'processExited'].includes(kind)) {
     delete session.pending_permission
     delete session.pending_user_input
@@ -654,6 +693,12 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null
 }
 
+function historySnapshotIsStale(current: AgentSession, snapshot: AgentSession): boolean {
+  const applied = current.runtime_event_cursor
+  const saved = snapshot.runtime_event_cursor
+  return Boolean(applied && saved && applied.runtime_id === saved.runtime_id && applied.epoch === saved.epoch && applied.sequence > saved.sequence)
+}
+
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
 }
@@ -662,10 +707,13 @@ function clone<T>(value: T): T {
 export function reduceRuntimeEventAfterPersistence(
   current: AgentSession,
   wire: SequencedEvent,
-  state: { pendingExit: SequencedEvent | null },
+  state: { pendingExit: SequencedEvent | null; lastDriverError?: string | null },
   clock: ReducerClock = defaultClock,
   processExitError: string | null = null,
 ): RuntimeEventResult | null {
+  if (wire.event.kind === 'historySnapshot' && !historySnapshotIsStale(current, wire.event.payload as unknown as AgentSession)) {
+    state.pendingExit = null
+  }
   if (wire.event.kind === 'processExited') {
     const saved = current.history_saved_cursor
     if (!saved || saved.runtime_id !== wire.runtimeId || saved.epoch !== wire.epoch || saved.sequence < wire.sequence) {
@@ -674,6 +722,7 @@ export function reduceRuntimeEventAfterPersistence(
     }
   }
   const result = reduceRuntimeEvent(current, wire, clock, processExitError)
+  if (wire.event.kind === 'historySnapshot') state.lastDriverError = result.session.last_driver_error ?? null
   const exit = state.pendingExit
   if (wire.event.kind === 'historyPersistence' && exit
     && wire.runtimeId === exit.runtimeId && wire.epoch === exit.epoch

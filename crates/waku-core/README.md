@@ -16,8 +16,14 @@ transaction with WAL `synchronous=FULL`. Only a successful commit emits a
 `HistoryPersistence` acknowledgment. Failed batches remain available for retry.
 The server keeps a 4096-event hot replay window; `ReplayEvents` reads older
 history in pages of at most 512 events, bounded by the transport byte budget.
-No persisted event cleanup is enabled. Stale client snapshots can update
-metadata without replacing the daemon-owned history.
+Saved redundant events retain at most 20,000 rows per session or 90 days from
+reliable preservation. Unknown or unconfirmed prefixes remain unprunable.
+A pruned `ReplayEvents` prefix returns `HistorySnapshot` with the complete
+readable history and its saved cursor, read in one SQLite transaction.
+Snapshot responses use ordered UTF-8 chunks below the wire frame limit;
+clients validate their total byte length and cursor before replacing history.
+Readable history remains until explicit deletion. Stale client snapshots can
+update metadata without replacing daemon-owned history.
 
 `DaemonClient` lives in [`waku-client`](../waku-client), which is what Waku
 Desktop depends on. `serve` and `WakuBackend` are used by the `waku-daemon`

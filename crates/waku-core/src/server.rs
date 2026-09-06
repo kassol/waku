@@ -978,7 +978,7 @@ fn handle_connection(
 
     'connection: while !shutdown.load(Ordering::Acquire) {
         while let Ok(message) = outgoing_rx.try_recv() {
-            if write_json(&mut socket, &message).is_err() {
+            if write_server_message(&mut socket, &message).is_err() {
                 break 'connection;
             }
         }
@@ -1534,6 +1534,62 @@ fn read_client_message(socket: &mut WebSocket<TcpStream>) -> anyhow::Result<Clie
             _ => {}
         }
     }
+}
+
+fn write_server_message<S: io::Read + io::Write>(
+    socket: &mut WebSocket<S>,
+    message: &ServerMessage,
+) -> anyhow::Result<()> {
+    let (request_id, session, replay) = match message {
+        ServerMessage::Response {
+            request_id,
+            outcome:
+                ResponseOutcome::Ok {
+                    payload: ResponsePayload::HistorySnapshot { session },
+                },
+        } => (*request_id, session, true),
+        ServerMessage::Response {
+            request_id,
+            outcome:
+                ResponseOutcome::Ok {
+                    payload:
+                        ResponsePayload::Session {
+                            session: Some(session),
+                        },
+                },
+        } => (*request_id, session, false),
+        _ => return write_json(socket, message),
+    };
+    let data = serde_json::to_string(session)?;
+    if !replay && data.len() < MAX_WIRE_MESSAGE_BYTES / 2 {
+        return write_json(socket, message);
+    }
+    let cursor = session.runtime_event_cursor;
+    if replay && (cursor.is_none() || cursor != session.history_saved_cursor) {
+        bail!("snapshot has no reliable saved cursor");
+    }
+    let mut offset = 0;
+    while offset < data.len() {
+        // JSON escaping can expand one source byte to six bytes.
+        let mut end = (offset + MAX_WIRE_MESSAGE_BYTES / 8).min(data.len());
+        while !data.is_char_boundary(end) {
+            end -= 1;
+        }
+        write_json(
+            socket,
+            &ServerMessage::HistorySnapshotChunk {
+                request_id,
+                session_id: session.id,
+                cursor,
+                replay,
+                offset: offset as u64,
+                total_bytes: data.len() as u64,
+                data: data[offset..end].to_owned(),
+            },
+        )?;
+        offset = end;
+    }
+    Ok(())
 }
 
 fn write_json<S: io::Read + io::Write, T: serde::Serialize>(
@@ -2136,6 +2192,113 @@ mod tests {
     }
 
     #[test]
+    fn pruned_snapshot_larger_than_wire_limit_restores_over_the_real_socket() {
+        let root = std::env::temp_dir().join(format!("waku-large-history-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::daemon(root.join("app.db"));
+        let mut state = crate::persistence::PersistedState::fresh(root.join("workspace"));
+        state.sessions[0].begin_turn("large preserved history");
+        state.sessions[0].push_message(
+            crate::model::MessageRole::Assistant,
+            "界".repeat(MAX_WIRE_MESSAGE_BYTES / 3 + 1024),
+        );
+        let session_id = state.sessions[0].id;
+        let runtime_id = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let cursor = crate::model::RuntimeEventCursor {
+            runtime_id,
+            epoch,
+            sequence: 20_001,
+        };
+        state.sessions[0].runtime_event_cursor = Some(cursor);
+        state.sessions[0].history_saved_cursor = Some(cursor);
+        let events = (1..=20_001)
+            .map(|sequence| SequencedEvent {
+                session_id,
+                runtime_id,
+                epoch,
+                sequence,
+                event: WireDriverEvent::new("textDelta", json!("x")),
+            })
+            .collect::<Vec<_>>();
+        store.save_events(&mut state, &events).unwrap();
+        drop(state);
+        drop(store);
+        let backend = Arc::new(
+            WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(root.join("app.db")),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "fixture".into(),
+                backend,
+                stop,
+                ServerOptions::default(),
+            )
+            .unwrap()
+        });
+        let result = std::panic::catch_unwind(|| {
+            let client = DaemonClient::connect(&address.to_string(), "fixture".into()).unwrap();
+            let ResponsePayload::HistorySnapshot { session } = client
+                .request(
+                    session_id,
+                    runtime_id,
+                    Command::ReplayEvents {
+                        cursor: ReplayCursor {
+                            session_id,
+                            runtime_id,
+                            epoch,
+                            sequence: 0,
+                        },
+                    },
+                )
+                .unwrap()
+            else {
+                panic!("missing large snapshot");
+            };
+            assert_eq!(session.history_saved_cursor, Some(cursor));
+            assert_eq!(
+                session.messages.last().unwrap().content.len(),
+                MAX_WIRE_MESSAGE_BYTES + 3072
+            );
+            assert!(session.messages.last().unwrap().content.ends_with("界"));
+            drop(session);
+            let ResponsePayload::Session {
+                session: Some(session),
+            } = client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::HydrateSession { session_id },
+                )
+                .unwrap()
+            else {
+                panic!("missing large details");
+            };
+            assert_eq!(
+                session.messages.last().unwrap().content.len(),
+                MAX_WIRE_MESSAGE_BYTES + 3072
+            );
+            drop(session);
+            assert!(
+                matches!(client.request(session_id, runtime_id, Command::ReplayEvents { cursor: ReplayCursor { session_id, runtime_id, epoch, sequence: 20_001 } }).unwrap(), ResponsePayload::EventReplay { events } if events.is_empty())
+            );
+        });
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
     fn daemon_preserves_unviewed_provider_history_across_database_reopen() {
         let root = std::env::temp_dir().join(format!("waku-history-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -2426,6 +2589,69 @@ mod tests {
                 format!("{}tail unsaved recovered", "x".repeat(4_200))
             );
             assert_eq!(current.history_saved_cursor.unwrap().sequence, 4_210);
+            // A late subscriber crosses persisted pruning as well as the hot window.
+            sink.send_batch(
+                (0..16_000)
+                    .map(|_| WireDriverEvent::new("textDelta", json!("x")))
+                    .collect(),
+            )
+            .unwrap();
+            let pruned_client =
+                DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+            let pruned = pruned_client.subscribe(session_id, runtime_id);
+            let snapshot = pruned.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(snapshot.event.kind, "historySnapshot");
+            assert_eq!(snapshot.sequence, 20_210);
+            let mut restored: crate::model::AgentSession =
+                serde_json::from_value(snapshot.event.payload).unwrap();
+            assert_eq!(
+                restored.messages.last().unwrap().content,
+                format!(
+                    "{}{}",
+                    current.messages.last().unwrap().content,
+                    "x".repeat(16_000)
+                )
+            );
+            assert_eq!(
+                pruned
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .event
+                    .kind,
+                "historyPersistence"
+            );
+            sink.send(WireDriverEvent::new("textDelta", json!(" after snapshot")))
+                .unwrap();
+            let tail = pruned.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(tail.sequence, 20_211);
+            assert_eq!(tail.event.kind, "textDelta");
+            let mut reducer = waku_protocol::history::HistoryReducer::default();
+            let snapshot = restored.clone();
+            reducer.apply(
+                &mut restored,
+                crate::model::DriverEvent::HistorySnapshot(Box::new(snapshot)),
+            );
+            reducer.apply(
+                &mut restored,
+                waku_protocol::event_from_wire(tail.event).unwrap(),
+            );
+            let ResponsePayload::Session {
+                session: Some(current),
+            } = client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::HydrateSession { session_id },
+                )
+                .unwrap()
+            else {
+                panic!("missing tail after snapshot");
+            };
+            assert_eq!(restored.messages.len(), current.messages.len());
+            assert_eq!(
+                restored.messages.last().unwrap().content,
+                current.messages.last().unwrap().content
+            );
             let reopened_backend = WakuBackend::new(
                 DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
                 StateStore::daemon(root.join("app.db")),

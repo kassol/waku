@@ -1105,3 +1105,5 @@ usage_error.curl_no_status: curl から HTTP ステータス行が返されま�
 session.history_saved: 履歴を保存しました
 session.history_pending: 履歴を保存中…
 session.history_save_failed: '履歴が保存されていません：%{error}'
+
+sidebar.original_parent: "元の親セッション: %{id}"

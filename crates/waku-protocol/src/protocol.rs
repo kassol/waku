@@ -9,8 +9,8 @@ use crate::attachments::{AttachmentUpload, StoredAttachment};
 use crate::computer_use::ComputerPermissions;
 use crate::model::{
     AgentSession, GoalOperation, Project, ProviderKind, ProviderProbe, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, RuntimeMode, SessionStatus, TurnStatus,
-    UserInputAnswer,
+    ProviderSessionHistory, ProviderSessionSummary, RuntimeEventCursor, RuntimeMode, SessionStatus,
+    TurnStatus, UserInputAnswer,
 };
 use crate::persistence::{ComposerDraftChange, ComposerDrafts, SessionMessageMatch};
 use crate::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
@@ -20,7 +20,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -415,6 +415,16 @@ pub enum ServerMessage {
         request_id: Uuid,
         outcome: ResponseOutcome,
     },
+    /// A fixed session snapshot transferred without exceeding the wire frame limit.
+    HistorySnapshotChunk {
+        request_id: Uuid,
+        session_id: Uuid,
+        cursor: Option<RuntimeEventCursor>,
+        replay: bool,
+        offset: u64,
+        total_bytes: u64,
+        data: String,
+    },
     Event(SequencedEvent),
     /// A reliable storage commit (or its failure), separate from receipt.
     HistoryPersistence {
@@ -510,6 +520,9 @@ pub enum ResponsePayload {
         sessions: Vec<AgentSession>,
         default_cwd: PathBuf,
         projectless_root: Option<PathBuf>,
+    },
+    HistorySnapshot {
+        session: AgentSession,
     },
     EventReplay {
         events: Vec<SequencedEvent>,
@@ -631,7 +644,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 11);
     }
 
     #[test]
@@ -640,7 +653,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 11);
     }
 
     #[test]

@@ -36,6 +36,13 @@
       "when": 1788662642342,
       "tag": "0004_silent_outlaw_kid",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1788664857566,
+      "tag": "0005_complex_bruce_banner",
+      "breakpoints": true
     }
   ]
 }

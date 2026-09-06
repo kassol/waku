@@ -110,6 +110,55 @@ impl Waku {
     ) -> bool {
         runtime.last_active_at = Instant::now();
         match event {
+            DriverEvent::HistorySnapshot(snapshot) => {
+                if self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .is_some_and(|session| {
+                        waku_protocol::history::history_snapshot_is_stale(session, &snapshot)
+                    })
+                {
+                    return true;
+                }
+                runtime.pending_permission = snapshot.pending_permission.clone();
+                if runtime
+                    .pending_user_input
+                    .as_ref()
+                    .map(|request| &request.request_id)
+                    != snapshot
+                        .pending_user_input
+                        .as_ref()
+                        .map(|request| &request.request_id)
+                {
+                    runtime.pending_user_input =
+                        snapshot.pending_user_input.clone().map(|request| {
+                            PendingUserInput::new(request.request_id, request.questions)
+                        });
+                    if self.state.selected_session == Some(session_id) {
+                        self.user_input_answer
+                            .update(cx, |input, cx| input.clear(cx));
+                    }
+                }
+                // The same message IDs can now hold a much longer saved prefix.
+                if let Some(session) = self.state.session_mut(session_id) {
+                    let mut markdown = self.message_markdown.borrow_mut();
+                    for message in session.messages.iter().chain(snapshot.messages.iter()) {
+                        markdown.remove(&message.id);
+                    }
+                }
+                self.activity_diffs.borrow_mut().clear();
+                self.apply_history_event(
+                    session_id,
+                    runtime,
+                    DriverEvent::HistorySnapshot(snapshot),
+                );
+                if self.state.selected_session == Some(session_id) {
+                    self.reset_visible_state();
+                    self.reset_transcript_rows(self.transcript_row_count());
+                }
+            }
             event @ (DriverEvent::RuntimeEventCursorAdvanced(_)
             | DriverEvent::HistoryPersistence { .. }
             | DriverEvent::AgentPresetSelected(_)

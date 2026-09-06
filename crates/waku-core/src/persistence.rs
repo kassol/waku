@@ -1192,6 +1192,10 @@ impl StateStore {
             });
         }
         let connection = &guard.as_ref().expect("storage opened above").connection;
+        Self::hydrate_from(connection, session)
+    }
+
+    fn hydrate_from(connection: &Connection, session: &mut AgentSession) -> io::Result<()> {
         let id = session.id.to_string();
 
         let data: Option<String> = connection
@@ -1221,6 +1225,7 @@ impl StateStore {
         session.runtime_event_cursor = stored.runtime_event_cursor;
         session.history_saved_cursor = stored.history_saved_cursor;
         session.history_save_error = stored.history_save_error;
+        session.last_driver_error = stored.last_driver_error;
         session.pending_permission = stored.pending_permission;
         session.pending_user_input = stored.pending_user_input;
 
@@ -1449,6 +1454,26 @@ impl StateStore {
                 params![event.session_id.to_string(), event.runtime_id.to_string(), event.epoch.to_string(), event.sequence as i64, serde_json::to_string(event).map_err(to_io_error)?],
             ).map_err(to_io_error)?;
         }
+        // Mark only the prefix covered by the history written in this transaction.
+        // Legacy and unconfirmed rows stay unprunable until their projection is saved.
+        for (session_id, _) in &written_messages {
+            let session = state
+                .sessions
+                .iter()
+                .find(|session| session.id == *session_id)
+                .unwrap();
+            let Some(saved) = session.history_saved_cursor else {
+                continue;
+            };
+            transaction.execute(
+                "UPDATE session_events SET saved_at = unixepoch() WHERE session_id = ?1 AND runtime_id = ?2 AND epoch = ?3 AND sequence <= ?4 AND saved_at IS NULL",
+                params![session_id.to_string(), saved.runtime_id.to_string(), saved.epoch.to_string(), saved.sequence as i64],
+            ).map_err(to_io_error)?;
+            transaction.execute(
+                "DELETE FROM session_events WHERE session_id = ?1 AND saved_at IS NOT NULL AND (saved_at < unixepoch() - 7776000 OR rowid IN (SELECT rowid FROM session_events WHERE session_id = ?1 ORDER BY rowid DESC LIMIT -1 OFFSET 20000))",
+                params![session_id.to_string()],
+            ).map_err(to_io_error)?;
+        }
         transaction.commit().map_err(to_io_error)?;
         storage.saved_projects = projects_fingerprint;
         storage.persisted_sessions = live;
@@ -1470,17 +1495,74 @@ impl StateStore {
         epoch: Uuid,
         after: u64,
     ) -> io::Result<Vec<crate::SequencedEvent>> {
+        let connection = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(to_io_error)?;
+        Self::replay_events_from(&connection, session_id, runtime_id, epoch, after)
+    }
+
+    /// Read the event prefix and its fallback history from one SQLite snapshot.
+    /// A concurrent save/prune can therefore never advance one without the other.
+    pub fn replay_history(
+        &self,
+        cursor: crate::protocol::ReplayCursor,
+    ) -> io::Result<crate::protocol::ResponsePayload> {
+        let connection = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(to_io_error)?;
+        let transaction = connection.unchecked_transaction().map_err(to_io_error)?;
+        let events = Self::replay_events_from(
+            &transaction,
+            cursor.session_id,
+            cursor.runtime_id,
+            cursor.epoch,
+            cursor.sequence,
+        )?;
+        if events.is_empty()
+            || events.iter().enumerate().any(|(index, event)| {
+                event.sequence != cursor.sequence.saturating_add(index as u64 + 1)
+            })
+        {
+            let data: Option<String> = transaction
+                .query_row(
+                    "SELECT data FROM session_details WHERE session_id = ?1",
+                    params![cursor.session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(to_io_error)?;
+            if let Some(data) = data {
+                let mut session: AgentSession = serde_json::from_str(&data).map_err(to_io_error)?;
+                if session.history_saved_cursor.is_some_and(|saved| {
+                    saved.runtime_id == cursor.runtime_id
+                        && saved.epoch == cursor.epoch
+                        && saved.sequence > cursor.sequence
+                }) {
+                    Self::hydrate_from(&transaction, &mut session)?;
+                    return Ok(crate::protocol::ResponsePayload::HistorySnapshot { session });
+                }
+            }
+        }
+        Ok(crate::protocol::ResponsePayload::EventReplay { events })
+    }
+
+    fn replay_events_from(
+        connection: &Connection,
+        session_id: Uuid,
+        runtime_id: Uuid,
+        epoch: Uuid,
+        after: u64,
+    ) -> io::Result<Vec<crate::SequencedEvent>> {
         let after = i64::try_from(after).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "history cursor exceeds the supported range",
             )
         })?;
-        let connection = Connection::open_with_flags(
-            &self.path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(to_io_error)?;
         let mut query = connection.prepare("SELECT data FROM session_events WHERE session_id = ?1 AND runtime_id = ?2 AND epoch = ?3 AND sequence > ?4 ORDER BY sequence LIMIT 512").map_err(to_io_error)?;
         let rows = query
             .query_map(
@@ -1620,6 +1702,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         pending_user_input: None,
         history_saved_cursor: None,
         history_save_error: None,
+        last_driver_error: None,
         provider_session_id: None,
         messages: Vec::new(),
         transcript_blocks: Vec::new(),
@@ -2328,11 +2411,16 @@ mod tests {
         };
         state.sessions[0].runtime_event_cursor = Some(cursor);
         state.sessions[0].history_saved_cursor = Some(cursor);
+        state.sessions[0].last_driver_error = Some("provider connection closed".into());
         state.mark_session_dirty(session_id);
         store.save_events(&mut state, &events).unwrap();
         let reopened = StateStore::daemon(store.path().to_owned());
         let restored = load_hydrated(&reopened);
         assert_eq!(restored.sessions[0].history_saved_cursor, Some(cursor));
+        assert_eq!(
+            restored.sessions[0].last_driver_error.as_deref(),
+            Some("provider connection closed")
+        );
         assert_eq!(
             restored.sessions[0]
                 .pending_permission
@@ -2356,6 +2444,221 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn retained_history_survives_event_limit_and_parent_deletion() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(directory.join("workspace"));
+        state.sessions[0].begin_turn("parent");
+        let parent_id = state.sessions[0].id;
+        let mut child = AgentSession::new(state.projects[0].id, ProviderKind::Codex);
+        child.parent_session_id = Some(parent_id);
+        let workspace = directory.join("child-worktree");
+        fs::create_dir_all(&workspace).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&workspace)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(workspace.join("result.txt"), "uncommitted child work").unwrap();
+        child.workspace = SessionWorkspace::Worktree {
+            path: workspace.clone(),
+            branch: "codex/child".into(),
+        };
+        child.begin_turn("keep child history");
+        child.push_message(MessageRole::Assistant, "complete history");
+        let session_id = child.id;
+        let runtime_id = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let cursor = crate::model::RuntimeEventCursor {
+            runtime_id,
+            epoch,
+            sequence: 20_005,
+        };
+        child.runtime_event_cursor = Some(cursor);
+        child.history_saved_cursor = Some(cursor);
+        state.sessions.push(child);
+        state.mark_session_dirty(session_id);
+        let events = (1..=20_005)
+            .map(|sequence| crate::SequencedEvent {
+                session_id,
+                runtime_id,
+                epoch,
+                sequence,
+                event: crate::WireDriverEvent::new("textDelta", serde_json::json!("x")),
+            })
+            .collect::<Vec<_>>();
+        store.save_events(&mut state, &events).unwrap();
+        assert_eq!(
+            store
+                .replay_events(session_id, runtime_id, epoch, 0)
+                .unwrap()[0]
+                .sequence,
+            6
+        );
+        state.sessions.retain(|session| session.id != parent_id);
+        store.save(&mut state).unwrap();
+        let reopened = StateStore::daemon(store.path().to_owned());
+        let restored = load_hydrated(&reopened);
+        let child = restored
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .unwrap();
+        assert_eq!(child.parent_session_id, Some(parent_id));
+        assert_eq!(child.messages.last().unwrap().content, "complete history");
+        assert_eq!(child.history_saved_cursor, Some(cursor));
+        let crate::protocol::ResponsePayload::HistorySnapshot { session } = reopened
+            .replay_history(crate::protocol::ReplayCursor {
+                session_id,
+                runtime_id,
+                epoch,
+                sequence: 0,
+            })
+            .unwrap()
+        else {
+            panic!("pruned prefix requires a full snapshot");
+        };
+        assert_eq!(session.parent_session_id, Some(parent_id));
+        assert_eq!(
+            fs::read_to_string(workspace.join("result.txt")).unwrap(),
+            "uncommitted child work"
+        );
+        assert_eq!(
+            session.workspace,
+            SessionWorkspace::Worktree {
+                path: workspace,
+                branch: "codex/child".into()
+            }
+        );
+        assert_eq!(session.messages.last().unwrap().content, "complete history");
+        assert_eq!(session.history_saved_cursor, Some(cursor));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn history_pruning_uses_age_and_preserves_unconfirmed_events() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(directory.join("workspace"));
+        state.sessions[0].begin_turn("keep input");
+        let session_id = state.sessions[0].id;
+        let runtime_id = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let cursor = crate::model::RuntimeEventCursor {
+            runtime_id,
+            epoch,
+            sequence: 2,
+        };
+        state.sessions[0].history_saved_cursor = Some(cursor);
+        state.sessions[0].runtime_event_cursor = Some(cursor);
+        let events = (1..=3)
+            .map(|sequence| crate::SequencedEvent {
+                session_id,
+                runtime_id,
+                epoch,
+                sequence,
+                event: crate::WireDriverEvent::new("textDelta", serde_json::json!("x")),
+            })
+            .collect::<Vec<_>>();
+        store.save_events(&mut state, &events).unwrap();
+        let connection = Connection::open(store.path()).unwrap();
+        connection
+            .execute(
+                "UPDATE session_events SET saved_at = 1 WHERE sequence = 2 AND saved_at IS NOT NULL",
+                [],
+            )
+            .unwrap();
+        state.mark_session_dirty(session_id);
+        store.save(&mut state).unwrap();
+        let page = store
+            .replay_events(session_id, runtime_id, epoch, 0)
+            .unwrap();
+        assert_eq!(
+            page.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            [1, 3],
+            "retain recent and unconfirmed events even across an interior age gap"
+        );
+        let crate::protocol::ResponsePayload::HistorySnapshot { session } = store
+            .replay_history(crate::protocol::ReplayCursor {
+                session_id,
+                runtime_id,
+                epoch,
+                sequence: 0,
+            })
+            .unwrap()
+        else {
+            panic!("aged prefix requires its history");
+        };
+        assert_eq!(session.messages[0].content, "keep input");
+        assert_eq!(session.history_saved_cursor, Some(cursor));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_pruning_and_replay_return_one_complete_saved_snapshot() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(directory.join("workspace"));
+        state.sessions[0].begin_turn("keep input");
+        let session_id = state.sessions[0].id;
+        let runtime_id = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let event = |sequence| crate::SequencedEvent {
+            session_id,
+            runtime_id,
+            epoch,
+            sequence,
+            event: crate::WireDriverEvent::new("textDelta", serde_json::json!("x")),
+        };
+        let cursor = |sequence| crate::model::RuntimeEventCursor {
+            runtime_id,
+            epoch,
+            sequence,
+        };
+        state.sessions[0].push_message(MessageRole::Assistant, "20001");
+        state.sessions[0].runtime_event_cursor = Some(cursor(20_001));
+        state.sessions[0].history_saved_cursor = Some(cursor(20_001));
+        store
+            .save_events(&mut state, &(1..=20_001).map(event).collect::<Vec<_>>())
+            .unwrap();
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                for sequence in 20_002..=20_025 {
+                    state.sessions[0].messages.last_mut().unwrap().content = sequence.to_string();
+                    state.sessions[0].runtime_event_cursor = Some(cursor(sequence));
+                    state.sessions[0].history_saved_cursor = Some(cursor(sequence));
+                    state.mark_session_dirty(session_id);
+                    store.save_events(&mut state, &[event(sequence)]).unwrap();
+                }
+            });
+            start.wait();
+            for _ in 0..100 {
+                let crate::protocol::ResponsePayload::HistorySnapshot { session } = store
+                    .replay_history(crate::protocol::ReplayCursor {
+                        session_id,
+                        runtime_id,
+                        epoch,
+                        sequence: 0,
+                    })
+                    .unwrap()
+                else {
+                    panic!("missing pruned snapshot");
+                };
+                assert_eq!(
+                    session.messages.last().unwrap().content,
+                    session.history_saved_cursor.unwrap().sequence.to_string()
+                );
+            }
+        });
         fs::remove_dir_all(directory).unwrap();
     }
 

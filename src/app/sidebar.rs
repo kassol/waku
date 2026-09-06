@@ -307,6 +307,110 @@ fn visible_project_sessions(
     (visible, older_seen > revealed_older_sessions)
 }
 
+#[derive(Default)]
+pub(super) struct SidebarTree {
+    roots: Vec<Uuid>,
+    nodes: HashMap<Uuid, SidebarTreeNode>,
+}
+
+#[derive(Default)]
+struct SidebarTreeNode {
+    parent: Option<Uuid>,
+    children: Vec<Uuid>,
+    depth: usize,
+    latest: u64,
+    session_index: usize,
+}
+
+impl SidebarTree {
+    fn new(sessions: &[&AgentSession]) -> Self {
+        let mut tree = Self::default();
+        for session in sessions {
+            tree.nodes.insert(
+                session.id,
+                SidebarTreeNode {
+                    latest: sidebar_session_timestamp(session),
+                    ..Default::default()
+                },
+            );
+        }
+        for session in sessions {
+            if let Some(parent) = session
+                .parent_session_id
+                .filter(|id| tree.nodes.contains_key(id))
+            {
+                tree.nodes
+                    .get_mut(&parent)
+                    .unwrap()
+                    .children
+                    .push(session.id);
+                tree.nodes.get_mut(&session.id).unwrap().parent = Some(parent);
+            } else {
+                tree.roots.push(session.id);
+            }
+        }
+        // Iterative traversal bounds stack use even for imported deep histories.
+        let mut visited = HashSet::new();
+        let mut order = Vec::with_capacity(sessions.len());
+        let mut pending = tree
+            .roots
+            .iter()
+            .rev()
+            .map(|id| (*id, 0))
+            .collect::<Vec<_>>();
+        for candidate in sessions {
+            if pending.is_empty() && !visited.contains(&candidate.id) {
+                tree.roots.push(candidate.id);
+                if let Some(parent) = tree.nodes.get_mut(&candidate.id).unwrap().parent.take() {
+                    tree.nodes
+                        .get_mut(&parent)
+                        .unwrap()
+                        .children
+                        .retain(|id| *id != candidate.id);
+                }
+                pending.push((candidate.id, 0));
+            }
+            while let Some((id, depth)) = pending.pop() {
+                if !visited.insert(id) {
+                    continue;
+                }
+                order.push(id);
+                let node = tree.nodes.get_mut(&id).unwrap();
+                node.depth = depth;
+                pending.extend(node.children.iter().rev().map(|child| (*child, depth + 1)));
+            }
+        }
+        for id in order.into_iter().rev() {
+            let node = &tree.nodes[&id];
+            let (parent, latest) = (node.parent, node.latest);
+            if let Some(parent) = parent {
+                let parent = tree.nodes.get_mut(&parent).unwrap();
+                parent.latest = parent.latest.max(latest);
+            }
+        }
+        tree
+    }
+
+    fn visible(&self, roots: &[Uuid], collapsed: &HashSet<Uuid>) -> Vec<Uuid> {
+        let mut visible = Vec::new();
+        let mut pending = roots.iter().rev().copied().collect::<Vec<_>>();
+        while let Some(id) = pending.pop() {
+            visible.push(id);
+            if !collapsed.contains(&id) {
+                pending.extend(
+                    self.nodes[&id]
+                        .children
+                        .iter()
+                        .rev()
+                        .copied()
+                        .filter(|child| self.nodes[child].parent == Some(id)),
+                );
+            }
+        }
+        visible
+    }
+}
+
 fn sidebar_project_is_projectless(project: &Project, projectless_root: Option<&Path>) -> bool {
     projectless_root.is_some_and(|root| project.path.starts_with(root))
 }
@@ -1141,7 +1245,51 @@ impl Waku {
 
     /// Keep a newly selected task visible without disturbing the sidebar when
     /// its row is already fully inside the viewport.
-    pub(super) fn reveal_sidebar_session(&self, session_id: Uuid) {
+    pub(super) fn reveal_sidebar_session(&mut self, session_id: Uuid) {
+        self.sidebar_rows_cached(Local::now().date_naive(), unix_time());
+        let tree = self.sidebar_tree.borrow();
+        let mut root = session_id;
+        while let Some(parent) = tree.nodes.get(&root).and_then(|node| node.parent) {
+            self.sidebar_collapsed_sessions.borrow_mut().remove(&parent);
+            root = parent;
+        }
+        if let Some(node) = tree.nodes.get(&root) {
+            let session = &self.state.sessions[node.session_index];
+            let group = match self.state.sidebar_grouping {
+                SidebarGrouping::Updated => SidebarGroup::Updated(session_date_group(
+                    sidebar_session_timestamp(session),
+                    Local::now().date_naive(),
+                )),
+                SidebarGrouping::Project => {
+                    let workspace_root = crate::projectless::workspace_root();
+                    if self
+                        .state
+                        .projects
+                        .iter()
+                        .find(|project| project.id == session.project_id)
+                        .is_some_and(|project| {
+                            sidebar_project_is_projectless(project, workspace_root.as_deref())
+                        })
+                    {
+                        SidebarGroup::Projectless
+                    } else {
+                        SidebarGroup::Project(session.project_id)
+                    }
+                }
+            };
+            self.sidebar_collapsed_groups.remove(&group);
+            if self.state.sidebar_grouping == SidebarGrouping::Project {
+                let count = tree
+                    .roots
+                    .iter()
+                    .position(|id| *id == root)
+                    .unwrap_or_default()
+                    + 1;
+                let revealed = self.sidebar_project_reveal_counts.entry(group).or_default();
+                *revealed = (*revealed).max(count);
+            }
+        }
+        drop(tree);
         let rows = self.sidebar_rows_cached(Local::now().date_naive(), unix_time());
         self.sync_sidebar_rows(&rows);
         if let Some(index) = sidebar_session_row_index(&rows, session_id) {
@@ -1176,9 +1324,8 @@ impl Waku {
             },
         );
         for session in &self.state.sessions {
-            if !session.has_started() {
-                continue;
-            }
+            fingerprint = mix(fingerprint, u64::from(session.has_started()));
+            fingerprint = mix_uuid(fingerprint, session.parent_session_id.unwrap_or_default());
             fingerprint = mix_uuid(fingerprint, session.id);
             fingerprint = mix_uuid(fingerprint, session.project_id);
             fingerprint = mix(fingerprint, sidebar_session_timestamp(session));
@@ -1219,6 +1366,15 @@ impl Waku {
             mix(fingerprint, self.sidebar_collapsed_groups.len() as u64),
             collapsed,
         );
+        let collapsed_tree = self.sidebar_collapsed_sessions.borrow();
+        fingerprint = mix(fingerprint, collapsed_tree.len() as u64);
+        fingerprint = mix(
+            fingerprint,
+            collapsed_tree
+                .iter()
+                .fold(0u64, |sum, id| sum.wrapping_add(mix_uuid(0, *id))),
+        );
+        drop(collapsed_tree);
         if self.sidebar_rows_fingerprint.get() != Some(fingerprint) {
             *self.sidebar_rows_snapshot.borrow_mut() = Rc::new(self.sidebar_rows(today, now));
             self.sidebar_rows_fingerprint.set(Some(fingerprint));
@@ -1229,14 +1385,31 @@ impl Waku {
     /// Snapshot the session history as a flat list of lightweight rows under
     /// the current grouping and ordering preferences.
     fn sidebar_rows(&self, today: NaiveDate, now: u64) -> Vec<SidebarRow> {
+        let referenced = self
+            .state
+            .sessions
+            .iter()
+            .filter_map(|session| session.parent_session_id)
+            .collect::<HashSet<_>>();
         let mut sorted_sessions = self
             .state
             .sessions
             .iter()
-            .filter(|session| session.has_started())
+            .filter(|session| {
+                session.has_started()
+                    || session.parent_session_id.is_some()
+                    || referenced.contains(&session.id)
+            })
             .collect::<Vec<_>>();
         sort_sidebar_sessions(&mut sorted_sessions, self.state.sidebar_ordering);
 
+        let mut tree = SidebarTree::new(&sorted_sessions);
+        for (index, session) in self.state.sessions.iter().enumerate() {
+            if let Some(node) = tree.nodes.get_mut(&session.id) {
+                node.session_index = index;
+            }
+        }
+        sorted_sessions.retain(|session| tree.nodes[&session.id].parent.is_none());
         let mut rows = vec![SidebarRow::Search];
         match self.state.sidebar_grouping {
             SidebarGrouping::Updated => {
@@ -1265,7 +1438,7 @@ impl Waku {
                 let recent_cutoff = now.saturating_sub(SIDEBAR_PROJECT_RECENT_WINDOW_SECONDS);
                 let session_timestamps = sorted_sessions
                     .iter()
-                    .map(|session| (session.id, sidebar_session_timestamp(session)))
+                    .map(|session| (session.id, tree.nodes[&session.id].latest))
                     .collect::<HashMap<_, _>>();
                 let projectless_root = crate::projectless::workspace_root();
                 let projectless_project_ids = self
@@ -1329,7 +1502,20 @@ impl Waku {
             };
             rows.push(SidebarRow::Header(group));
         }
-        rows
+        let collapsed = self.sidebar_collapsed_sessions.borrow();
+        let mut expanded_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            match row {
+                SidebarRow::Session(id) => expanded_rows.extend(
+                    tree.visible(&[id], &collapsed)
+                        .into_iter()
+                        .map(SidebarRow::Session),
+                ),
+                _ => expanded_rows.push(row),
+            }
+        }
+        *self.sidebar_tree.borrow_mut() = tree;
+        expanded_rows
     }
 
     /// Keep the virtualized list in sync with the current row snapshot.
@@ -1794,16 +1980,115 @@ impl Waku {
         cx.notify();
     }
 
+    fn toggle_sidebar_session(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        let mut collapsed = self.sidebar_collapsed_sessions.borrow_mut();
+        if !collapsed.remove(&session_id) {
+            collapsed.insert(session_id);
+        }
+        drop(collapsed);
+        cx.notify();
+    }
+
+    fn navigate_sidebar_session(
+        &mut self,
+        session_id: Uuid,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = self.sidebar_rows_cached(Local::now().date_naive(), unix_time());
+        let tree = self.sidebar_tree.borrow();
+        let Some(node) = tree.nodes.get(&session_id) else {
+            return;
+        };
+        let collapsed = self
+            .sidebar_collapsed_sessions
+            .borrow()
+            .contains(&session_id);
+        let target = match key {
+            "left" if !collapsed && !node.children.is_empty() => {
+                drop(tree);
+                self.toggle_sidebar_session(session_id, cx);
+                return;
+            }
+            "right" if collapsed && !node.children.is_empty() => {
+                drop(tree);
+                self.toggle_sidebar_session(session_id, cx);
+                return;
+            }
+            "left" => node.parent,
+            "right" => node.children.first().copied(),
+            "up" | "down" => sidebar_session_row_index(&rows, session_id).and_then(|index| {
+                if key == "up" {
+                    rows[..index].iter().rev().find_map(|row| {
+                        if let SidebarRow::Session(id) = row {
+                            Some(*id)
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    rows[index + 1..].iter().find_map(|row| {
+                        if let SidebarRow::Session(id) = row {
+                            Some(*id)
+                        } else {
+                            None
+                        }
+                    })
+                }
+            }),
+            "home" => rows.iter().find_map(|row| {
+                if let SidebarRow::Session(id) = row {
+                    Some(*id)
+                } else {
+                    None
+                }
+            }),
+            "end" => rows.iter().rev().find_map(|row| {
+                if let SidebarRow::Session(id) = row {
+                    Some(*id)
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        };
+        drop(tree);
+        if let Some(target) = target {
+            self.reveal_sidebar_session(target);
+            let focus = self
+                .menu_handle(format!("session-{target}"), cx)
+                .trigger_focus_handle()
+                .clone();
+            window.focus(&focus, cx);
+            cx.notify();
+        }
+    }
+
     fn render_sidebar_session_item(&self, session_id: Uuid, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
+        let tree = self.sidebar_tree.borrow();
+        let Some(node) = tree.nodes.get(&session_id) else {
+            return div().into_any_element();
+        };
         let Some(session) = self
             .state
             .sessions
-            .iter()
-            .find(|session| session.id == session_id)
+            .get(node.session_index)
+            .filter(|session| session.id == session_id)
         else {
             return div().into_any_element();
         };
+        let depth = node.depth;
+        let has_children = !node.children.is_empty();
+        let orphan_parent = session
+            .parent_session_id
+            .filter(|parent| Some(*parent) != node.parent);
+        let collapsed = self
+            .sidebar_collapsed_sessions
+            .borrow()
+            .contains(&session_id);
+        drop(tree);
         let selected = sidebar_session_selected(
             self.state.selected_session,
             self.pending_session_activation
@@ -1820,11 +2105,13 @@ impl Waku {
             .iter()
             .find(|project| project.id == session.project_id);
         let grouped_by_project = self.state.sidebar_grouping == SidebarGrouping::Project;
-        let left_padding = if grouped_by_project {
+        // Keep the title usable in very deep histories; keyboard navigation
+        // continues through every level after visual indentation reaches its cap.
+        let left_padding = (if grouped_by_project {
             SIDEBAR_GROUP_CHILD_PADDING
         } else {
             8.0
-        };
+        }) + depth.min(8) as f32 * 12.0;
         let detail_label = if grouped_by_project {
             persisted_sidebar_branch_label(&session.workspace)
                 .map(|branch| SharedString::from(branch.to_owned()))
@@ -1846,6 +2133,11 @@ impl Waku {
                     .unwrap_or_else(|| tr!("sidebar.unknown_project")),
             ))
         };
+        let detail_label = orphan_parent
+            .map(|parent| {
+                SharedString::from(tr!("sidebar.original_parent", id = parent.to_string()))
+            })
+            .or(detail_label);
         let has_detail_label = detail_label.is_some();
         let detail_icon = if grouped_by_project {
             "icons/git-branch.svg"
@@ -1898,6 +2190,12 @@ impl Waku {
             .id(SharedString::from(format!("session-{}", session.id)))
             .w_full()
             .min_w_0()
+            .when_some(orphan_parent, |element, parent| {
+                element.tooltip(Tooltip::text(tr!(
+                    "sidebar.original_parent",
+                    id = parent.to_string()
+                )))
+            })
             .flex()
             .flex_col()
             .gap(px(4.0))
@@ -1918,6 +2216,33 @@ impl Waku {
                     .gap(px(6.0))
                     .overflow_hidden()
                     .line_height(sp(18.0))
+                    .when(has_children, |element| {
+                        element.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "session-disclosure-{session_id}"
+                                )))
+                                .size(px(18.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon(
+                                    if collapsed {
+                                        "icons/chevron-right.svg"
+                                    } else {
+                                        "icons/chevron-down.svg"
+                                    },
+                                    12.0,
+                                    theme.text_secondary,
+                                ))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_sidebar_session(session_id, cx);
+                                })),
+                        )
+                    })
                     .child(title)
                     .when(working, |element| {
                         element.child(motion::spin_slow(icon(
@@ -1994,6 +2319,9 @@ impl Waku {
                         let key = event.keystroke.key.as_str();
                         if matches!(key, "enter" | "space") {
                             this.select_session(session_id, cx);
+                            cx.stop_propagation();
+                        } else if matches!(key, "left" | "right" | "up" | "down" | "home" | "end") {
+                            this.navigate_sidebar_session(session_id, key, window, cx);
                             cx.stop_propagation();
                         } else if key == "f10" && event.keystroke.modifiers.shift {
                             keyboard_menu.open_context_menu(window, cx);
@@ -2432,6 +2760,68 @@ fn sidebar_session_selected(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_tree_preserves_sibling_order_and_collapses_descendants() {
+        let project = Uuid::new_v4();
+        let parent = AgentSession::new(project, ProviderKind::Codex);
+        let mut first = AgentSession::new(project, ProviderKind::Codex);
+        first.parent_session_id = Some(parent.id);
+        let mut second = first.clone();
+        second.id = Uuid::new_v4();
+        let tree = SidebarTree::new(&[&second, &parent, &first]);
+        assert_eq!(tree.roots, vec![parent.id]);
+        assert_eq!(
+            tree.visible(&tree.roots, &HashSet::new()),
+            vec![parent.id, second.id, first.id]
+        );
+        assert_eq!(
+            tree.visible(&tree.roots, &HashSet::from([parent.id])),
+            vec![parent.id]
+        );
+    }
+
+    #[test]
+    fn history_tree_keeps_orphans_and_cycle_histories_discoverable() {
+        let project = Uuid::new_v4();
+        let mut orphan = AgentSession::new(project, ProviderKind::Codex);
+        let missing = Uuid::new_v4();
+        orphan.parent_session_id = Some(missing);
+        let mut first = AgentSession::new(project, ProviderKind::Codex);
+        let mut second = AgentSession::new(project, ProviderKind::Codex);
+        first.parent_session_id = Some(second.id);
+        second.parent_session_id = Some(first.id);
+        let tree = SidebarTree::new(&[&orphan, &first, &second]);
+        assert_eq!(
+            tree.visible(&tree.roots, &HashSet::new()),
+            vec![orphan.id, first.id, second.id]
+        );
+        assert_eq!(orphan.parent_session_id, Some(missing));
+        assert!(tree.nodes[&second.id].children.is_empty());
+    }
+
+    #[test]
+    fn history_tree_handles_deep_chains_without_recursion_and_keeps_recent_children_discoverable() {
+        let project = Uuid::new_v4();
+        let sessions = (1..=20_000)
+            .map(|id| {
+                let mut session = AgentSession::new(project, ProviderKind::Codex);
+                session.id = Uuid::from_u128(id);
+                session.parent_session_id = (id > 1).then(|| Uuid::from_u128(id - 1));
+                session.created_at = id as u64;
+                session
+            })
+            .collect::<Vec<_>>();
+        let tree = SidebarTree::new(&sessions.iter().rev().collect::<Vec<_>>());
+        assert_eq!(tree.roots, vec![Uuid::from_u128(1)]);
+        assert_eq!(tree.nodes[&tree.roots[0]].latest, 20_000);
+        assert_eq!(tree.nodes[&Uuid::from_u128(20_000)].depth, 19_999);
+        assert_eq!(tree.visible(&tree.roots, &HashSet::new()).len(), 20_000);
+        assert_eq!(
+            tree.visible(&tree.roots, &HashSet::from([tree.roots[0]])),
+            tree.roots
+        );
+    }
 
     #[test]
     fn groups_sessions_by_calendar_period() {

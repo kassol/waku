@@ -973,6 +973,9 @@ pub struct AgentSession {
     pub history_saved_cursor: Option<RuntimeEventCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_save_error: Option<String>,
+    /// Pending provider failure used if the runtime exits before producing a reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_driver_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_permission: Option<PendingPermission>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1037,6 +1040,7 @@ impl AgentSession {
             runtime_event_cursor: None,
             history_saved_cursor: None,
             history_save_error: None,
+            last_driver_error: None,
             pending_permission: None,
             pending_user_input: None,
             provider_session_id: None,
@@ -1078,6 +1082,7 @@ impl AgentSession {
             runtime_event_cursor: None,
             history_saved_cursor: None,
             history_save_error: None,
+            last_driver_error: None,
             pending_permission: None,
             pending_user_input: None,
             provider_session_id: None,
@@ -1824,6 +1829,8 @@ pub enum DriverEvent {
     /// sequence has been incorporated into the local session projection.
     /// Providers never emit this and the daemon never serializes it.
     RuntimeEventCursorAdvanced(RuntimeEventCursor),
+    /// Reliable full history replacing a pruned replay prefix. Client-only.
+    HistorySnapshot(Box<AgentSession>),
     HistoryPersistence {
         cursor: RuntimeEventCursor,
         error: Option<String>,
