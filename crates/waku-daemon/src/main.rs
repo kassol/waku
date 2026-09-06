@@ -8,6 +8,16 @@ use anyhow::{Context as _, anyhow, bail};
 use waku_protocol::{DAEMON_TOKEN_ENV, DaemonReady, PROTOCOL_VERSION};
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        return waku_core::mcp::run_stdio(
+            std::io::stdin().lock(),
+            std::io::stdout().lock(),
+            &std::env::var("WAKU_MCP_ADDRESS")?,
+            &std::env::var("WAKU_MCP_TOKEN")?,
+            std::env::var("WAKU_MCP_SESSION")?.parse()?,
+            std::env::var("WAKU_MCP_RUNTIME")?.parse()?,
+        );
+    }
     let arguments = Arguments::parse(std::env::args().skip(1))?;
     let token =
         std::env::var(DAEMON_TOKEN_ENV).context("Waku daemon authentication token is missing")?;

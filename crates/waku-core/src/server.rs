@@ -73,6 +73,10 @@ pub trait Backend: Send + Sync + 'static {
     /// Called on a separate worker after event ingestion releases its locks.
     fn stop_failed_work(&self) {}
 
+    fn authorize_steward(&self, _session_id: Uuid, _project_id: Uuid) -> anyhow::Result<()> {
+        bail!("steward sessions are unavailable")
+    }
+
     fn shutdown(&self) {}
 }
 
@@ -82,6 +86,7 @@ pub struct EventSink {
     runtime_id: Uuid,
     hub: Arc<Hub>,
     creation_started: Option<Sender<Result<(), String>>>,
+    pub(crate) scoped_project: Option<Uuid>,
 }
 
 pub(crate) struct ChildCreationGuard {
@@ -100,6 +105,34 @@ impl Drop for ChildCreationGuard {
 }
 
 impl EventSink {
+    pub(crate) fn mcp_config(&self, project_id: Uuid) -> anyhow::Result<Option<String>> {
+        let Some(address) = self.hub.address else {
+            return Ok(None);
+        };
+        let principal = Uuid::new_v4();
+        let scope = StewardScope {
+            principal,
+            session_id: self.session_id,
+            runtime_id: self.runtime_id,
+            project_id,
+        };
+        self.hub.state.lock().capabilities.insert(principal, scope);
+        Ok(Some(
+            serde_json::json!({"mcpServers": {"waku": {
+                "type": "stdio",
+                "command": std::env::current_exe()?,
+                "args": ["mcp"],
+                "env": {
+                    "WAKU_MCP_ADDRESS": address.to_string(),
+                    "WAKU_MCP_TOKEN": principal.to_string(),
+                    "WAKU_MCP_SESSION": self.session_id.to_string(),
+                    "WAKU_MCP_RUNTIME": self.runtime_id.to_string()
+                }
+            }}})
+            .to_string(),
+        ))
+    }
+
     pub(crate) fn reserve_child(&self, session_id: Uuid) -> ChildCreationGuard {
         self.hub.state.lock().creating_sessions.insert(session_id);
         ChildCreationGuard {
@@ -145,6 +178,11 @@ impl EventSink {
     }
 
     pub fn send_batch(&self, events: Vec<WireDriverEvent>) -> anyhow::Result<()> {
+        if events.iter().any(|event| event.kind == "processExited") {
+            self.hub.state.lock().capabilities.retain(|_, scope| {
+                scope.session_id != self.session_id || scope.runtime_id != self.runtime_id
+            });
+        }
         let started = self.creation_started.as_ref().and_then(|_| {
             events.iter().find_map(|event| match event.kind.as_str() {
                 "turnStarted" => Some(Ok(())),
@@ -203,8 +241,9 @@ struct HubState {
     next_sequences: HashMap<(Uuid, Uuid), u64>,
     journal: HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>,
     history_persistence: HashMap<(Uuid, Uuid), ServerMessage>,
-    responses: VecDeque<(Uuid, ResponseOutcome)>,
-    response_waiters: HashMap<Uuid, Vec<Sender<ServerMessage>>>,
+    capabilities: HashMap<Uuid, StewardScope>,
+    responses: VecDeque<((Uuid, Uuid), ResponseOutcome)>,
+    response_waiters: HashMap<(Uuid, Uuid), Vec<Sender<ServerMessage>>>,
     catalog_projects: HashMap<Uuid, ProjectCatalogEntry>,
     catalog_sessions: HashMap<Uuid, SessionCatalogEntry>,
 }
@@ -253,7 +292,16 @@ impl From<&AgentSession> for SessionCatalogEntry {
     }
 }
 
+#[derive(Clone, Debug)]
+struct StewardScope {
+    principal: Uuid,
+    session_id: Uuid,
+    runtime_id: Uuid,
+    project_id: Uuid,
+}
+
 struct Hub {
+    address: Option<std::net::SocketAddr>,
     epoch: Uuid,
     state: Mutex<HubState>,
     backend: Option<Weak<dyn Backend>>,
@@ -262,6 +310,7 @@ struct Hub {
 impl Default for Hub {
     fn default() -> Self {
         Self {
+            address: None,
             epoch: Uuid::new_v4(),
             state: Mutex::new(HubState::default()),
             backend: None,
@@ -297,11 +346,15 @@ impl Hub {
             runtime_id,
             hub: self.clone(),
             creation_started: None,
+            scoped_project: None,
         }
     }
 
     fn begin_runtime(&self, session_id: Uuid, runtime_id: Uuid) {
         let mut state = self.state.lock();
+        state
+            .capabilities
+            .retain(|_, scope| scope.session_id != session_id);
         state.active_runtimes.insert(session_id, runtime_id);
         state
             .next_sequences
@@ -351,6 +404,9 @@ impl Hub {
         if !matches_active {
             return;
         }
+        state
+            .capabilities
+            .retain(|_, scope| scope.session_id != session_id);
         state.active_runtimes.remove(&session_id);
         state
             .next_sequences
@@ -537,6 +593,15 @@ impl Hub {
     /// Reserve a UUID before dispatch. Retransmissions share the first
     /// execution's response without occupying another worker or mailbox.
     fn reserve_request(&self, request_id: Uuid, outgoing: &Sender<ServerMessage>) -> bool {
+        self.reserve_request_as(Uuid::nil(), request_id, outgoing)
+    }
+
+    fn reserve_request_as(
+        &self,
+        principal: Uuid,
+        request_id: Uuid,
+        outgoing: &Sender<ServerMessage>,
+    ) -> bool {
         if request_id.is_nil() {
             return true;
         }
@@ -545,7 +610,7 @@ impl Hub {
             .responses
             .iter()
             .rev()
-            .find_map(|(id, outcome)| (*id == request_id).then(|| outcome.clone()))
+            .find_map(|(id, outcome)| (*id == (principal, request_id)).then(|| outcome.clone()))
         {
             drop(state);
             let _ = outgoing.send(ServerMessage::Response {
@@ -554,7 +619,7 @@ impl Hub {
             });
             return false;
         }
-        match state.response_waiters.entry(request_id) {
+        match state.response_waiters.entry((principal, request_id)) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.get_mut().push(outgoing.clone());
                 false
@@ -567,24 +632,36 @@ impl Hub {
     }
 
     fn cached_response(&self, request_id: Uuid) -> Option<ResponseOutcome> {
+        self.cached_response_as(Uuid::nil(), request_id)
+    }
+
+    fn cached_response_as(&self, principal: Uuid, request_id: Uuid) -> Option<ResponseOutcome> {
         self.state
             .lock()
             .responses
             .iter()
             .rev()
-            .find_map(|(cached_id, outcome)| (*cached_id == request_id).then(|| outcome.clone()))
+            .find_map(|(cached_id, outcome)| {
+                (*cached_id == (principal, request_id)).then(|| outcome.clone())
+            })
     }
 
     fn cache_response(&self, request_id: Uuid, outcome: ResponseOutcome) {
+        self.cache_response_as(Uuid::nil(), request_id, outcome);
+    }
+
+    fn cache_response_as(&self, principal: Uuid, request_id: Uuid, outcome: ResponseOutcome) {
         let waiters = {
             let mut state = self.state.lock();
-            state.responses.push_back((request_id, outcome.clone()));
+            state
+                .responses
+                .push_back(((principal, request_id), outcome.clone()));
             while state.responses.len() > MAX_CACHED_RESPONSES {
                 state.responses.pop_front();
             }
             state
                 .response_waiters
-                .remove(&request_id)
+                .remove(&(principal, request_id))
                 .unwrap_or_default()
         };
         for outgoing in waiters {
@@ -721,6 +798,17 @@ impl RequestDispatcher {
     }
 }
 
+fn mcp_address(mut address: std::net::SocketAddr) -> std::net::SocketAddr {
+    if address.ip().is_unspecified() {
+        address.set_ip(if address.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    address
+}
+
 pub fn serve(
     listener: TcpListener,
     token: String,
@@ -728,10 +816,12 @@ pub fn serve(
     shutdown: Arc<AtomicBool>,
     options: ServerOptions,
 ) -> anyhow::Result<()> {
+    let address = listener.local_addr()?;
     listener
         .set_nonblocking(true)
         .context("could not configure Waku daemon listener")?;
     let hub = Arc::new(Hub {
+        address: Some(mcp_address(address)),
         backend: Some(Arc::downgrade(&backend)),
         ..Hub::default()
     });
@@ -804,6 +894,7 @@ fn handle_connection(
     )
     .context("WebSocket handshake failed")?;
     let hello = read_client_message(&mut socket)?;
+    let mut scope = None;
     let resume_from = match hello {
         ClientMessage::Hello {
             protocol_version,
@@ -812,6 +903,18 @@ fn handle_connection(
             ..
         } if protocol_version == PROTOCOL_VERSION && token_matches(expected_token, &token) => {
             resume_from
+        }
+        ClientMessage::Hello {
+            protocol_version,
+            token,
+            ..
+        } if protocol_version == PROTOCOL_VERSION
+            && Uuid::parse_str(&token).ok().is_some_and(|id| {
+                scope = hub.state.lock().capabilities.get(&id).cloned();
+                scope.is_some()
+            }) =>
+        {
+            Vec::new()
         }
         ClientMessage::Hello {
             protocol_version, ..
@@ -853,7 +956,11 @@ fn handle_connection(
         .set_read_timeout(Some(SOCKET_POLL_INTERVAL))?;
 
     let (outgoing, outgoing_rx) = unbounded();
-    let subscriber_id = hub.subscribe(&resume_from, outgoing.clone());
+    let subscriber_id = if scope.is_none() {
+        hub.subscribe(&resume_from, outgoing.clone())
+    } else {
+        u64::MAX
+    };
 
     'connection: while !shutdown.load(Ordering::Acquire) {
         while let Ok(message) = outgoing_rx.try_recv() {
@@ -864,6 +971,16 @@ fn handle_connection(
         match socket.read() {
             Ok(Message::Text(text)) => match serde_json::from_str(text.as_ref()) {
                 Ok(ClientMessage::Request(request)) => {
+                    if let Some(scope) = &scope {
+                        dispatch_steward(
+                            request,
+                            scope.clone(),
+                            outgoing.clone(),
+                            dispatcher.backend.clone(),
+                            hub.clone(),
+                        );
+                        continue;
+                    }
                     let exit_command = matches!(
                         request.command,
                         Command::PrepareShutdown | Command::ShutdownDaemon
@@ -908,7 +1025,7 @@ fn handle_connection(
                     }
                 }
                 Ok(ClientMessage::Shutdown) => {
-                    if options.allow_shutdown {
+                    if options.allow_shutdown && scope.is_none() {
                         let result = dispatcher.backend.handle(
                             Request {
                                 request_id: Uuid::new_v4(),
@@ -958,6 +1075,58 @@ fn handle_connection(
     }
     hub.unsubscribe(subscriber_id);
     Ok(())
+}
+
+fn dispatch_steward(
+    request: Request,
+    scope: StewardScope,
+    outgoing: Sender<ServerMessage>,
+    backend: Arc<dyn Backend>,
+    hub: Arc<Hub>,
+) {
+    let active = hub.state.lock().capabilities.contains_key(&scope.principal);
+    let authorized = request.session_id == scope.session_id
+        && request.runtime_id == scope.runtime_id
+        && matches!(request.command, Command::CreateSession { .. })
+        && active
+        && backend
+            .authorize_steward(scope.session_id, scope.project_id)
+            .is_ok();
+    if !authorized {
+        let _ = outgoing.send(ServerMessage::Response {
+            request_id: request.request_id,
+            outcome: ResponseOutcome::Error {
+                error: RpcError {
+                    message: "steward operation is not authorized".into(),
+                },
+            },
+        });
+        return;
+    }
+    if !hub.reserve_request_as(scope.principal, request.request_id, &outgoing) {
+        return;
+    }
+    let request_id = request.request_id;
+    let failed_outgoing = outgoing.clone();
+    let failed_hub = hub.clone();
+    let principal = scope.principal;
+    if let Err(error) = std::thread::Builder::new()
+        .name("waku-steward-request".into())
+        .spawn(move || {
+            handle_request_as(request, outgoing, u64::MAX, backend, hub, Some(scope));
+        })
+    {
+        let outcome = ResponseOutcome::Error {
+            error: RpcError {
+                message: format!("could not start steward request: {error}"),
+            },
+        };
+        failed_hub.cache_response_as(principal, request_id, outcome.clone());
+        let _ = failed_outgoing.send(ServerMessage::Response {
+            request_id,
+            outcome,
+        });
+    }
 }
 
 fn validate_handshake(
@@ -1172,6 +1341,18 @@ fn handle_request(
     backend: Arc<dyn Backend>,
     hub: Arc<Hub>,
 ) -> HandledRequest {
+    handle_request_as(request, outgoing, source_subscriber_id, backend, hub, None)
+}
+
+fn handle_request_as(
+    request: Request,
+    outgoing: Sender<ServerMessage>,
+    source_subscriber_id: u64,
+    backend: Arc<dyn Backend>,
+    hub: Arc<Hub>,
+    scope: Option<StewardScope>,
+) -> HandledRequest {
+    let principal = scope.as_ref().map_or(Uuid::nil(), |scope| scope.principal);
     let request_id = request.request_id;
     let notification = request_id.is_nil();
     let session_id = request.session_id;
@@ -1183,42 +1364,49 @@ fn handle_request(
         Command::Start { .. } | Command::OpenTerminal { .. }
     );
     let mut began_runtime = false;
-    let (outcome, executed) = if !notification && let Some(cached) = hub.cached_response(request_id)
-    {
-        (cached, false)
-    } else {
-        let mutation = (command_targets_runtime(&request.command)
-            && !matches!(&request.command, Command::AttachSession))
-            || matches!(&request.command, Command::CreateSession { .. });
-        let prepared = if mutation && hub.state.lock().creating_sessions.contains(&session_id) {
-            Err(anyhow::anyhow!(
-                "child session creation is still in progress"
-            ))
-        } else if let Command::Start { options } = &request.command {
-            backend.prepare_start(session_id, options)
+    let (outcome, executed) =
+        if !notification && let Some(cached) = hub.cached_response_as(principal, request_id) {
+            (cached, false)
         } else {
-            Ok(())
-        };
-        if starts_runtime && prepared.is_ok() {
-            if matches!(&request.command, Command::Start { .. }) {
-                hub.confirm_drained_history(session_id, None);
+            let mutation = (command_targets_runtime(&request.command)
+                && !matches!(&request.command, Command::AttachSession))
+                || matches!(&request.command, Command::CreateSession { .. });
+            let prepared = if mutation && hub.state.lock().creating_sessions.contains(&session_id) {
+                Err(anyhow::anyhow!(
+                    "child session creation is still in progress"
+                ))
+            } else if let Command::Start { options } = &request.command {
+                backend.prepare_start(session_id, options)
+            } else {
+                Ok(())
+            };
+            if starts_runtime && prepared.is_ok() {
+                if matches!(&request.command, Command::Start { .. }) {
+                    hub.confirm_drained_history(session_id, None);
+                }
+                hub.begin_runtime(session_id, runtime_id);
+                began_runtime = true;
             }
-            hub.begin_runtime(session_id, runtime_id);
-            began_runtime = true;
-        }
-        let outcome = match prepared
-            .and_then(|_| backend.handle(request, hub.event_sink(session_id, runtime_id)))
-        {
-            Ok(payload) => ResponseOutcome::Ok { payload },
-            Err(error) => ResponseOutcome::Error {
-                error: RpcError::from(error),
-            },
+            let outcome = match prepared.and_then(|_| {
+                let mut events = hub.event_sink(session_id, runtime_id);
+                events.scoped_project = scope.as_ref().map(|scope| scope.project_id);
+                if let Some(scope) = &scope {
+                    if !hub.state.lock().capabilities.contains_key(&scope.principal) {
+                        bail!("steward runtime is no longer active");
+                    }
+                }
+                backend.handle(request, events)
+            }) {
+                Ok(payload) => ResponseOutcome::Ok { payload },
+                Err(error) => ResponseOutcome::Error {
+                    error: RpcError::from(error),
+                },
+            };
+            if !notification {
+                hub.cache_response_as(principal, request_id, outcome.clone());
+            }
+            (outcome, true)
         };
-        if !notification {
-            hub.cache_response(request_id, outcome.clone());
-        }
-        (outcome, true)
-    };
     if executed && prepares_shutdown && matches!(&outcome, ResponseOutcome::Ok { .. }) {
         hub.confirm_all_drained_history();
     }
@@ -1422,6 +1610,18 @@ mod tests {
                 }),
                 _ => Ok(ResponsePayload::Ack),
             }
+        }
+    }
+
+    #[test]
+    fn mcp_wildcard_listeners_connect_through_same_family_loopback() {
+        for (bound, expected) in [
+            ("0.0.0.0:1234", "127.0.0.1:1234"),
+            ("[::]:1234", "[::1]:1234"),
+            ("127.0.0.1:1234", "127.0.0.1:1234"),
+            ("192.0.2.1:1234", "192.0.2.1:1234"),
+        ] {
+            assert_eq!(mcp_address(bound.parse().unwrap()).to_string(), expected);
         }
     }
 

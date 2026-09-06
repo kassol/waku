@@ -167,7 +167,11 @@ fn configure_stream_command(command: &mut Command, mode: RuntimeMode) {
 }
 
 impl ClaudeDriver {
-    pub fn start(options: DriverStartOptions, events: DriverEventSender) -> anyhow::Result<Self> {
+    pub fn start(
+        options: DriverStartOptions,
+        events: DriverEventSender,
+        mcp_config: Option<String>,
+    ) -> anyhow::Result<Self> {
         let DriverStartOptions {
             binary,
             cwd,
@@ -202,6 +206,9 @@ impl ClaudeDriver {
         let mut command = crate::command_env::command(&binary);
         command.current_dir(&cwd);
         configure_stream_command(&mut command, mode);
+        if let Some(config) = mcp_config {
+            command.args(["--mcp-config", &config]);
+        }
         let launch_model = wire_model(model.as_deref(), context_window.as_deref());
         if let Some(model) = launch_model.as_deref() {
             command.args(["--model", model]);
@@ -1900,6 +1907,7 @@ mod tests {
                 provider_cursor: None,
             },
             events,
+            None,
         )
         .expect("the streaming session should start");
 
@@ -1968,6 +1976,7 @@ mod tests {
                 provider_cursor: None,
             },
             events,
+            None,
         )
         .expect("the streaming session should start");
 

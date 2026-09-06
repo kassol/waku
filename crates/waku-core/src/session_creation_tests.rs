@@ -957,3 +957,6 @@ fn failed_initial_child_save_disables_new_creation_before_provider_start() {
         assert!(!worktrees[0].join("child-result.txt").exists());
     });
 }
+
+#[path = "steward_tests.rs"]
+mod steward_tests;

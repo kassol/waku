@@ -436,6 +436,22 @@ impl Backend for WakuBackend {
         self.handle_accepted(request, events)
     }
 
+    fn authorize_steward(&self, session_id: Uuid, project_id: Uuid) -> anyhow::Result<()> {
+        let state = self.task_state.lock();
+        if !state
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id && session.project_id == project_id)
+            || !state
+                .projects
+                .iter()
+                .any(|project| project.id == project_id)
+        {
+            bail!("steward project is no longer available");
+        }
+        Ok(())
+    }
+
     fn prepare_start(
         &self,
         session_id: Uuid,
@@ -513,6 +529,12 @@ impl WakuBackend {
                         .iter_mut()
                         .find(|session| session.id == session_id)
                         .ok_or_else(|| anyhow!("the parent session is unavailable"))?;
+                    if events
+                        .scoped_project
+                        .is_some_and(|project| project != parent.project_id)
+                    {
+                        bail!("steward project is no longer available");
+                    }
                     self.task_store.hydrate(parent)?;
                     if !parent.has_started()
                         || !matches!(parent.provider, ProviderKind::Claude | ProviderKind::Codex)
@@ -1279,6 +1301,21 @@ impl WakuBackend {
                     .lock()
                     .retain(|(id, _), pending| *id != session_id || !pending.is_empty());
                 let provider = decode_enum(&options.provider)?;
+                let mcp_config = if provider == ProviderKind::Claude {
+                    let project_id = self
+                        .task_state
+                        .lock()
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == session_id)
+                        .map(|session| session.project_id);
+                    project_id
+                        .map(|project_id| events.mcp_config(project_id))
+                        .transpose()?
+                        .flatten()
+                } else {
+                    None
+                };
                 let options = DriverStartOptions {
                     binary: options.binary,
                     cwd: options.cwd,
@@ -1297,7 +1334,8 @@ impl WakuBackend {
                 };
                 let (wake, _wake_events) = smol::channel::bounded(1);
                 let (event_sender, event_receiver) = driver::event_channel(wake);
-                let handle = driver::start_local(provider, options, event_sender)?;
+                let handle =
+                    driver::start_local_with_mcp(provider, options, event_sender, mcp_config)?;
                 let supports_steer = handle.supports_steer();
                 let forwarder = std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))

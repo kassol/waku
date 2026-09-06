@@ -41,6 +41,7 @@ pub mod i18n;
 pub mod identity;
 pub mod kimi_session;
 pub mod model;
+pub mod mcp;
 pub mod model_catalog;
 pub mod opencode_pool;
 pub mod opencode_session;

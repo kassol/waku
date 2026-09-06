@@ -210,6 +210,15 @@ pub(crate) fn start_local(
     options: DriverStartOptions,
     events: DriverEventSender,
 ) -> anyhow::Result<DriverHandle> {
+    start_local_with_mcp(provider, options, events, None)
+}
+
+pub(crate) fn start_local_with_mcp(
+    provider: ProviderKind,
+    options: DriverStartOptions,
+    events: DriverEventSender,
+    mcp_config: Option<String>,
+) -> anyhow::Result<DriverHandle> {
     let inner: Arc<dyn DriverControl> = match provider {
         ProviderKind::Codex => Arc::new(codex::CodexDriver::start(options, events)?),
         ProviderKind::Pi => Arc::new(pi::PiDriver::start(pi::PiFlavor::Pi, options, events)?),
@@ -229,7 +238,7 @@ pub(crate) fn start_local(
         // Claude serves a realtime stream of user messages on stdin — the same
         // transport the Agent SDK drives — which is what lets its Supervised
         // mode ask rather than decide alone.
-        ProviderKind::Claude => Arc::new(claude::ClaudeDriver::start(options, events)?),
+        ProviderKind::Claude => Arc::new(claude::ClaudeDriver::start(options, events, mcp_config)?),
         // Amp reads newline-delimited user messages on stdin and stays alive
         // until stdin closes, so it too serves the whole conversation.
         ProviderKind::Amp => Arc::new(amp::AmpDriver::start(options, events)?),
