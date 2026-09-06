@@ -3531,3 +3531,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "daemon_shutdown_tests.rs"]
+mod daemon_shutdown_tests;

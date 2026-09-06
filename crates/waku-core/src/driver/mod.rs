@@ -5,6 +5,8 @@ mod activity;
 mod amp;
 mod claude;
 mod codex;
+#[cfg(test)]
+mod codex_lifecycle_tests;
 mod computer_use;
 mod deepseek;
 mod opencode;

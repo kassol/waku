@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -128,6 +129,7 @@ impl BackgroundRpcState {
 }
 
 pub struct CodexDriver {
+    shutdown_requested: Arc<AtomicBool>,
     commands: Sender<CommandMessage>,
     mode: RuntimeMode,
     computer_use_process_directory: Option<PathBuf>,
@@ -259,6 +261,11 @@ impl CodexDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
         let mut child =
             crate::command_env::spawn(command).context("failed to start `codex app-server`")?;
 
@@ -872,10 +879,37 @@ impl CodexDriver {
                 }
             })?;
 
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let process_shutdown = shutdown_requested.clone();
         thread::Builder::new()
             .name("waku-codex-process".into())
             .spawn(move || {
-                let status = match child.wait() {
+                let mut shutdown_started = None;
+                let status = match loop {
+                    let exited = match codex_process_exited(&mut child) {
+                        Ok(exited) => exited,
+                        Err(error) => break Err(error),
+                    };
+                    if exited && reader_thread.is_finished() && stderr_thread.is_finished() {
+                        break child.wait();
+                    }
+                    if exited || process_shutdown.load(Ordering::Acquire) {
+                        let since = shutdown_started.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= Duration::from_secs(2) {
+                            // Drop requests EOF through the writer. A stuck
+                            // writer or app-server must not block durable quit.
+                            // WNOWAIT retains the leader's PID until its pipe
+                            // owners exit, so the group ID cannot be reused.
+                            #[cfg(unix)]
+                            unsafe {
+                                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                            }
+                            let _ = child.kill();
+                            break child.wait();
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                } {
                     Ok(status) => status,
                     Err(error) => {
                         let _ = events.send(DriverEvent::Error(tr!(
@@ -888,7 +922,10 @@ impl CodexDriver {
                 };
                 let _ = reader_thread.join();
                 let _ = stderr_thread.join();
-                if !status.success() && last_visible_stderr.lock().is_none() {
+                if !status.success()
+                    && !process_shutdown.load(Ordering::Acquire)
+                    && last_visible_stderr.lock().is_none()
+                {
                     let _ = events.send(DriverEvent::Error(tr!(
                         "errors.provider_exited",
                         provider = "Codex app-server",
@@ -899,12 +936,39 @@ impl CodexDriver {
             })?;
 
         Ok(Self {
+            shutdown_requested,
             commands,
             mode,
             computer_use_process_directory,
             computer_use_server_path,
             computer_use_preview_monitor,
         })
+    }
+}
+
+// On Unix, keep the process-group leader waitable while descendants can
+// still hold its output pipes. Reaping it first would make later group signals
+// unsafe and could leave the reader joins blocked indefinitely.
+fn codex_process_exited(child: &mut Child) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { info.assume_init() }.si_signo != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        child.try_wait().map(|status| status.is_some())
     }
 }
 
@@ -1125,6 +1189,7 @@ impl DriverControl for CodexDriver {
 
 impl Drop for CodexDriver {
     fn drop(&mut self) {
+        self.shutdown_requested.store(true, Ordering::Release);
         self.cancel_computer_use();
         drop(self.computer_use_preview_monitor.take());
         if let Some(directory) = self.computer_use_process_directory.as_deref() {
@@ -1848,6 +1913,20 @@ fn handle_codex_message(
         return;
     };
     let params = value.get("params").cloned().unwrap_or(Value::Null);
+    // Native subagents share this connection, but their notifications must
+    // not replace the main turn or enter its transcript. Server requests still
+    // need the existing approval/input UI and are answered by global RPC id.
+    let message_thread_id = params
+        .get("threadId")
+        .or_else(|| params.get("conversationId"))
+        .or_else(|| params.pointer("/thread/id"))
+        .and_then(Value::as_str);
+    if value.get("id").is_none()
+        && let Some(message_thread_id) = message_thread_id
+        && thread_id.lock().as_deref() != Some(message_thread_id)
+    {
+        return;
+    }
 
     match method {
         "turn/started" => {
@@ -2618,6 +2697,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn child_thread_messages_do_not_change_the_main_turn() {
+        let harness = GoalHarness::new();
+        harness.handle(json!({
+            "method": "turn/started",
+            "params": {"threadId": "thread-1", "turn": {"id": "main-turn"}}
+        }));
+        assert!(matches!(
+            harness.received.recv().unwrap(),
+            DriverEvent::TurnStarted
+        ));
+        for message in [
+            json!({"method": "turn/started", "params": {
+                "threadId": "child-thread", "turn": {"id": "child-turn"}
+            }}),
+            json!({"method": "item/agentMessage/delta", "params": {
+                "threadId": "child-thread", "delta": "child text"
+            }}),
+            json!({"id": 77, "method": "item/commandExecution/requestApproval", "params": {
+                "threadId": "child-thread", "command": "echo child"
+            }}),
+            json!({"id": 78, "method": "item/tool/requestUserInput", "params": {
+                "threadId": "child-thread", "questions": [{"id": "q", "question": "Child question?"}]
+            }}),
+            json!({"method": "item/reasoning/textDelta", "params": {
+                "threadId": "child-thread", "delta": "child reasoning"
+            }}),
+            json!({"method": "turn/completed", "params": {
+                "threadId": "child-thread", "turn": {"id": "child-turn", "status": "completed"}
+            }}),
+        ] {
+            harness.handle(message);
+        }
+        assert!(matches!(harness.received.recv().unwrap(), DriverEvent::Permission { request_id, .. } if request_id == "77"));
+        assert!(matches!(harness.received.recv().unwrap(), DriverEvent::UserInputRequested { request_id, .. } if request_id == "78"));
+        assert!(
+            harness.received.try_recv().is_err(),
+            "child notifications must stay out of the main session"
+        );
+        assert_eq!(harness.turn_id.lock().as_deref(), Some("main-turn"));
+        harness.handle(json!({"method": "item/agentMessage/delta", "params": {
+            "threadId": "thread-1", "delta": "main answer"
+        }}));
+        assert!(matches!(
+            harness.received.recv().unwrap(),
+            DriverEvent::TextDelta(text) if text == "main answer"
+        ));
+        harness.handle(json!({"method": "turn/completed", "params": {
+            "threadId": "thread-1", "turn": {"id": "main-turn", "status": "completed"}
+        }}));
+        assert!(matches!(
+            harness.received.recv().unwrap(),
+            DriverEvent::TurnFinished { success: true, .. }
+        ));
+        assert!(harness.turn_id.lock().is_none());
+        assert_eq!(*harness.turn_ids.lock(), vec!["main-turn".to_owned()]);
+        harness.handle(json!({"method": "account/rateLimits/updated", "params": {
+            "rateLimits": {"primary": {"usedPercent": 10, "windowDurationMins": 300}}
+        }}));
+        assert!(matches!(
+            harness.received.recv().unwrap(),
+            DriverEvent::PlanUsageUpdated(_)
+        ));
+    }
+
     fn goal_json() -> Value {
         json!({
             "threadId": "thread-1",
@@ -2883,6 +3027,7 @@ mod tests {
     fn model_changes_reach_the_running_thread_but_mode_changes_ask_for_a_restart() {
         let (commands, command_rx) = unbounded();
         let driver = CodexDriver {
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             commands,
             mode: RuntimeMode::FullAccess,
             computer_use_process_directory: None,

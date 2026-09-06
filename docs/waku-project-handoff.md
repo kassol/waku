@@ -139,3 +139,13 @@ Matt 流程产生仓库产物时，遵循用户的独立提交及默认 push 约
 本机安装验证：优化构建成功；App、REPL、daemon 及嵌套 helper 签名检查通过；4 项身份、配置路径及导航回归检查通过。传入无效外部 daemon 地址和路径后，安装版仍启动自己的包内 daemon，并通过真实 WebSocket `loadTaskState` 读取独立数据库。初次启动自动创建 1 个空白会话。清除验证启动参数后，经 Launch Services 后台重启成功。原版 App、Info.plist、settings.json 的 SHA-256 和原版两个进程均保持不变。
 
 本机使用现有 Apple Development 证书签名；该包用于本机使用，未做面向其他设备分发的公证。可重复安装包保存在 `~/Downloads/Waku-Steward-2026-09-06.zip`。
+
+## Codex 生命周期修复（2026-09-06）
+
+原生 Codex 子代理与主线程共用连接。子线程通知曾覆盖主轮次 ID，并提前结束主轮，导致最终回复后仍显示 Working，steer/cancel 缺少活动轮次。driver 现在按线程 ID 隔离通知；子代理审批和回答请求继续按 RPC ID 处理。
+
+Codex 退出现在先请求 EOF，超过 2 秒仍未结束时终止自有进程组，再排空输出并确认退出。进程组主进程在管道排空前保持可等待，避免 PID 重用；覆盖忽略 EOF 和子进程继承输出管道两种阻塞。
+
+完整 workspace library 回归 919 项通过、26 项忽略；独立真实 Codex 0.153.4 回归验证 Astra 原生子代理、主轮完成、后续输入、steer、cancel 与退出全部通过。可运行 `cargo test -p waku-core native_codex_child_followup_steer_cancel_and_drop -- --ignored --nocapture` 重验，该检查使用真实模型和临时目录。
+
+包含 IME 候选窗坐标修复的优化包已更新本机 Steward，正常系统退出与后台重开通过，原会话历史和待发送消息保留。安装包为 `~/Downloads/Waku-Steward-2026-09-06-reliability-fix.zip`。搜狗实际候选窗交互仍待日常使用确认，输入法重绘前坐标回归已通过。
