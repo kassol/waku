@@ -1656,21 +1656,99 @@ fn mcp_prompt_save_failure_stops_new_work_before_provider_submission() {
 
 #[test]
 fn mcp_wait_provider_completion_wakes_parent_once_through_server_worker() {
+    check_wait_provider_completion(ProviderKind::Claude);
+}
+
+#[test]
+fn mcp_wait_codex_parent_completion_wakes_once_through_server_worker() {
+    check_wait_provider_completion(ProviderKind::Codex);
+}
+
+fn check_wait_provider_completion(provider: ProviderKind) {
     with_creation_daemon(|client, _, root, project_path, address| {
         let script = include_str!("../tests/fixtures/steward_wait.py");
         std::fs::write(root.join("codex-fixture"), script).unwrap();
         let project = Project::from_path(project_path.to_owned());
-        let mut parent = AgentSession::new(project.id, ProviderKind::Claude);
+        let mut parent = AgentSession::new(project.id, provider);
         parent.runtime_mode = RuntimeMode::Ask;
         parent.begin_turn("Delegate and wait for the child");
-        let (parent, _, config, runtime) = start_steward_saved_with_script(
-            &client,
-            root,
-            project_path,
-            parent,
-            project,
-            Some(script),
-        );
+        let (parent, config, runtime) = if provider == ProviderKind::Claude {
+            let (parent, _, config, runtime) = start_steward_saved_with_script(
+                &client,
+                root,
+                project_path,
+                parent,
+                project,
+                Some(script),
+            );
+            (parent, config, runtime)
+        } else {
+            client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::SaveTaskState {
+                        projects: vec![project],
+                        sessions: vec![parent.clone()],
+                        live_session_ids: vec![parent.id],
+                    },
+                )
+                .unwrap();
+            let binary = root.join("codex-parent-fixture");
+            std::fs::write(&binary, script).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let runtime = Uuid::new_v4();
+            client
+                .request(
+                    parent.id,
+                    runtime,
+                    Command::Start {
+                        options: crate::WireDriverStartOptions {
+                            provider: "codex".into(),
+                            binary,
+                            cwd: project_path.into(),
+                            mode: "ask".into(),
+                            model: None,
+                            reasoning_effort: None,
+                            service_tier: None,
+                            context_window: None,
+                            agent_preset: None,
+                            computer_use_enabled: false,
+                            provider_cursor: None,
+                        },
+                    },
+                )
+                .unwrap();
+            let config_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let args: Vec<String> = loop {
+                if let Ok(text) = std::fs::read_to_string(project_path.join("codex-args.json")) {
+                    if let Ok(args) = serde_json::from_str(&text) {
+                        break args;
+                    }
+                }
+                assert!(std::time::Instant::now() < config_deadline, "Codex did not receive MCP configuration");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let config_arg = args
+                .iter()
+                .find(|arg| arg.starts_with("mcp_servers.waku="))
+                .unwrap();
+            let config: toml::Value = toml::from_str(config_arg).unwrap();
+            let env = &config["mcp_servers"]["waku"]["env"];
+            assert_eq!(
+                env["WAKU_MCP_SESSION"].as_str().unwrap(),
+                parent.id.to_string()
+            );
+            assert_eq!(
+                env["WAKU_MCP_RUNTIME"].as_str().unwrap(),
+                runtime.to_string()
+            );
+            (
+                parent,
+                json!({"mcpServers": {"waku": {"env": env}}}),
+                runtime,
+            )
+        };
         client
             .request(
                 parent.id,
@@ -1740,6 +1818,37 @@ fn mcp_wait_provider_completion_wakes_parent_once_through_server_worker() {
             "registration must not start a new parent turn"
         );
         std::fs::write(root.join("finish-parent"), "").unwrap();
+        let idle_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let ResponsePayload::Session {
+                session: Some(waiting),
+            } = client
+                .request(
+                    parent.id,
+                    runtime,
+                    Command::HydrateSession {
+                        session_id: parent.id,
+                    },
+                )
+                .unwrap()
+            else {
+                panic!("parent unavailable");
+            };
+            if waiting.is_waiting_for_children() {
+                assert_eq!(waiting.provider, provider);
+                assert_eq!(
+                    waiting.turns.last().unwrap().status,
+                    crate::model::TurnStatus::Completed
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < idle_deadline,
+                "parent did not settle into durable waiting"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!callbacks.exists());
         std::fs::write(root.join("finish-child"), "").unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
         loop {
@@ -1755,6 +1864,16 @@ fn mcp_wait_provider_completion_wakes_parent_once_through_server_worker() {
         let callback = std::fs::read_to_string(&callbacks).unwrap();
         assert_eq!(callback.lines().count(), 1);
         assert!(callback.contains(&child.id.to_string()));
+        if provider == ProviderKind::Codex {
+            let request: serde_json::Value =
+                serde_json::from_str(callback.lines().next().unwrap()).unwrap();
+            assert_eq!(request["method"], "turn/start");
+            assert!(
+                request["params"]
+                    .to_string()
+                    .contains("Waku automatic child-session notification")
+            );
+        }
         std::fs::write(root.join("repeat-child"), "").unwrap();
         while !root.join("repeat-sent").exists() {
             assert!(std::time::Instant::now() < deadline);
