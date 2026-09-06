@@ -1867,6 +1867,10 @@ fn check_wait_provider_completion(provider: ProviderKind) {
             json!({"session_ids":[child.id]}),
         );
         assert_eq!(result["waiting"], true);
+        let batch = mcp_tool(address, token, parent.id, runtime, "waku_results", json!({"session_ids":[child.id]}));
+        assert!(batch["results"][0]["receipt"].is_null());
+        let ResponsePayload::Session {session:Some(still_waiting)} = client.request(parent.id, runtime, Command::HydrateSession {session_id:parent.id}).unwrap() else { panic!("parent unavailable"); };
+        assert_eq!(serde_json::to_value(still_waiting.steward_wait).unwrap(), result["wait"]);
         let callbacks = root.join("callback-prompts.jsonl");
         assert!(
             !callbacks.exists(),
@@ -2153,3 +2157,6 @@ fn steward_capability_cannot_open_or_submit_a_consultation() {
 }
 #[path = "task_workspace_delivery_tests.rs"]
 mod task_workspace_delivery_tests;
+
+#[path = "steward_coordination_tests.rs"]
+mod steward_coordination_tests;
