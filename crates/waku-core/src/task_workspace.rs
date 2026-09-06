@@ -46,7 +46,20 @@ impl WakuBackend {
                 commit,
                 expected_target_commit,
                 evidence,
-            } => self.deliver_task(session_id, commit, expected_target_commit, evidence),
+            } => {
+                self.deliver_task(session_id, commit, expected_target_commit, evidence)?;
+                self.cleanup_task_resources(session_id, events, Some(session_id), true)?;
+                let (session, _) = self.managed_task(session_id)?;
+                Ok(ResponsePayload::TaskWorkspace { session })
+            },
+            StewardWorkspaceOperation::Cleanup { session_id: target } => {
+                if target != session_id {
+                    self.authorized_child(&mut self.task_state.lock(), session_id, target, events)?;
+                }
+                self.cleanup_task_resources(target, events, Some(session_id), true)?;
+                let (session, _) = self.managed_task(target)?;
+                Ok(ResponsePayload::TaskWorkspace { session })
+            },
             StewardWorkspaceOperation::Integrate {
                 session_id: child,
                 commit,
@@ -217,6 +230,7 @@ impl WakuBackend {
                 }
             }
             ManagedWorkspace {
+                cleanup: Vec::new(),
                 created: false,
                 deliveries: Vec::new(),
                 results: Vec::new(),

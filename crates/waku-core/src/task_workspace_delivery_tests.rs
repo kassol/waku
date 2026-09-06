@@ -234,6 +234,21 @@ fn managed_task_accepts_fixed_child_commit_through_mcp_while_parent_runs() {
             second_commit
         );
         assert!(repository.join("second-result.txt").exists());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while workspace_path.exists() || successor_path.exists() || task.path.exists() {
+            if std::time::Instant::now() >= deadline {
+                let child_state = workspace_tool(address, token, parent.id, runtime,
+                    json!({"type":"inspect","sessionId":child.id}));
+                let next_state = workspace_tool(address, token, parent.id, runtime,
+                    json!({"type":"inspect","sessionId":successor.id}));
+                panic!("cleanup missing: root={:?} child={:?} successor={:?}",
+                    delivered["session"]["managed_workspace"]["cleanup"],
+                    child_state["session"]["managed_workspace"]["cleanup"],
+                    next_state["session"]["managed_workspace"]["cleanup"]);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(task.coordination.as_ref().unwrap().path.exists());
         assert_eq!(
             workspace_tool(address, token, parent.id, runtime, delivery),
             delivered

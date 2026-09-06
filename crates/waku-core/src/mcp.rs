@@ -189,10 +189,11 @@ pub fn run_stdio(
                     },
                     {
                         "name": "waku_workspace",
-                        "description": "Inspect this task or a direct child. Integrate an explicitly accepted full child commit into the daemon integration branch, with checks, environment and reviewer evidence bound to that commit. Deliver the accepted combined commit to the task's originally selected local target after checking its version and active users. Integration and delivery do not push or deploy. Repeating a confirmed fixed result reuses its record. On conflict or a moved target, inspect the retained state before retrying. Task workspaces are explicitly created by the user before execution.",
+                        "description": "Inspect this task or a direct child. Integrate an explicitly accepted full child commit into the daemon integration branch, with checks, environment and reviewer evidence bound to that commit. Deliver the accepted combined commit to the task's originally selected local target after checking its version and active users. Integration and delivery do not push or deploy. Repeating a confirmed fixed result reuses its record. On conflict or a moved target, inspect the retained state before retrying. Task workspaces are explicitly created by the user before execution. After confirmed delivery, safe owned resources are cleaned automatically; cleanup retries retained resources for this session and its direct children, without forcing deletion.",
                         "inputSchema": {"type":"object","properties":{"operation":{
                             "oneOf":[
                                 {"type":"object","properties":{"type":{"const":"inspect"},"sessionId":{"type":"string","format":"uuid"}},"required":["type","sessionId"],"additionalProperties":false},
+                                {"type":"object","properties":{"type":{"const":"cleanup"},"sessionId":{"type":"string","format":"uuid"}},"required":["type","sessionId"],"additionalProperties":false},
                                 {"type":"object","properties":{"type":{"const":"integrate"},"sessionId":{"type":"string","format":"uuid"},"commit":{"type":"string"},"expectedIntegrationCommit":{"type":"string"},"evidence":{"$ref":"#/$defs/evidence"}},"required":["type","sessionId","commit","expectedIntegrationCommit","evidence"],"additionalProperties":false},
                                 {"type":"object","properties":{"type":{"const":"deliver"},"commit":{"type":"string"},"expectedTargetCommit":{"type":"string"},"evidence":{"$ref":"#/$defs/evidence"}},"required":["type","commit","expectedTargetCommit","evidence"],"additionalProperties":false}
                             ]
@@ -316,7 +317,7 @@ pub fn run_stdio(
                                     let failed = session.managed_workspace.as_ref().is_some_and(|workspace| {
                                         use crate::model::StewardWorkspaceOperation as Operation;
                                         match &workspace_operation {
-                                            Some(Operation::Inspect { .. }) => false,
+                                            Some(Operation::Inspect { .. } | Operation::Cleanup { .. }) => false,
                                             Some(Operation::Integrate { commit, .. }) => !workspace.results.iter().any(|result| &result.commit == commit && result.integration_commit.is_some()),
                                             Some(Operation::Deliver { commit, .. }) => !workspace.deliveries.iter().any(|delivery| &delivery.commit == commit && delivery.completed),
                                             _ => workspace.error.is_some(),

@@ -2856,6 +2856,160 @@ impl Waku {
         )
     }
 
+    fn render_managed_task_details(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.selected_session()?.managed_workspace.as_ref()?;
+        let theme = Theme::current(cx);
+        let weak = cx.entity().downgrade();
+        let focus = self.transcript_control_focus("managed-task-details-content", cx);
+        let open_focus = focus.clone();
+        let handle = self.menu_handle_with("managed-task-details", cx, move |open, window, cx| {
+            if !open {
+                return;
+            }
+            let _ = weak.update(cx, |this, cx| {
+                let Some(selected) = this.selected_session() else {
+                    return;
+                };
+                let owner = selected.id;
+                let mut rows = vec!["Saved task evidence (snapshot when opened)".to_owned()];
+                for session in this.state.sessions.iter().filter(|session| {
+                    session.id == owner || session.parent_session_id == Some(owner)
+                }) {
+                    let Some(task) = &session.managed_workspace else {
+                        continue;
+                    };
+                    rows.push(format!(
+                        "{} · owner {}",
+                        session.display_title(),
+                        session.id
+                    ));
+                    rows.push(format!("Base: {}", task.base_commit));
+                    rows.push(format!(
+                        "Execution: {}",
+                        task.coordination
+                            .as_ref()
+                            .map_or(task.path.as_path(), |location| location.path.as_path())
+                            .display()
+                    ));
+                    rows.push(format!(
+                        "Integration: {} → target {}",
+                        task.integration_branch, task.target_branch
+                    ));
+                    for dependency in &task.dependencies {
+                        rows.push(format!(
+                            "Dependency: {} at {}",
+                            dependency.session_id, dependency.commit
+                        ));
+                    }
+                    for result in &task.results {
+                        rows.push(format!(
+                            "Result: {} · owner {} · integrated {}",
+                            result.commit,
+                            result.owner,
+                            result.integration_commit.as_deref().unwrap_or("pending")
+                        ));
+                        for evidence in &result.evidence {
+                            rows.push(format!(
+                                "Commit: {}\nChecks: {}\nEnvironment: {}\nReviewer: {}",
+                                evidence.commit,
+                                evidence.checks,
+                                evidence.environment,
+                                evidence.reviewer
+                            ));
+                        }
+                    }
+                    for delivery in &task.deliveries {
+                        rows.push(format!(
+                            "Delivery: {} · {}\nReference: {}",
+                            delivery.commit,
+                            if delivery.completed {
+                                "delivered locally"
+                            } else {
+                                "pending"
+                            },
+                            delivery.reference
+                        ));
+                        for evidence in &delivery.evidence {
+                            rows.push(format!(
+                                "Overall checks: {}\nEnvironment: {}\nReviewer: {}",
+                                evidence.checks, evidence.environment, evidence.reviewer
+                            ));
+                        }
+                        if let Some(error) = &delivery.error {
+                            rows.push(error.clone());
+                        }
+                    }
+                    for cleanup in &task.cleanup {
+                        rows.push(format!(
+                            "Cleanup: {} · {:?}{}",
+                            cleanup.path.display(),
+                            cleanup.status,
+                            cleanup
+                                .reason
+                                .as_ref()
+                                .map(|reason| format!(" · {reason}"))
+                                .unwrap_or_default()
+                        ));
+                    }
+                }
+                this.task_workspace_details_list.reset(rows.len());
+                this.task_workspace_details = Rc::new(rows);
+                open_focus.focus(window, cx);
+                cx.notify();
+            });
+        });
+        let rows = self.task_workspace_details.clone();
+        let state = self.task_workspace_details_list.clone();
+        Some(popover(
+            MenuChip::new("managed-task-details-trigger")
+                .label("Task results")
+                .selected(handle.is_open()),
+            &handle,
+            MenuAlign::AboveLeft,
+            move |_, _, _| {
+                let rows = rows.clone();
+                let scroll = state.clone();
+                div()
+                    .w(px(600.0))
+                    .h(px(420.0))
+                    .p(px(12.0))
+                    .rounded(px(10.0))
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .id("managed-task-details-content")
+                    .track_focus(&focus)
+                    .tab_index(0)
+                    .focus_visible(|style| style.border_color(theme.accent))
+                    .on_key_down(move |event, window, cx| {
+                        match event.keystroke.key.as_str() {
+                            "up" => scroll.scroll_by(px(-40.0)),
+                            "down" => scroll.scroll_by(px(40.0)),
+                            "pageup" => scroll.scroll_by(px(-320.0)),
+                            "pagedown" => scroll.scroll_by(px(320.0)),
+                            "home" => scroll.scroll_to_reveal_item(0),
+                            "end" => scroll.scroll_to_end(),
+                            _ => return,
+                        }
+                        window.refresh();
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        list(state.clone(), move |index, _, _| {
+                            div()
+                                .w_full()
+                                .py(px(6.0))
+                                .text_size(sp(12.0))
+                                .text_color(theme.text)
+                                .child(rows[index].clone())
+                                .into_any_element()
+                        })
+                        .size_full(),
+                    )
+                    .into_any_element()
+            },
+        ))
+    }
     fn render_branch_selector(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::current(cx);
         let session = self.selected_session()?;
@@ -3448,29 +3602,17 @@ impl Waku {
                 } else {
                     "Ready to execute"
                 };
+                let cleanup = if task.cleanup.is_empty() {
+                    String::new()
+                } else {
+                    let removed = task.cleanup.iter().filter(|item|
+                        item.status == waku_protocol::model::WorkspaceCleanupStatus::Removed).count();
+                    format!(" · cleaned {removed}/{}", task.cleanup.len())
+                };
                 return Some(
-                    div()
-                        .px(px(7.0))
+                    div().px(px(7.0)).max_w(px(300.0)).truncate()
                         .text_color(theme.text_secondary)
-                        .child(format!(
-                            "{} · {} · {} → {} · base {} · owner {}{}",
-                            task.name,
-                            status,
-                            task.coordination
-                                .as_ref()
-                                .map_or(task.branch.as_str(), |location| location.branch.as_str()),
-                            task.target_branch,
-                            &task.base_commit[..task.base_commit.len().min(8)],
-                            &session.id.to_string()[..8],
-                            format!(
-                                " · integration {}{}",
-                                task.integration_branch,
-                                task.error
-                                    .as_ref()
-                                    .map(|error| format!(" · {error}"))
-                                    .unwrap_or_default()
-                            )
-                        ))
+                        .child(format!("{status}{cleanup} · {}", task.name))
                         .into_any_element(),
                 );
             }
@@ -3530,6 +3672,23 @@ impl Waku {
                 .child(tr!("consultation.open"))
                 .on_click(cx.listener(|this, _, window, cx| this.open_consultation(window, cx)))
         });
+
+        let retry_cleanup = if !self.branch_operation_pending && self.selected_session()
+            .and_then(|session| session.managed_workspace.as_ref())
+            .is_some_and(|task| task.cleanup.iter().any(|item|
+                item.status != waku_protocol::model::WorkspaceCleanupStatus::Removed))
+        {
+            let focus = self.transcript_control_focus("retry-managed-cleanup", cx);
+            Some(div().id("retry-managed-cleanup").track_focus(&focus).tab_index(0)
+                .px(px(7.0)).py(px(4.0)).rounded(px(4.0)).cursor_default()
+                .text_color(theme.text_secondary)
+                .focus_visible(|style| style.border_1().border_color(theme.accent))
+                .hover(|style| style.bg(theme.overlay)).child("Retry safe cleanup")
+                .on_click(cx.listener(|this, _, _, cx| this.retry_managed_cleanup(cx))))
+        } else { None };
+
+        let task_details = self.render_managed_task_details(cx);
+
         let usage_meter = self.render_usage_meter(cx);
         let steward_wait = self
             .selected_session()
@@ -3588,6 +3747,8 @@ impl Waku {
                     .children(branch_selector)
                     .children(task_workspace)
                     .children(begin_task)
+                    .children(retry_cleanup)
+                    .children(task_details)
                     .child(div().flex_1())
                     .children(usage_meter)
                     .children(steward_wait)

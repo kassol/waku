@@ -1197,6 +1197,8 @@ pub struct Waku {
     /// rows remain visible but never enter this index.
     branch_picker_highlight: Option<usize>,
     branch_picker_list_state: ListState,
+    task_workspace_details: Rc<Vec<String>>,
+    task_workspace_details_list: ListState,
     branch_picker_row_cache: RefCell<Vec<crate::git_branch::BranchEntry>>,
     /// Git subprocess results per concrete workspace path. Render only reads
     /// this in-memory cache; misses are fulfilled on the background executor.
@@ -2785,6 +2787,8 @@ impl Waku {
                 branch_picker_mode: BranchPickerMode::Browse,
                 branch_picker_highlight: None,
                 branch_picker_list_state,
+                task_workspace_details: Rc::new(Vec::new()),
+                task_workspace_details_list: ListState::new(0, ListAlignment::Top, px(256.0)),
                 branch_picker_row_cache: RefCell::new(Vec::new()),
                 branch_snapshots: QueryCache::new(MAX_CACHED_WORKSPACES),
                 visible_branch_snapshot: None,

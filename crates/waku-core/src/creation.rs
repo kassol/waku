@@ -222,9 +222,10 @@ impl WakuBackend {
                             if let Some(task) = &parent.managed_workspace {
                                 let mut managed = task.clone();
                                 managed.coordination = None;
-                managed.deliveries.clear();
-                managed.results.clear();
-                managed.dependencies = dependencies.clone();
+                                managed.deliveries.clear();
+                                managed.cleanup.clear();
+                                managed.results.clear();
+                                managed.dependencies = dependencies.clone();
                                 managed.name = child.display_title().to_string();
                                 managed.base_commit = task_base.clone().expect("managed task has a base");
                                 managed.path = planned.path.clone();
@@ -276,6 +277,7 @@ impl WakuBackend {
                 let mut managed = task.clone();
                 managed.coordination = None;
                 managed.deliveries.clear();
+                managed.cleanup.clear();
                 managed.results.clear();
                 managed.dependencies = dependencies.clone();
                 managed.name = child.display_title().to_string();

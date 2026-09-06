@@ -51,6 +51,11 @@ mod creation;
 mod task_workspace;
 #[path = "task_integration.rs"]
 mod task_integration;
+#[path = "task_cleanup.rs"]
+mod task_cleanup;
+#[cfg(test)]
+#[path = "task_cleanup_tests.rs"]
+mod task_cleanup_tests;
 
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
@@ -60,6 +65,7 @@ pub struct WakuBackend {
     workspace_start_gate: Mutex<()>,
     runtime_workspaces: Mutex<HashMap<Uuid, PathBuf>>,
     terminal_workspaces: Mutex<HashMap<Uuid, PathBuf>>,
+    live_background: Mutex<HashMap<(Uuid, Uuid), HashSet<crate::model::BackgroundWorkKey>>>,
     quitting: AtomicBool,
     saving_failed: AtomicBool,
     failed_sessions: Mutex<HashSet<Uuid>>,
@@ -188,6 +194,7 @@ impl WakuBackend {
             workspace_start_gate: Mutex::new(()),
             runtime_workspaces: Mutex::new(HashMap::new()),
             terminal_workspaces: Mutex::new(HashMap::new()),
+            live_background: Mutex::new(HashMap::new()),
             quitting: AtomicBool::new(false),
             saving_failed: AtomicBool::new(false),
             failed_sessions: Mutex::new(HashSet::new()),
@@ -430,6 +437,7 @@ impl Backend for WakuBackend {
             }) {
                 continue;
             }
+            self.track_cleanup_background(first.session_id, first.runtime_id, &decoded);
             reducer.apply(session, decoded);
             let cursor = crate::model::RuntimeEventCursor {
                 runtime_id: event.runtime_id,
@@ -538,6 +546,7 @@ impl Backend for WakuBackend {
     fn resume_stewards(&self, events: EventSink) {
         self.resume_queued_inputs(&events);
         self.resume_waiting_stewards(&events);
+        self.cleanup_delivered_tasks(&events);
     }
 
     fn authorize_steward(&self, session_id: Uuid, project_id: Uuid) -> anyhow::Result<()> {

@@ -1001,8 +1001,29 @@ pub struct WorkspaceDelivery {
     pub completed: bool,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceCleanupStatus {
+    Ready,
+    Waiting,
+    Retained,
+    Removed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct WorkspaceCleanup {
+    #[ts(type = "string")]
+    pub path: PathBuf,
+    pub branch: String,
+    pub commit: Option<String>,
+    pub status: WorkspaceCleanupStatus,
+    pub reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct ManagedWorkspace {
+    #[serde(default)]
+    pub cleanup: Vec<WorkspaceCleanup>,
     #[serde(default)]
     pub deliveries: Vec<WorkspaceDelivery>,
     #[serde(default)]
@@ -1038,6 +1059,9 @@ pub struct ManagedWorkspace {
     rename_all_fields = "camelCase"
 )]
 pub enum StewardWorkspaceOperation {
+    Cleanup {
+        session_id: Uuid,
+    },
     Begin {
         name: String,
         target_branch: String,

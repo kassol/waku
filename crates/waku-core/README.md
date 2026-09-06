@@ -101,3 +101,14 @@ After a failed attempt, a newly reviewed commit can be delivered without replaci
 an earlier reference. A confirmed delivery is idempotent. Delivery does not push
 or deploy. The UI distinguishes execution, pending acceptance, integration and
 local delivery using saved records.
+
+After confirmed delivery, the daemon cleans eligible task worktrees and branches.
+It checks each recorded resource, shared session references, runtime and terminal
+users, all untracked or ignored files, and commit containment in the durable
+result reference. Idle provider processes are closed only when no open turn,
+approval, queued input, persistent wait, unsaved history or background work remains.
+The existing event worker retries resources deferred for active work. Other unsafe
+resources keep a saved reason and can be retried with `waku_workspace cleanup`.
+Cleanup uses ordinary Git removal, preserves history and delivery refs, and never
+adopts legacy workspaces or deletes later work after a partial cleanup. The task
+results popup shows saved commit evidence, dependencies and per-resource outcomes.

@@ -120,6 +120,8 @@ export type { WireDriverEvent } from "./WireDriverEvent";
 export type { WireDriverStartOptions } from "./WireDriverStartOptions";
 export type { WireSessionOptions } from "./WireSessionOptions";
 export type { WorkingTreeEntry } from "./WorkingTreeEntry";
+export type { WorkspaceCleanup } from "./WorkspaceCleanup";
+export type { WorkspaceCleanupStatus } from "./WorkspaceCleanupStatus";
 export type { WorkspaceDelivery } from "./WorkspaceDelivery";
 export type { WorkspaceDependency } from "./WorkspaceDependency";
 export type { WorkspaceEvidence } from "./WorkspaceEvidence";

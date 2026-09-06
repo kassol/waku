@@ -6,6 +6,52 @@ enum BranchOperation {
 }
 
 impl Waku {
+    pub(super) fn retry_managed_cleanup(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.selected_session().map(|session| session.id) else {
+            return;
+        };
+        if self.branch_operation_pending {
+            return;
+        }
+        let client = self.daemon.client();
+        self.branch_operation_pending = true;
+        cx.notify();
+        cx.spawn(async move |waku, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    client.request(
+                        session_id,
+                        Uuid::nil(),
+                        waku_client::Command::StewardWorkspace {
+                            operation: waku_protocol::model::StewardWorkspaceOperation::Cleanup {
+                                session_id,
+                            },
+                        },
+                    )
+                })
+                .await;
+            let _ = waku.update(cx, |waku, cx| {
+                waku.branch_operation_pending = false;
+                match result {
+                    Ok(waku_client::ResponsePayload::TaskWorkspace { session }) => {
+                        if let Some(local) = waku
+                            .state
+                            .sessions
+                            .iter_mut()
+                            .find(|local| local.id == session_id)
+                        {
+                            local.managed_workspace = session.managed_workspace;
+                        }
+                    }
+                    Err(error) => waku.show_toast(error.to_string()),
+                    _ => waku.show_toast("Invalid cleanup response".to_owned()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
     pub(super) fn begin_managed_code_task(
         &mut self,
         target_branch: String,

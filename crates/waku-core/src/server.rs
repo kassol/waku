@@ -132,6 +132,10 @@ impl EventSink {
         self.hub.wake_stewards();
     }
 
+    pub(crate) fn task_workspace_saved(&self, session: &AgentSession) {
+        self.hub.task_state_saved(u64::MAX, &[], std::slice::from_ref(session));
+    }
+
     pub(crate) fn ensure_steward_active(&self) -> anyhow::Result<()> {
         if self
             .scoped_principal
@@ -342,6 +346,7 @@ impl From<&Project> for ProjectCatalogEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SessionCatalogEntry {
+    managed_revision: Option<u64>,
     title: String,
     auto_title: Option<String>,
     project_id: Uuid,
@@ -355,6 +360,7 @@ struct SessionCatalogEntry {
 impl From<&AgentSession> for SessionCatalogEntry {
     fn from(session: &AgentSession) -> Self {
         Self {
+            managed_revision: session.managed_workspace.as_ref().map(|task| task.revision),
             title: session.title.clone(),
             auto_title: session.auto_title.clone(),
             project_id: session.project_id,
@@ -1643,7 +1649,8 @@ fn task_catalog_action(command: &Command) -> TaskCatalogAction {
         Command::SaveTaskState { projects, .. } => TaskCatalogAction::Save {
             projects: projects.clone(),
         },
-        Command::RemoveSession
+        Command::StewardWorkspace { .. }
+        | Command::RemoveSession
         | Command::Cancel
         | Command::ForkSessionFromResponse { .. }
         | Command::RewindSessionToMessage { .. }
