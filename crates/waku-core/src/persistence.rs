@@ -1198,6 +1198,26 @@ impl StateStore {
             .collect();
         drop(sessions);
 
+        // Recover durable waits without hydrating any transcript. This runs
+        // once when opening the store; later catalogs use the in-memory projection.
+        let mut waits = connection
+            .prepare("SELECT session_id, json_extract(data, '$.steward_wait') FROM session_details")
+            .map_err(to_io_error)?;
+        let mut waits_by_session = HashMap::new();
+        for row in waits
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))
+            .map_err(to_io_error)?
+        {
+            let (id, wait) = row.map_err(to_io_error)?;
+            if let Some(wait) = wait {
+                waits_by_session.insert(id, serde_json::from_str(&wait).map_err(to_io_error)?);
+            }
+        }
+        for session in &mut state.sessions {
+            session.steward_wait = waits_by_session.remove(&session.id.to_string());
+        }
+        drop(waits);
+
         state.migrate_loaded();
         let app_settings = state.app_settings();
         let app_settings_are_saved = !self.desktop_files
@@ -1291,6 +1311,7 @@ impl StateStore {
         session.history_save_error = stored.history_save_error;
         session.last_driver_error = stored.last_driver_error;
         session.cancellation_requested_turn_id = stored.cancellation_requested_turn_id;
+        session.steward_wait = stored.steward_wait;
         session.pending_permission = stored.pending_permission;
         session.pending_user_input = stored.pending_user_input;
 
@@ -1742,6 +1763,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
     Some(AgentSession {
         id: Uuid::parse_str(&id).ok()?,
         parent_session_id: parent_session_id.and_then(|id| Uuid::parse_str(&id).ok()),
+        steward_wait: None,
         title,
         auto_title,
         project_id: Uuid::parse_str(&project_id).ok()?,
@@ -2070,6 +2092,33 @@ mod tests {
             text: text.to_owned(),
             attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn steward_wait_survives_database_reopen() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(directory.join("workspace"));
+        let session = &mut state.sessions[0];
+        let parent_turn_id = session.begin_turn("delegate");
+        session.finish_active_turn(crate::model::TurnStatus::Completed);
+        let wait = crate::model::StewardWait {
+            id: Uuid::new_v4(),
+            parent_turn_id,
+            targets: vec![crate::model::StewardWaitTarget {
+                session_id: Uuid::new_v4(),
+                turn_id: Uuid::new_v4(),
+            }],
+        };
+        session.steward_wait = Some(wait.clone());
+        store.save(&mut state).unwrap();
+        let reopened = store_in(&directory);
+        let mut restored = reopened.load().unwrap();
+        assert_eq!(restored.sessions[0].steward_wait, Some(wait.clone()));
+        reopened.hydrate(&mut restored.sessions[0]).unwrap();
+        assert_eq!(restored.sessions[0].steward_wait, Some(wait));
+        assert!(restored.sessions[0].is_waiting_for_children());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

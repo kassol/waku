@@ -138,6 +138,7 @@ pub(super) fn merge_remote_session_catalog(
             local.created_at = remote.created_at;
             local.last_reply_at = remote.last_reply_at;
             if !has_local_runtime(local.id) {
+                local.steward_wait = remote.steward_wait;
                 local.status = remote.status;
                 local.updated_at = remote.updated_at;
             }

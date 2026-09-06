@@ -1056,3 +1056,6 @@ session.history_pending: 正在保存历史…
 session.history_save_failed: '历史尚未保存：%{error}'
 
 sidebar.original_parent: "原父会话：%{id}"
+
+session.waiting_for_children: 正在等待子会话
+session.cancel_wait: 取消等待

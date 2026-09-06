@@ -909,12 +909,27 @@ pub struct RuntimeEventCursor {
     pub sequence: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct StewardWaitTarget {
+    pub session_id: Uuid,
+    pub turn_id: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct StewardWait {
+    pub id: Uuid,
+    pub parent_turn_id: Uuid,
+    pub targets: Vec<StewardWaitTarget>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct AgentSession {
     pub id: Uuid,
     /// Immutable creator assigned by the daemon; retained when that parent is removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steward_wait: Option<StewardWait>,
     /// A title explicitly chosen by the user. [`Self::DEFAULT_TITLE`] means
     /// no explicit title has been set, so [`Self::auto_title`] may be shown.
     pub title: String,
@@ -1019,6 +1034,7 @@ impl AgentSession {
         Self {
             id: Uuid::new_v4(),
             parent_session_id: None,
+            steward_wait: None,
             title: Self::DEFAULT_TITLE.to_owned(),
             auto_title: None,
             project_id,
@@ -1063,6 +1079,7 @@ impl AgentSession {
         Self {
             id: self.id,
             parent_session_id: self.parent_session_id,
+            steward_wait: self.steward_wait.clone(),
             title: self.title.clone(),
             auto_title: self.auto_title.clone(),
             project_id: self.project_id,
@@ -1189,6 +1206,12 @@ impl AgentSession {
         self.auto_title = title;
         self.updated_at = unix_time();
         true
+    }
+
+    pub fn is_waiting_for_children(&self) -> bool {
+        self.status == SessionStatus::Idle
+            && self.active_turn_id().is_none()
+            && self.steward_wait.is_some()
     }
 
     pub fn can_choose_model(&self, provider: ProviderKind) -> bool {
@@ -1320,6 +1343,7 @@ impl AgentSession {
         display_content: Option<String>,
         attachments: Vec<MessageAttachment>,
     ) -> Uuid {
+        self.steward_wait = None;
         let id = Uuid::new_v4();
         let now = unix_time();
         self.turns.push(AgentTurn {
@@ -1347,6 +1371,7 @@ impl AgentSession {
     /// start report marks it via [`Self::mark_active_turn_provider_started`],
     /// and an unconfirmed one can be unwound if the pursuit never begins.
     pub fn begin_provider_turn(&mut self) -> Uuid {
+        self.steward_wait = None;
         let id = Uuid::new_v4();
         let now = unix_time();
         self.turns.push(AgentTurn {
@@ -1381,6 +1406,7 @@ impl AgentSession {
         turn_id: Uuid,
         message_id: Uuid,
     ) -> bool {
+        self.steward_wait = None;
         let now = unix_time();
         if let Some(active) = self.active_turn_id() {
             let has_prompt = self.messages.iter().any(|candidate| {
@@ -1593,6 +1619,7 @@ impl AgentSession {
         let now = unix_time();
         fork.id = fork_id;
         fork.parent_session_id = None;
+        fork.steward_wait = None;
         fork.title = Self::DEFAULT_TITLE.to_owned();
         fork.auto_title = Some(fork_title.to_owned());
         fork.status = SessionStatus::Idle;
@@ -1829,6 +1856,7 @@ impl ActivityKind {
 
 #[derive(Clone, Debug)]
 pub enum DriverEvent {
+    StewardWaitChanged(Option<StewardWait>),
     /// Client-only acknowledgement that every daemon event through this
     /// sequence has been incorporated into the local session projection.
     /// Providers never emit this and the daemon never serializes it.

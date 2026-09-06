@@ -98,7 +98,7 @@ pub fn run_stdio(
         } else if method == "initialize" {
             initialized = true;
             Ok(
-                json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"waku","version":env!("CARGO_PKG_VERSION")}}),
+                json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"waku","version":env!("CARGO_PKG_VERSION")},"instructions":"After delegating, do independent work if available. When only child work remains, call waku_wait. If waiting=true, end your current turn immediately; do not poll or keep calling tools. Waku will automatically resume you in a new turn when a watched child finishes or needs user attention. If waiting=false, handle the returned states now. Never approve permissions or answer questions on the user's behalf."}),
             )
         } else if !initialized {
             Err((-32000, "Initialize the MCP session first".into()))
@@ -176,8 +176,13 @@ pub fn run_stdio(
                         }
                     },
                     {
+                        "name": "waku_wait",
+                        "description": "Persist a one-shot wait for the current turns of direct children. If waiting=true, finish your current turn now and stop polling; Waku automatically starts a follow-up turn when any watched child finishes, fails, is interrupted, or needs user input. If waiting=false, a child is already actionable: read its result now. New user input or cancellation revokes the wait. Repeating the same targets in this turn is safe.",
+                        "inputSchema": {"type":"object","properties":{"session_ids":{"type":"array","items":{"type":"string","format":"uuid"},"minItems":1,"maxItems":128}},"required":["session_ids"],"additionalProperties":false}
+                    },
+                    {
                         "name": "waku_status",
-                        "description": "Read direct children session and current/latest turn states; optionally wait for a change or timeout. Timeout is not failure.",
+                        "description": "Read direct children session and current/latest turn states. For passive waiting use waku_wait and end your turn instead of polling. Optional bounded wait is for compatibility; timeout is not failure.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -265,6 +270,7 @@ pub fn run_stdio(
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildResult {session,reply,reply_truncated,transcript,transcript_truncated} } => (json!({"session":session,"reply":reply,"reply_truncated":reply_truncated,"transcript":transcript,"transcript_truncated":transcript_truncated}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildPromptAccepted {turn_id} } => (json!({"turn_id":turn_id}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildCancel {session,accepted,stopped} } => (json!({"session":session,"accepted":accepted,"stopped":stopped}).to_string(),false),
+                                ResponseOutcome::Ok { payload:ResponsePayload::StewardWait {wait,sessions} } => (json!({"waiting":wait.is_some(),"wait":wait,"sessions":sessions,"next_action":"If waiting=true, end this turn now. A child event will automatically resume you; do not poll. If waiting=false, handle the actionable child states now."}).to_string(),false),
                                 ResponseOutcome::Error {error} => (error.message,true),
                                 _ => bail!("unexpected steward response"),
                             };
@@ -319,6 +325,16 @@ fn tool_command(name: &str, arguments: Value) -> Result<Command, String> {
             child_session_id: args.session_id,
             prompt: args.prompt,
         })
+    } else if name == "waku_wait" {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WaitArguments { session_ids: Vec<Uuid> }
+        let args: WaitArguments = serde_json::from_value(arguments)
+            .map_err(|error| format!("Invalid tool arguments: {error}"))?;
+        if args.session_ids.is_empty() || args.session_ids.len() > 128 {
+            return Err("session_ids must contain 1..128 direct children".into());
+        }
+        Ok(Command::StewardWait { session_ids: args.session_ids })
     } else if name == "waku_cancel" {
         let args: CancelArguments = serde_json::from_value(arguments)
             .map_err(|error| format!("Invalid tool arguments: {error}"))?;

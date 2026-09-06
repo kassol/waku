@@ -3430,6 +3430,34 @@ impl Waku {
         let branch_selector = self.render_branch_selector(cx);
 
         let usage_meter = self.render_usage_meter(cx);
+        let steward_wait = self
+            .selected_session()
+            .is_some_and(|session| session.is_waiting_for_children())
+            .then(|| {
+                let focus = self.transcript_control_focus("cancel-steward-wait", cx);
+                div()
+                    .px(px(7.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_color(theme.text_secondary)
+                    .child(tr!("session.waiting_for_children"))
+                    .child(
+                        div()
+                            .id("cancel-steward-wait")
+                            .track_focus(&focus)
+                            .tab_index(0)
+                            .tab_stop(true)
+                            .px(px(4.0))
+                            .py(px(4.0))
+                            .rounded(px(4.0))
+                            .cursor_default()
+                            .focus_visible(|style| style.border_1().border_color(theme.accent))
+                            .hover(|style| style.bg(theme.overlay).text_color(theme.text))
+                            .child(tr!("session.cancel_wait"))
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_steward_wait(cx))),
+                    )
+            });
         div()
             .flex_none()
             .px(px(20.0))
@@ -3459,6 +3487,7 @@ impl Waku {
                     .children(branch_selector)
                     .child(div().flex_1())
                     .children(usage_meter)
+                    .children(steward_wait)
                     .children(self.render_history_persistence(cx)),
             )
     }

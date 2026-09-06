@@ -1135,7 +1135,53 @@ impl Waku {
         }
     }
 
+    pub(super) fn cancel_steward_wait(&mut self, cx: &mut Context<Self>) {
+        let Some((session_id, wait_id)) = self.selected_session().and_then(|session| {
+            session
+                .is_waiting_for_children()
+                .then(|| (session.id, session.steward_wait.as_ref().unwrap().id))
+        }) else {
+            return;
+        };
+        let daemon = self.daemon.clone();
+        cx.spawn(async move |waku, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    daemon
+                        .client()
+                        .request(session_id, Uuid::nil(), waku_client::Command::Cancel)
+                })
+                .await;
+            let _ = waku.update(cx, |waku, cx| {
+                match result {
+                    Ok(waku_client::ResponsePayload::Ack) => {
+                        if let Some(session) =
+                            waku.state.sessions.iter_mut().find(|s| s.id == session_id)
+                        {
+                            if session
+                                .steward_wait
+                                .as_ref()
+                                .is_some_and(|wait| wait.id == wait_id)
+                            {
+                                session.steward_wait = None;
+                            }
+                        }
+                    }
+                    Ok(_) => waku.show_toast("Unexpected daemon cancellation response"),
+                    Err(error) => waku.show_toast(error.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn cancel_turn(&mut self, cx: &mut Context<Self>) {
+        if self.selected_session().is_some_and(AgentSession::is_waiting_for_children) {
+            self.cancel_steward_wait(cx);
+            return;
+        }
         self.escape_stop_confirmation.clear();
         let Some(session_id) = self.state.selected_session else {
             return;

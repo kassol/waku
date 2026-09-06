@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use subtle::ConstantTimeEq as _;
 use tungstenite::handshake::server::{
     ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
@@ -73,6 +73,9 @@ pub trait Backend: Send + Sync + 'static {
     /// Called on a separate worker after event ingestion releases its locks.
     fn stop_failed_work(&self) {}
 
+    /// Process durable child notifications outside the event ingestion lock.
+    fn resume_stewards(&self, _events: EventSink) {}
+
     fn authorize_steward(&self, _session_id: Uuid, _project_id: Uuid) -> anyhow::Result<()> {
         bail!("steward sessions are unavailable")
     }
@@ -97,15 +100,20 @@ pub struct EventSink {
 pub(crate) struct ChildCreationGuard {
     session_id: Uuid,
     hub: Arc<Hub>,
+    wake_on_release: bool,
 }
 
 impl Drop for ChildCreationGuard {
     fn drop(&mut self) {
-        self.hub
-            .state
-            .lock()
-            .creating_sessions
-            .remove(&self.session_id);
+        {
+            let mut state = self.hub.state.lock();
+            state.creating_sessions.remove(&self.session_id);
+            state.operation_sessions.remove(&self.session_id);
+        }
+        self.hub.operation_released.notify_all();
+        if self.wake_on_release {
+            self.hub.wake_stewards();
+        }
     }
 }
 
@@ -153,6 +161,7 @@ impl EventSink {
         ChildCreationGuard {
             session_id,
             hub: self.hub.clone(),
+            wake_on_release: false,
         }
     }
 
@@ -160,12 +169,31 @@ impl EventSink {
         &self,
         session_id: Uuid,
     ) -> anyhow::Result<ChildCreationGuard> {
-        if !self.hub.state.lock().creating_sessions.insert(session_id) {
+        let mut state = self.hub.state.lock();
+        if !state.creating_sessions.insert(session_id) {
             bail!("child session is busy accepting another operation");
         }
+        state.operation_sessions.insert(session_id);
         Ok(ChildCreationGuard {
             session_id,
             hub: self.hub.clone(),
+            wake_on_release: false,
+        })
+    }
+
+    fn reserve_client_target(&self, session_id: Uuid) -> anyhow::Result<ChildCreationGuard> {
+        let mut state = self.hub.state.lock();
+        self.hub.operation_released.wait_while(&mut state, |state| {
+            state.operation_sessions.contains(&session_id)
+        });
+        if !state.creating_sessions.insert(session_id) {
+            bail!("child session creation is still in progress");
+        }
+        state.operation_sessions.insert(session_id);
+        Ok(ChildCreationGuard {
+            session_id,
+            hub: self.hub.clone(),
+            wake_on_release: true,
         })
     }
 
@@ -270,6 +298,7 @@ struct HubState {
     subscribers: HashMap<u64, Sender<ServerMessage>>,
     active_runtimes: HashMap<Uuid, Uuid>,
     creating_sessions: HashSet<Uuid>,
+    operation_sessions: HashSet<Uuid>,
     next_sequences: HashMap<(Uuid, Uuid), u64>,
     journal: HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>,
     history_persistence: HashMap<(Uuid, Uuid), ServerMessage>,
@@ -336,7 +365,9 @@ struct Hub {
     address: Option<std::net::SocketAddr>,
     epoch: Uuid,
     state: Mutex<HubState>,
+    operation_released: Condvar,
     backend: Option<Weak<dyn Backend>>,
+    steward_wake: Mutex<Option<Sender<()>>>,
 }
 
 impl Default for Hub {
@@ -345,7 +376,9 @@ impl Default for Hub {
             address: None,
             epoch: Uuid::new_v4(),
             state: Mutex::new(HubState::default()),
+            operation_released: Condvar::new(),
             backend: None,
+            steward_wake: Mutex::new(None),
         }
     }
 }
@@ -372,6 +405,12 @@ struct RequestDispatcher {
 }
 
 impl Hub {
+    fn wake_stewards(&self) {
+        if let Some(sender) = self.steward_wake.lock().as_ref() {
+            let _ = sender.try_send(());
+        }
+    }
+
     fn event_sink(self: &Arc<Self>, session_id: Uuid, runtime_id: Uuid) -> EventSink {
         EventSink {
             session_id,
@@ -500,8 +539,10 @@ impl Hub {
             Some(ServerMessage::HistoryPersistence { error: Some(_), .. })
         );
         let mut persistence_error = None;
+        let mut committed = false;
         if replayable && let Some(backend) = self.backend.as_ref().and_then(Weak::upgrade) {
             let result = backend.persist_events(&sequenced);
+            committed = matches!(&result, Ok(true));
             if let Some(last) = sequenced.last() {
                 match &result {
                     Ok(true) | Err(_) => {
@@ -536,6 +577,13 @@ impl Hub {
             while journal.len() > MAX_REPLAY_EVENTS_PER_SESSION {
                 journal.pop_front();
             }
+        }
+        let wake = committed && sequenced.iter().any(|event| matches!(event.event.kind.as_str(),
+            "turnFinished" | "turnInterrupted" | "permission" | "userInputRequested"
+                | "error" | "processExited" | "stewardWaitChanged"));
+        drop(state);
+        if wake {
+            self.wake_stewards();
         }
         Ok(())
     }
@@ -860,6 +908,42 @@ fn mcp_address(mut address: std::net::SocketAddr) -> std::net::SocketAddr {
     address
 }
 
+struct StewardWorker {
+    hub: Arc<Hub>,
+    stopped: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StewardWorker {
+    fn start(hub: Arc<Hub>, backend: Arc<dyn Backend>) -> anyhow::Result<Self> {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stop = stopped.clone();
+        let weak = Arc::downgrade(&hub);
+        let thread = std::thread::Builder::new()
+            .name("waku-steward-notifications".into())
+            .spawn(move || {
+                while receiver.recv().is_ok() && !worker_stop.load(Ordering::Acquire) {
+                    let Some(hub) = weak.upgrade() else { break };
+                    backend.resume_stewards(hub.event_sink(Uuid::nil(), Uuid::nil()));
+                }
+            })?;
+        *hub.steward_wake.lock() = Some(sender);
+        hub.wake_stewards();
+        Ok(Self { hub, stopped, thread: Some(thread) })
+    }
+}
+
+impl Drop for StewardWorker {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        self.hub.steward_wake.lock().take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 pub fn serve(
     listener: TcpListener,
     token: String,
@@ -876,6 +960,7 @@ pub fn serve(
         backend: Some(Arc::downgrade(&backend)),
         ..Hub::default()
     });
+    let _steward_worker = StewardWorker::start(hub.clone(), backend.clone())?;
     let dispatcher = Arc::new(RequestDispatcher::new(backend.clone(), hub.clone()));
     let options = Arc::new(options);
     let active_connections = Arc::new(AtomicUsize::new(0));
@@ -1144,6 +1229,7 @@ fn dispatch_steward(
                 | Command::StewardQuery { .. }
                 | Command::StewardPrompt { .. }
                 | Command::StewardCancel { .. }
+                | Command::StewardWait { .. }
         )
         && active
         && backend
@@ -1420,6 +1506,7 @@ fn handle_request_as(
     let runtime_id = request.runtime_id;
     let task_catalog_action = task_catalog_action(&request.command);
     let prepares_shutdown = matches!(request.command, Command::PrepareShutdown);
+    let cancels = matches!(request.command, Command::Cancel);
     let starts_runtime = matches!(
         &request.command,
         Command::Start { .. } | Command::OpenTerminal { .. }
@@ -1432,15 +1519,28 @@ fn handle_request_as(
             let mutation = (command_targets_runtime(&request.command)
                 && !matches!(&request.command, Command::AttachSession))
                 || matches!(&request.command, Command::CreateSession { .. });
-            let prepared = if mutation && hub.state.lock().creating_sessions.contains(&session_id) {
+            let operation = if mutation
+                && scope.is_none()
+                && !matches!(&request.command, Command::CreateSession { .. })
+            {
+                // Runs on the session mailbox worker, outside hub/backend locks.
+                // A callback already submitting a turn must finish before user input.
+                hub.event_sink(session_id, runtime_id)
+                    .reserve_client_target(session_id)
+                    .map(Some)
+            } else if mutation && hub.state.lock().creating_sessions.contains(&session_id) {
                 Err(anyhow::anyhow!(
                     "child session creation is still in progress"
                 ))
-            } else if let Command::Start { options } = &request.command {
-                backend.prepare_start(session_id, options)
             } else {
-                Ok(())
+                Ok(None)
             };
+            let prepared = operation.and_then(|guard| {
+                if let Command::Start { options } = &request.command {
+                    backend.prepare_start(session_id, options)?;
+                }
+                Ok(guard)
+            });
             if starts_runtime && prepared.is_ok() {
                 if matches!(&request.command, Command::Start { .. }) {
                     hub.confirm_drained_history(session_id, None);
@@ -1448,7 +1548,7 @@ fn handle_request_as(
                 hub.begin_runtime(session_id, runtime_id);
                 began_runtime = true;
             }
-            let outcome = match prepared.and_then(|_| {
+            let outcome = match prepared.and_then(|_operation| {
                 let mut events = hub.event_sink(session_id, runtime_id);
                 events.scoped_project = scope.as_ref().map(|scope| scope.project_id);
                 events.scoped_principal = scope.as_ref().map(|scope| scope.principal);
@@ -1495,6 +1595,11 @@ fn handle_request_as(
             (TaskCatalogAction::Changed, ResponseOutcome::Ok { .. })
             | (TaskCatalogAction::Created, _) => {
                 hub.task_state_changed(source_subscriber_id);
+                if cancels {
+                    let _ = outgoing.send(ServerMessage::TaskStateChanged {
+                        revision: hub.state.lock().task_state_revision,
+                    });
+                }
             }
             _ => {}
         }
@@ -1516,6 +1621,7 @@ fn task_catalog_action(command: &Command) -> TaskCatalogAction {
             projects: projects.clone(),
         },
         Command::RemoveSession
+        | Command::Cancel
         | Command::ForkSessionFromResponse { .. }
         | Command::RewindSessionToMessage { .. } => TaskCatalogAction::Changed,
         _ => TaskCatalogAction::None,
@@ -1727,6 +1833,63 @@ mod tests {
                     projectless_root: Some(PathBuf::from("/tmp/.waku/projects")),
                 }),
                 _ => Ok(ResponsePayload::Ack),
+            }
+        }
+    }
+
+    #[test]
+    fn client_prompt_and_cancel_wait_for_callback_operation() {
+        for command in [
+            Command::Prompt {
+                prompt: "new user input".into(),
+                turn_id: None,
+                message_id: None,
+            },
+            Command::Cancel,
+        ] {
+            let cancels = matches!(command, Command::Cancel);
+            let hub = Arc::new(Hub::default());
+            let session_id = Uuid::new_v4();
+            let runtime_id = Uuid::new_v4();
+            hub.begin_runtime(session_id, runtime_id);
+            let sink = hub.event_sink(session_id, runtime_id);
+            let callback = sink.reserve_steward_target(session_id).unwrap();
+            let (wake, wakes) = bounded(1);
+            *hub.steward_wake.lock() = Some(wake);
+            let (outgoing, received) = unbounded();
+            let source = hub.subscribe(&[], outgoing.clone());
+            let (started, start) = bounded(1);
+            let (completed, completion) = bounded(1);
+            let worker_hub = hub.clone();
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let handled = handle_request(
+                    Request {
+                        request_id: Uuid::new_v4(),
+                        session_id,
+                        runtime_id,
+                        command,
+                    },
+                    outgoing,
+                    source,
+                    Arc::new(TestBackend::default()),
+                    worker_hub,
+                );
+                completed.send(()).unwrap();
+                handled.outcome
+            });
+            start.recv_timeout(Duration::from_secs(2)).unwrap();
+            let early = completion.recv_timeout(Duration::from_millis(50));
+            drop(callback);
+            let outcome = worker.join().unwrap();
+            assert!(matches!(early, Err(RecvTimeoutError::Timeout)));
+            assert!(matches!(outcome, ResponseOutcome::Ok { .. }));
+            assert!(wakes.try_recv().is_ok());
+            assert!(sink.reserve_steward_target(session_id).is_ok());
+            if cancels {
+                assert!(received.try_iter().any(|message| {
+                    matches!(message, ServerMessage::TaskStateChanged { .. })
+                }));
             }
         }
     }

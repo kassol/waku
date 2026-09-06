@@ -2175,3 +2175,8 @@ session.safe_exit_pending:
 
 sidebar.original_parent:
   en: "Original parent: %{id}"
+
+session.waiting_for_children:
+  en: Waiting for child sessions
+session.cancel_wait:
+  en: Cancel wait

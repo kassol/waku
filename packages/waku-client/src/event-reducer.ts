@@ -7,6 +7,7 @@ import type {
   UserInputRequest,
   ReportedCommand,
   SequencedEvent,
+  StewardWait,
   ThreadGoal,
   TranscriptBlock,
   TurnStatus,
@@ -74,6 +75,7 @@ export function reduceRuntimeEvent(
       session.messages.push(...clone(current.messages.filter((message) => message.turn_id && localIds.has(message.turn_id))))
       session.transcript_blocks.push(...clone(current.transcript_blocks.filter((block) => block.turn_id && localIds.has(block.turn_id))))
       session.status = current.status
+      session.steward_wait = current.steward_wait ? clone(current.steward_wait) : undefined
       session.last_driver_error = current.last_driver_error
     }
     return { session, permission: session.pending_permission ?? null, userInput: session.pending_user_input ?? null, settled: false, removeRuntime: false }
@@ -109,10 +111,26 @@ export function reduceRuntimeEvent(
   }
 
   switch (kind) {
+    case 'stewardWaitChanged': {
+      const wait = asRecord(payload)
+      if (payload === null) delete session.steward_wait
+      else if (wait && typeof wait.id === 'string'
+        && wait.parent_turn_id === session.turns.at(-1)?.id
+        && Array.isArray(wait.targets) && wait.targets.every((target) => {
+          const value = asRecord(target)
+          return value && typeof value.session_id === 'string' && typeof value.turn_id === 'string'
+        })) session.steward_wait = clone(wait as unknown as StewardWait)
+      break
+    }
+    case 'steerAccepted':
+      delete session.steward_wait
+      break
     case 'cancelRequested':
+      delete session.steward_wait
       session.cancellation_requested_turn_id = activeTurn(session)?.id
       break
     case 'turnInterrupted':
+      delete session.steward_wait
       delete session.cancellation_requested_turn_id
       delete session.last_driver_error
       result.settled = settleTurn(session, 'interrupted', 'Stopped.', clock)
@@ -156,6 +174,7 @@ export function reduceRuntimeEvent(
       // submitter's ids so every client's projection names the same rows.
       const value = asRecord(payload)
       if (!value || typeof value.message !== 'string') break
+      delete session.steward_wait
       delete session.last_driver_error
       adoptSubmittedPrompt(
         session,
@@ -180,6 +199,7 @@ export function reduceRuntimeEvent(
         // re-enters the model once a backgrounded command, subagent or monitor
         // settles. Give the turn a transcript home — there is no user message
         // for it — so its work streams in instead of being dropped.
+        delete session.steward_wait
         session.turns.push({
           id: clock.randomUUID(),
           turn_count: session.turns.length + 1,
@@ -303,6 +323,7 @@ export function reduceRuntimeEvent(
         && session.cancellation_requested_turn_id === activeTurn(session)?.id
       delete session.cancellation_requested_turn_id
       const success = value?.success === true
+      if (interrupted || !success) delete session.steward_wait
       if (interrupted) {
         delete session.last_driver_error
         result.settled = settleTurn(session, 'interrupted', 'Stopped.', clock)
@@ -359,6 +380,9 @@ export function reduceRuntimeEvent(
       break
     }
     case 'processExited':
+      if (activeTurn(session) || ['connecting', 'working', 'waiting', 'background'].includes(session.status)) {
+        delete session.steward_wait
+      }
       if (session.cancellation_requested_turn_id != null
         && session.cancellation_requested_turn_id === activeTurn(session)?.id) {
         delete session.cancellation_requested_turn_id

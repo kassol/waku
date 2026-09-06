@@ -20,6 +20,17 @@ fn start_steward_saved(
     parent: AgentSession,
     project: Project,
 ) -> (AgentSession, Project, serde_json::Value, Uuid) {
+    start_steward_saved_with_script(client, root, project_path, parent, project, None)
+}
+
+fn start_steward_saved_with_script(
+    client: &DaemonClient,
+    root: &Path,
+    project_path: &Path,
+    parent: AgentSession,
+    project: Project,
+    script: Option<&str>,
+) -> (AgentSession, Project, serde_json::Value, Uuid) {
     client
         .request(
             Uuid::nil(),
@@ -32,7 +43,7 @@ fn start_steward_saved(
         )
         .unwrap();
     let binary = root.join("claude-fixture");
-    std::fs::write(&binary, "#!/usr/bin/env python3\nimport sys,pathlib\npathlib.Path('mcp-config.json').write_text(sys.argv[sys.argv.index('--mcp-config')+1])\nassert '--strict-mcp-config' not in sys.argv\nfor line in sys.stdin: pass\n").unwrap();
+    std::fs::write(&binary, script.unwrap_or("#!/usr/bin/env python3\nimport sys,pathlib\npathlib.Path('mcp-config.json').write_text(sys.argv[sys.argv.index('--mcp-config')+1])\nassert '--strict-mcp-config' not in sys.argv\nfor line in sys.stdin: pass\n")).unwrap();
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
     let runtime = Uuid::new_v4();
     client
@@ -154,7 +165,7 @@ fn mcp_stdio_creates_real_child_and_rejects_spoofed_arguments() {
             .collect();
         assert_eq!(replies.len(), 6);
         assert_eq!(replies[5]["error"]["code"], -32600);
-        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 6);
+        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 7);
         assert_eq!(replies[2]["error"]["code"], -32602);
         assert_eq!(replies[3]["result"]["isError"], true);
         assert_eq!(replies[4]["result"]["isError"], false);
@@ -1641,4 +1652,125 @@ fn mcp_prompt_save_failure_stops_new_work_before_provider_submission() {
                 .unwrap();
         },
     );
+}
+
+#[test]
+fn mcp_wait_provider_completion_wakes_parent_once_through_server_worker() {
+    with_creation_daemon(|client, _, root, project_path, address| {
+        let script = include_str!("../tests/fixtures/steward_wait.py");
+        std::fs::write(root.join("codex-fixture"), script).unwrap();
+        let project = Project::from_path(project_path.to_owned());
+        let mut parent = AgentSession::new(project.id, ProviderKind::Claude);
+        parent.runtime_mode = RuntimeMode::Ask;
+        parent.begin_turn("Delegate and wait for the child");
+        let (parent, _, config, runtime) = start_steward_saved_with_script(
+            &client,
+            root,
+            project_path,
+            parent,
+            project,
+            Some(script),
+        );
+        client
+            .request(
+                parent.id,
+                runtime,
+                Command::Prompt {
+                    prompt: "Delegate and wait for the child".into(),
+                    turn_id: parent.active_turn_id(),
+                    message_id: parent.messages.last().map(|message| message.id),
+                },
+            )
+            .unwrap();
+        let input_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !root.join("parent-prompt-received").exists() {
+            assert!(
+                std::time::Instant::now() < input_deadline,
+                "parent provider did not receive its initial prompt"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+            .as_str()
+            .unwrap();
+        let input = [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        ]
+        .into_iter()
+        .map(|message| format!("{message}\n"))
+        .collect();
+        let output = run_mcp(input, address, token, parent.id, runtime);
+        let messages = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            messages[0]["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("waku_wait")
+        );
+        assert!(
+            messages[1]["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "waku_wait")
+        );
+        let ResponsePayload::SessionCreated { session: child, .. } = client
+            .request(parent.id, runtime, spawn_command("controlled wait child"))
+            .unwrap()
+        else {
+            panic!("child missing")
+        };
+        let result = mcp_tool(
+            address,
+            token,
+            parent.id,
+            runtime,
+            "waku_wait",
+            json!({"session_ids":[child.id]}),
+        );
+        assert_eq!(result["waiting"], true);
+        let callbacks = root.join("callback-prompts.jsonl");
+        assert!(
+            !callbacks.exists(),
+            "registration must not start a new parent turn"
+        );
+        std::fs::write(root.join("finish-parent"), "").unwrap();
+        std::fs::write(root.join("finish-child"), "").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            if std::fs::read_to_string(&callbacks).is_ok_and(|text| !text.is_empty()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server worker did not resume parent"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let callback = std::fs::read_to_string(&callbacks).unwrap();
+        assert_eq!(callback.lines().count(), 1);
+        assert!(callback.contains(&child.id.to_string()));
+        std::fs::write(root.join("repeat-child"), "").unwrap();
+        while !root.join("repeat-sent").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Allow the worker to process both the callback result and duplicate child completion.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            std::fs::read_to_string(callbacks).unwrap().lines().count(),
+            1
+        );
+        client
+            .request(parent.id, runtime, Command::CloseSession)
+            .unwrap();
+        client
+            .request(child.id, Uuid::nil(), Command::CloseSession)
+            .unwrap();
+    });
 }

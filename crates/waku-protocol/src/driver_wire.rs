@@ -22,6 +22,9 @@ pub fn encode_enum<T: Serialize>(value: T) -> anyhow::Result<String> {
 
 pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
     let (kind, payload) = match event {
+        DriverEvent::StewardWaitChanged(wait) => {
+            ("stewardWaitChanged", serde_json::to_value(wait)?)
+        }
         DriverEvent::RuntimeEventCursorAdvanced(_)
         | DriverEvent::HistorySnapshot(_)
         | DriverEvent::HistoryPersistence { .. } => {
@@ -135,6 +138,7 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
 pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
     let payload = event.payload;
     Ok(match event.kind.as_str() {
+        "stewardWaitChanged" => DriverEvent::StewardWaitChanged(serde_json::from_value(payload)?),
         "connected" => DriverEvent::Connected {
             provider_cursor: serde_json::from_value(payload)?,
         },

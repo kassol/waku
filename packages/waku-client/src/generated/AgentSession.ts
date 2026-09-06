@@ -11,6 +11,7 @@ import type { RuntimeEventCursor } from "./RuntimeEventCursor";
 import type { RuntimeMode } from "./RuntimeMode";
 import type { SessionStatus } from "./SessionStatus";
 import type { SessionWorkspace } from "./SessionWorkspace";
+import type { StewardWait } from "./StewardWait";
 import type { ThreadGoal } from "./ThreadGoal";
 import type { TranscriptBlock } from "./TranscriptBlock";
 import type { UserInputRequest } from "./UserInputRequest";
@@ -19,7 +20,7 @@ export type AgentSession = { id: string,
 /**
  * Immutable creator assigned by the daemon; retained when that parent is removed.
  */
-parent_session_id?: string | null,
+parent_session_id?: string | null, steward_wait?: StewardWait | null,
 /**
  * A title explicitly chosen by the user. [`Self::DEFAULT_TITLE`] means
  * no explicit title has been set, so [`Self::auto_title`] may be shown.

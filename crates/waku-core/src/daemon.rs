@@ -29,6 +29,11 @@ use waku_protocol::provider_session::{ProviderSessionFork, ProviderSessionForkRe
 
 #[path = "steward.rs"]
 mod steward;
+#[path = "steward_wait.rs"]
+mod steward_wait;
+#[cfg(test)]
+#[path = "steward_wait_tests.rs"]
+mod steward_wait_tests;
 #[path = "creation.rs"]
 mod creation;
 
@@ -65,14 +70,27 @@ impl WakuBackend {
         // This daemon owns no provider processes yet. Never resume a saved
         // approval or replay a prompt after an unclean process exit.
         let mut recovered = false;
+        let mut cleared_waits = Vec::new();
         for index in 0..task_state.sessions.len() {
             // Idle is the reducer's closed-turn state. Keep its historical
             // transcript lazy; a failed startup can still have an open turn.
-            if task_state.sessions[index].status == SessionStatus::Idle {
+            if task_state.sessions[index].status == SessionStatus::Idle
+                && task_state.sessions[index].steward_wait.is_none()
+            {
                 continue;
             }
             task_store.hydrate(&mut task_state.sessions[index])?;
             let session = &mut task_state.sessions[index];
+            if session.steward_wait.as_ref().is_some_and(|wait| {
+                session.turns.last().is_none_or(|turn| {
+                    turn.id != wait.parent_turn_id
+                        || turn.status != crate::model::TurnStatus::Completed
+                })
+            }) {
+                session.steward_wait = None;
+                cleared_waits.push(session.id);
+                recovered = true;
+            }
             if session.status.is_busy()
                 || session.active_turn_id().is_some()
                 || session.pending_permission.is_some()
@@ -96,6 +114,9 @@ impl WakuBackend {
             }
         }
         if recovered {
+            for id in cleared_waits {
+                task_state.mark_session_dirty(id);
+            }
             task_store.save(&mut task_state)?;
         }
         creation::recover(&task_store, &mut task_state)?;
@@ -425,6 +446,7 @@ impl Backend for WakuBackend {
         let starts_work = matches!(
             request.command,
             Command::CreateSession { .. }
+                | Command::StewardWait { .. }
                 | Command::StewardPrompt { .. }
                 | Command::Start { .. }
                 | Command::Prompt { .. }
@@ -446,6 +468,10 @@ impl Backend for WakuBackend {
             self.ensure_accepting_work()?;
         }
         self.handle_accepted(request, events)
+    }
+
+    fn resume_stewards(&self, events: EventSink) {
+        self.resume_waiting_stewards(&events);
     }
 
     fn authorize_steward(&self, session_id: Uuid, project_id: Uuid) -> anyhow::Result<()> {
@@ -546,7 +572,47 @@ impl WakuBackend {
     ) -> anyhow::Result<ResponsePayload> {
         let session_id = request.session_id;
         let runtime_id = request.runtime_id;
+        if matches!(&request.command, Command::Cancel) {
+            let cancelled_wait = {
+                let mut state = self.task_state.lock();
+                let waiting = state.sessions.iter_mut().find(|session| {
+                    session.id == session_id
+                        && session.steward_wait.is_some()
+                        && session.active_turn_id().is_none()
+                });
+                if let Some(session) = waiting {
+                    let wait = session.steward_wait.take();
+                    state.mark_session_dirty(session_id);
+                    if let Err(error) = self.task_store.save(&mut state) {
+                        let session = state.sessions.iter_mut().find(|s| s.id == session_id).unwrap();
+                        session.steward_wait = wait;
+                        session.history_save_error = Some(error.to_string());
+                        self.saving_failed.store(true, Ordering::Release);
+                        self.failed_sessions.lock().insert(session_id);
+                        drop(state);
+                        events.stop_failed_work();
+                        return Err(error.into());
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            if cancelled_wait {
+                // Cancellation belongs to the saved session, even after its
+                // provider exits. Notify an attached runtime when one remains.
+                let active = self.sessions.lock().get(&session_id).map(|(id, _)| *id);
+                if let Some(active) = active {
+                    events.child_sink(session_id, active)
+                        .send(event_to_wire(DriverEvent::CancelRequested)?)?;
+                }
+                return Ok(ResponsePayload::Ack);
+            }
+        }
         match request.command {
+            Command::StewardWait { session_ids } => {
+                self.register_steward_wait(session_id, session_ids, &events)
+            }
             Command::StewardPrompt {
                 child_session_id,
                 prompt,
@@ -754,6 +820,7 @@ impl WakuBackend {
                     .map(|session| session.id)
                     .collect::<Vec<_>>();
                 for mut session in sessions {
+                    session.steward_wait = None;
                     if let Some(existing) = state
                         .sessions
                         .iter_mut()
@@ -763,6 +830,7 @@ impl WakuBackend {
                         // cursor before accepting any full client projection.
                         self.task_store.hydrate(existing)?;
                         session.parent_session_id = existing.parent_session_id;
+                        session.steward_wait = existing.steward_wait.clone();
                         if existing.runtime_event_cursor.is_some()
                             || session_projection_precedes(
                                 existing,
@@ -2324,6 +2392,7 @@ fn handle_driver_command(
             return Ok(ResponsePayload::Cursor { cursor });
         }
         Command::StewardQuery { .. }
+        | Command::StewardWait { .. }
         | Command::StewardPrompt { .. }
         | Command::StewardCancel { .. }
         | Command::CreateSession { .. }
@@ -2411,6 +2480,7 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
         }
         DriverEvent::TurnStarted => ("turnStarted", Value::Null),
         DriverEvent::TurnParked => ("turnParked", Value::Null),
+        DriverEvent::StewardWaitChanged(wait) => ("stewardWaitChanged", serde_json::to_value(wait)?),
         DriverEvent::TextDelta(text) => ("textDelta", Value::String(text)),
         DriverEvent::ReasoningDelta(text) => ("reasoningDelta", Value::String(text)),
         DriverEvent::Activity {
@@ -2515,6 +2585,7 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         "availableCommands" => DriverEvent::AvailableCommands(serde_json::from_value(payload)?),
         "turnStarted" => DriverEvent::TurnStarted,
         "turnParked" => DriverEvent::TurnParked,
+        "stewardWaitChanged" => DriverEvent::StewardWaitChanged(serde_json::from_value(payload)?),
         "textDelta" => DriverEvent::TextDelta(serde_json::from_value(payload)?),
         "reasoningDelta" => DriverEvent::ReasoningDelta(serde_json::from_value(payload)?),
         "activity" => {

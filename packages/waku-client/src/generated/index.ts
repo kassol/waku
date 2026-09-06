@@ -86,6 +86,8 @@ export type { SkillSource } from "./SkillSource";
 export type { SkillsCatalog } from "./SkillsCatalog";
 export type { SlashCommand } from "./SlashCommand";
 export type { StewardQuery } from "./StewardQuery";
+export type { StewardWait } from "./StewardWait";
+export type { StewardWaitTarget } from "./StewardWaitTarget";
 export type { StoredAttachment } from "./StoredAttachment";
 export type { StoredTranscriptBlockContent } from "./StoredTranscriptBlockContent";
 export type { ThreadGoal } from "./ThreadGoal";

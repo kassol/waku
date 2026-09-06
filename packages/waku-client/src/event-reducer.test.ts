@@ -375,3 +375,30 @@ test('failed turn reasons survive exit and reconnect until a new submitted turn'
   const success = apply(apply(runningSession(), 'error', 'temporary error'), 'turnFinished', { success: true })
   expect(success.last_driver_error).toBeUndefined()
 })
+
+
+test('durable child waiting follows completion, replay, and user intervention', () => {
+  const original = runningSession()
+  const wait = { id: 'wait', parent_turn_id: original.turns.at(-1)!.id, targets: [{ session_id: 'child', turn_id: 'child-turn' }] }
+  const registered = apply(original, 'stewardWaitChanged', wait)
+  expect(original.steward_wait).toBeUndefined()
+  expect(registered.steward_wait).toEqual(wait)
+  const completed = apply(registered, 'turnFinished', { success: true })
+  expect(completed.status).toBe('idle')
+  expect(apply(completed, 'processExited', null).steward_wait).toEqual(wait)
+  const saved = { ...completed, runtime_event_cursor: { runtime_id: 'runtime', epoch: 'epoch', sequence: 2 } }
+  const stale = { ...original, runtime_event_cursor: { runtime_id: 'runtime', epoch: 'epoch', sequence: 1 } }
+  expect(apply(saved, 'historySnapshot', stale).steward_wait).toEqual(wait)
+  expect(apply(original, 'historySnapshot', saved).steward_wait).toEqual(wait)
+  const next = apply(completed, 'promptSubmitted', SUBMISSION)
+  const replayed = apply(next, 'historySnapshot', completed)
+  expect(replayed.turns.at(-1)?.id).toBe(SUBMISSION.turnId)
+  expect(replayed.steward_wait).toBeUndefined()
+  expect(apply(replayed, 'stewardWaitChanged', wait).steward_wait).toBeUndefined()
+  for (const kind of ['cancelRequested', 'steerAccepted', 'turnInterrupted']) {
+    expect(apply(registered, kind, { message: 'user takes over' }).steward_wait).toBeUndefined()
+  }
+  expect(apply(registered, 'turnFinished', { success: false }).steward_wait).toBeUndefined()
+  expect(apply(registered, 'processExited', null).steward_wait).toBeUndefined()
+  expect(apply(completed, 'stewardWaitChanged', null).steward_wait).toBeUndefined()
+})

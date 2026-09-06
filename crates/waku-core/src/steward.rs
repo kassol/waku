@@ -119,7 +119,7 @@ impl WakuBackend {
         }
     }
 
-    fn child_summary(&self, session: &AgentSession) -> ChildSessionSummary {
+    pub(super) fn child_summary(&self, session: &AgentSession) -> ChildSessionSummary {
         let turn = session.turns.last().map(|turn| ChildTurnSummary {
             turn_id: turn.id,
             status: turn.status,
@@ -250,7 +250,7 @@ impl BoundedText {
 }
 
 impl WakuBackend {
-    fn authorized_child(
+    pub(super) fn authorized_child(
         &self,
         state: &mut PersistedState,
         parent_id: Uuid,
@@ -351,6 +351,20 @@ impl WakuBackend {
             }
             (child, project_path, turn_id, message_id)
         };
+        self.send_saved_steward_turn(child, project_path, prompt, turn_id, message_id, events)?;
+        Ok(ResponsePayload::ChildPromptAccepted { turn_id })
+    }
+
+    pub(super) fn send_saved_steward_turn(
+        &self,
+        child: AgentSession,
+        project_path: PathBuf,
+        prompt: String,
+        turn_id: Uuid,
+        message_id: Uuid,
+        events: &EventSink,
+    ) -> anyhow::Result<()> {
+        let child_id = child.id;
         let active = self.sessions.lock().get(&child_id).map(|(id, _)| *id);
         let runtime_id = active.unwrap_or_else(Uuid::new_v4);
         let child_events = if active.is_some() {
@@ -359,6 +373,7 @@ impl WakuBackend {
             events.begin_child(child_id, runtime_id).0
         };
         let send = || -> anyhow::Result<()> {
+            self.ensure_accepting_work()?;
             events.ensure_steward_active()?;
             if active.is_none() {
                 self.handle_accepted(
@@ -394,6 +409,7 @@ impl WakuBackend {
                     child_events.clone(),
                 )?;
             }
+            self.ensure_accepting_work()?;
             self.handle_accepted(
                 Request {
                     request_id: Uuid::new_v4(),
@@ -420,7 +436,7 @@ impl WakuBackend {
                 })?,
             ])?;
         }
-        Ok(ResponsePayload::ChildPromptAccepted { turn_id })
+        Ok(())
     }
 
     pub(super) fn steward_cancel(

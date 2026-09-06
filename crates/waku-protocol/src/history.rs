@@ -38,6 +38,7 @@ pub fn apply_rewound_history(current: &mut AgentSession, rewound: AgentSession) 
     current.pending_permission = rewound.pending_permission;
     current.pending_user_input = rewound.pending_user_input;
     current.status = rewound.status;
+    current.steward_wait = rewound.steward_wait;
     current.updated_at = current.updated_at.max(rewound.updated_at);
 }
 
@@ -51,6 +52,16 @@ impl HistoryReducer {
     pub fn apply(&mut self, session: &mut AgentSession, event: DriverEvent) -> HistoryEffects {
         let mut effects = HistoryEffects::default();
         match event {
+            DriverEvent::StewardWaitChanged(wait) => {
+                if wait.as_ref().is_none_or(|wait| {
+                    session
+                        .turns
+                        .last()
+                        .is_some_and(|turn| turn.id == wait.parent_turn_id)
+                }) {
+                    session.steward_wait = wait;
+                }
+            }
             DriverEvent::HistorySnapshot(mut snapshot) => {
                 if history_snapshot_is_stale(session, &snapshot) {
                     return effects;
@@ -87,6 +98,7 @@ impl HistoryReducer {
                     );
                     snapshot.turns.extend(local_turns);
                     snapshot.status = session.status;
+                    snapshot.steward_wait = session.steward_wait.clone();
                     snapshot.last_driver_error = session.last_driver_error.clone();
                 }
                 session.parent_session_id = snapshot.parent_session_id;
@@ -130,9 +142,11 @@ impl HistoryReducer {
                 session.last_driver_error = None;
             }
             DriverEvent::CancelRequested => {
+                session.steward_wait = None;
                 session.cancellation_requested_turn_id = session.active_turn_id();
             }
             DriverEvent::TurnInterrupted => {
+                session.steward_wait = None;
                 session.cancellation_requested_turn_id = None;
                 session.pending_permission = None;
                 session.pending_user_input = None;
@@ -229,6 +243,9 @@ impl HistoryReducer {
                 }
             }
             DriverEvent::TurnFinished { success, summary } => {
+                if !success {
+                    session.steward_wait = None;
+                }
                 if session.cancellation_requested_turn_id.is_some()
                     && session.cancellation_requested_turn_id == session.active_turn_id()
                 {
@@ -319,6 +336,7 @@ impl HistoryReducer {
                     .or_else(|| session.last_driver_error.clone())
                     .unwrap_or_else(|| tr!("session.codex_exited_before_response"));
                 if session.status.is_busy() || session.active_turn_id().is_some() {
+                    session.steward_wait = None;
                     session.last_driver_error = Some(failure_message.clone());
                     session.status = SessionStatus::Failed;
                     session.updated_at = unix_time();
@@ -382,6 +400,7 @@ impl HistoryReducer {
                 session_accepts_turn_output(session);
             }
             DriverEvent::SteerAccepted { message } => {
+                session.steward_wait = None;
                 session.push_user_message_with_presentation(message, None, Vec::new());
                 session.updated_at = unix_time();
             }
@@ -665,6 +684,64 @@ pub fn compact_driver_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steward_wait_survives_completion_and_stale_snapshot_until_new_input() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let parent_turn_id = session.begin_turn("delegate");
+        let wait = StewardWait {
+            id: Uuid::new_v4(),
+            parent_turn_id,
+            targets: vec![StewardWaitTarget {
+                session_id: Uuid::new_v4(),
+                turn_id: Uuid::new_v4(),
+            }],
+        };
+        let cursor = RuntimeEventCursor {
+            runtime_id: Uuid::new_v4(),
+            epoch: Uuid::new_v4(),
+            sequence: 1,
+        };
+        session.runtime_event_cursor = Some(cursor);
+        let old = session.clone();
+        let mut reducer = HistoryReducer::default();
+        let wire = crate::event_to_wire(DriverEvent::StewardWaitChanged(Some(wait.clone()))).unwrap();
+        reducer.apply(&mut session, crate::event_from_wire(wire).unwrap());
+        assert!(!session.is_waiting_for_children());
+        reducer.apply(
+            &mut session,
+            DriverEvent::TurnFinished {
+                success: true,
+                summary: None,
+            },
+        );
+        session.runtime_event_cursor.as_mut().unwrap().sequence = 2;
+        reducer.apply(&mut session, DriverEvent::HistorySnapshot(Box::new(old)));
+        assert_eq!(session.steward_wait, Some(wait.clone()));
+        assert!(session.is_waiting_for_children());
+        let saved = session.clone();
+        session.begin_turn("new user input");
+        reducer.apply(&mut session, DriverEvent::HistorySnapshot(Box::new(saved)));
+        reducer.apply(
+            &mut session,
+            DriverEvent::StewardWaitChanged(Some(wait.clone())),
+        );
+        assert!(session.steward_wait.is_none());
+        let mut restored = session.clone();
+        restored.steward_wait = Some(wait.clone());
+        reducer.apply(&mut restored, DriverEvent::CancelRequested);
+        assert!(restored.steward_wait.is_none());
+        restored.steward_wait = Some(wait);
+        reducer.apply(
+            &mut restored,
+            DriverEvent::PromptSubmitted {
+                message: "new remote input".into(),
+                turn_id: Uuid::new_v4(),
+                message_id: Uuid::new_v4(),
+            },
+        );
+        assert!(restored.steward_wait.is_none());
+    }
 
     #[test]
     fn cancellation_waits_for_provider_and_preserves_current_turn() {
