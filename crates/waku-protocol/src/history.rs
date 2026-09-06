@@ -40,13 +40,61 @@ pub fn apply_rewound_history(current: &mut AgentSession, rewound: AgentSession) 
     current.updated_at = current.updated_at.max(rewound.updated_at);
 }
 
+pub fn history_snapshot_is_stale(current: &AgentSession, snapshot: &AgentSession) -> bool {
+    matches!((current.runtime_event_cursor, snapshot.runtime_event_cursor), (Some(current), Some(saved))
+        if current.runtime_id == saved.runtime_id && current.epoch == saved.epoch && current.sequence > saved.sequence)
+}
+
 impl HistoryReducer {
     /// Apply one event after the transport has ordered and deduplicated it.
     pub fn apply(&mut self, session: &mut AgentSession, event: DriverEvent) -> HistoryEffects {
         let mut effects = HistoryEffects::default();
         match event {
-            DriverEvent::HistorySnapshot(snapshot) => {
-                *session = *snapshot;
+            DriverEvent::HistorySnapshot(mut snapshot) => {
+                if history_snapshot_is_stale(session, &snapshot) {
+                    return effects;
+                }
+                // A replay snapshot owns history; user choices and locally
+                // submitted turns may have changed while it was in flight.
+                let saved_turn_count = snapshot.turns.last().map_or(0, |turn| turn.turn_count);
+                let local_turns = session
+                    .turns
+                    .iter()
+                    .filter(|turn| turn.turn_count > saved_turn_count)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !local_turns.is_empty() {
+                    let local_ids = local_turns
+                        .iter()
+                        .map(|turn| turn.id)
+                        .collect::<std::collections::HashSet<_>>();
+                    snapshot.messages.extend(
+                        session
+                            .messages
+                            .iter()
+                            .filter(|message| {
+                                message.turn_id.is_some_and(|id| local_ids.contains(&id))
+                            })
+                            .cloned(),
+                    );
+                    snapshot.transcript_blocks.extend(
+                        session
+                            .transcript_blocks
+                            .iter()
+                            .filter(|block| block.turn_id.is_some_and(|id| local_ids.contains(&id)))
+                            .cloned(),
+                    );
+                    snapshot.turns.extend(local_turns);
+                    snapshot.status = session.status;
+                }
+                session.parent_session_id = snapshot.parent_session_id;
+                session.auto_title = snapshot.auto_title.take();
+                session.available_commands = std::mem::take(&mut snapshot.available_commands);
+                session.thread_goal = snapshot.thread_goal.take();
+                session.context_usage = snapshot.context_usage;
+                session.last_reply_at = session.last_reply_at.max(snapshot.last_reply_at);
+                session.detail_loaded = true;
+                apply_rewound_history(session, *snapshot);
                 self.last_driver_error = session.last_driver_error.clone();
                 self.stream_phase = if session
                     .messages
@@ -639,6 +687,72 @@ mod tests {
         assert_eq!(current.messages.len(), saved.messages.len());
         assert_eq!(current.messages.last().unwrap().content, "preserved tail");
         assert_eq!(current.parent_session_id, saved.parent_session_id);
+    }
+
+    #[test]
+    fn snapshot_does_not_rewind_a_later_applied_event() {
+        let mut current = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        current.begin_turn("task");
+        let mut reducer = HistoryReducer::default();
+        reducer.apply(&mut current, DriverEvent::TurnStarted);
+        reducer.apply(&mut current, DriverEvent::TextDelta("saved".into()));
+        let cursor = RuntimeEventCursor {
+            runtime_id: Uuid::new_v4(),
+            epoch: Uuid::new_v4(),
+            sequence: 8,
+        };
+        current.runtime_event_cursor = Some(cursor);
+        let snapshot = current.clone();
+        reducer.apply(&mut current, DriverEvent::TextDelta(" later".into()));
+        current.runtime_event_cursor = Some(RuntimeEventCursor {
+            sequence: 9,
+            ..cursor
+        });
+        reducer.apply(
+            &mut current,
+            DriverEvent::HistorySnapshot(Box::new(snapshot)),
+        );
+        assert_eq!(current.messages.last().unwrap().content, "saved later");
+        assert_eq!(current.runtime_event_cursor.unwrap().sequence, 9);
+    }
+
+    #[test]
+    fn snapshot_keeps_newer_user_choices_and_local_turn() {
+        let mut current = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        current.begin_turn("first task");
+        current.push_message(MessageRole::Assistant, "partial");
+        current.finish_active_turn(TurnStatus::Completed);
+        let mut snapshot = current.clone();
+        snapshot.messages.last_mut().unwrap().content = "complete saved answer".into();
+        snapshot.available_commands = vec![];
+        snapshot.context_usage = Some(crate::model::ContextUsage {
+            tokens: 321,
+            window: Some(1000),
+        });
+        let new_project = Uuid::new_v4();
+        current.project_id = new_project;
+        current.set_title("new title");
+        current.model = Some("new model".into());
+        current.runtime_mode = RuntimeMode::FullAccess;
+        current
+            .queued_messages
+            .push(QueuedMessage::new("queued follow-up"));
+        let newer_turn = current.begin_turn("new local task");
+        current.status = SessionStatus::Connecting;
+        HistoryReducer::default().apply(
+            &mut current,
+            DriverEvent::HistorySnapshot(Box::new(snapshot)),
+        );
+        assert_eq!(current.title, "new title");
+        assert_eq!(current.project_id, new_project);
+        assert_eq!(current.model.as_deref(), Some("new model"));
+        assert_eq!(current.runtime_mode, RuntimeMode::FullAccess);
+        assert_eq!(current.queued_messages[0].content, "queued follow-up");
+        assert_eq!(current.active_turn_id(), Some(newer_turn));
+        assert_eq!(current.messages[1].content, "complete saved answer");
+        assert_eq!(current.messages[2].content, "new local task");
+        assert_eq!(current.context_usage.unwrap().tokens, 321);
+        assert_eq!(current.status, SessionStatus::Connecting);
     }
 
     #[test]

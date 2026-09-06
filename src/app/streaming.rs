@@ -111,6 +111,17 @@ impl Waku {
         runtime.last_active_at = Instant::now();
         match event {
             DriverEvent::HistorySnapshot(snapshot) => {
+                if self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .is_some_and(|session| {
+                        waku_protocol::history::history_snapshot_is_stale(session, &snapshot)
+                    })
+                {
+                    return true;
+                }
                 runtime.pending_permission = snapshot.pending_permission.clone();
                 if runtime
                     .pending_user_input

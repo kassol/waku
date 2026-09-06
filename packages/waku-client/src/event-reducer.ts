@@ -43,7 +43,38 @@ export function reduceRuntimeEvent(
   processExitError: string | null = null,
 ): RuntimeEventResult {
   if (wire.event.kind === 'historySnapshot') {
-    const session = clone(wire.event.payload as unknown as AgentSession)
+    const snapshot = clone(wire.event.payload as unknown as AgentSession)
+    if (historySnapshotIsStale(current, snapshot)) {
+      const session = clone(current)
+      return { session, permission: session.pending_permission ?? null, userInput: session.pending_user_input ?? null, settled: false, removeRuntime: false }
+    }
+    const session: AgentSession = {
+      ...snapshot,
+      id: current.id,
+      project_id: current.project_id,
+      provider: current.provider,
+      created_at: current.created_at,
+      title: current.title,
+      model: current.model,
+      workspace: current.workspace,
+      runtime_mode: current.runtime_mode,
+      reasoning_effort: current.reasoning_effort,
+      service_tier: current.service_tier,
+      context_window: current.context_window,
+      agent_preset: current.agent_preset,
+      queued_messages: clone(current.queued_messages ?? []),
+      updated_at: Math.max(current.updated_at, snapshot.updated_at),
+      last_reply_at: Math.max(current.last_reply_at ?? 0, snapshot.last_reply_at ?? 0) || undefined,
+    }
+    const savedCount = snapshot.turns.at(-1)?.turn_count ?? 0
+    const localTurns = current.turns.filter((turn) => turn.turn_count > savedCount)
+    if (localTurns.length) {
+      const localIds = new Set(localTurns.map((turn) => turn.id))
+      session.turns.push(...clone(localTurns))
+      session.messages.push(...clone(current.messages.filter((message) => message.turn_id && localIds.has(message.turn_id))))
+      session.transcript_blocks.push(...clone(current.transcript_blocks.filter((block) => block.turn_id && localIds.has(block.turn_id))))
+      session.status = current.status
+    }
     return { session, permission: session.pending_permission ?? null, userInput: session.pending_user_input ?? null, settled: false, removeRuntime: false }
   }
   const session = clone(current)
@@ -662,6 +693,12 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null
 }
 
+function historySnapshotIsStale(current: AgentSession, snapshot: AgentSession): boolean {
+  const applied = current.runtime_event_cursor
+  const saved = snapshot.runtime_event_cursor
+  return Boolean(applied && saved && applied.runtime_id === saved.runtime_id && applied.epoch === saved.epoch && applied.sequence > saved.sequence)
+}
+
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
 }
@@ -674,9 +711,8 @@ export function reduceRuntimeEventAfterPersistence(
   clock: ReducerClock = defaultClock,
   processExitError: string | null = null,
 ): RuntimeEventResult | null {
-  if (wire.event.kind === 'historySnapshot') {
+  if (wire.event.kind === 'historySnapshot' && !historySnapshotIsStale(current, wire.event.payload as unknown as AgentSession)) {
     state.pendingExit = null
-    state.lastDriverError = (wire.event.payload as unknown as AgentSession).last_driver_error ?? null
   }
   if (wire.event.kind === 'processExited') {
     const saved = current.history_saved_cursor
@@ -686,6 +722,7 @@ export function reduceRuntimeEventAfterPersistence(
     }
   }
   const result = reduceRuntimeEvent(current, wire, clock, processExitError)
+  if (wire.event.kind === 'historySnapshot') state.lastDriverError = result.session.last_driver_error ?? null
   const exit = state.pendingExit
   if (wire.event.kind === 'historyPersistence' && exit
     && wire.runtimeId === exit.runtimeId && wire.epoch === exit.epoch

@@ -322,3 +322,37 @@ test('snapshot preserves the provider error until the exit is settled', () => {
   const exited = reduceRuntimeEvent(restored, event('processExited', null), clock).session
   expect(exited.messages.at(-1)?.content).toBe('provider lost connection')
 })
+
+test('snapshot keeps newer user choices and the local submitted turn', () => {
+  const saved = idleSession()
+  saved.messages[1]!.content = 'complete saved answer'
+  saved.context_usage = { tokens: 321, window: 1000 }
+  const current = apply(idleSession(), 'promptSubmitted', SUBMISSION)
+  current.project_id = 'new-project'
+  current.title = 'new title'
+  current.model = 'new model'
+  current.runtime_mode = 'fullAccess'
+  current.queued_messages = [{ id: 'queued', content: 'queued follow-up', attachments: [], created_at: 200 }]
+  const restored = reduceRuntimeEvent(current, event('historySnapshot', saved), clock).session
+  expect(restored.title).toBe('new title')
+  expect(restored.project_id).toBe('new-project')
+  expect(restored.model).toBe('new model')
+  expect(restored.runtime_mode).toBe('fullAccess')
+  expect(restored.queued_messages?.[0]?.content).toBe('queued follow-up')
+  expect(restored.turns.at(-1)?.id).toBe(SUBMISSION.turnId)
+  expect(restored.messages[1]?.content).toBe('complete saved answer')
+  expect(restored.messages.at(-1)?.content).toBe('Second prompt')
+  expect(restored.context_usage?.tokens).toBe(321)
+  expect(restored.status).toBe('connecting')
+})
+
+
+test('snapshot does not rewind an already applied event', () => {
+  const saved = apply(runningSession(), 'textDelta', 'saved')
+  saved.runtime_event_cursor = { runtime_id: 'runtime', epoch: 'epoch', sequence: 8 }
+  const current = apply(saved, 'textDelta', ' later')
+  current.runtime_event_cursor = { runtime_id: 'runtime', epoch: 'epoch', sequence: 9 }
+  const restored = reduceRuntimeEvent(current, event('historySnapshot', saved), clock).session
+  expect(restored.messages.at(-1)?.content).toBe('saved later')
+  expect(restored.runtime_event_cursor?.sequence).toBe(9)
+})
