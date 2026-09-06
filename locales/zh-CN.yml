@@ -1066,3 +1066,18 @@ session.input_received_provider: 提供方已确认接收输入
 session.input_failed: 输入投递失败
 session.input_uncertain: 输入等待确认，请勿重发
 session.input_unsupported: 提供方不支持运行中输入
+consultation.open: 即时交流
+consultation.title: 只读即时交流 · Claude
+consultation.read_only: 讨论想法和已记录的进度。交流无法使用工具或控制任务。
+consultation.placeholder: 询问进度或讨论想法…
+consultation.context_time: "记录时间：%{time}"
+consultation.answering: 正在加载或答复…
+consultation.saved: 交流已保存
+consultation.send: 发送
+consultation.close: 关闭
+consultation.interrupted: 问题已保存，尚无已保存答复。可再次提问继续交流。
+consultation.invalid_response: 服务返回了无效的交流答复。
+
+consultation.not_saved: 无法确认交流状态。
+
+consultation.not_configured: 只读即时交流需要已配置的 Claude。请先在设置中配置 Claude。

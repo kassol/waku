@@ -300,6 +300,7 @@ impl Render for Waku {
             let command_palette = self.render_command_palette(window, cx);
             let commit_dialog = self.render_commit_dialog(cx);
             let goal_dialog = self.render_goal_dialog(window, cx);
+            let consultation = self.render_consultation(cx);
             let toast = self.render_active_toast(cx);
             let content = div()
                 .relative()
@@ -319,6 +320,7 @@ impl Render for Waku {
                 .children(command_palette)
                 .children(commit_dialog)
                 .children(goal_dialog)
+                .children(consultation)
                 .children(image_preview)
                 .children(task_switcher)
                 .into_any_element();
@@ -335,6 +337,7 @@ impl Render for Waku {
         let command_palette = self.render_command_palette(window, cx);
         let commit_dialog = self.render_commit_dialog(cx);
         let goal_dialog = self.render_goal_dialog(window, cx);
+        let consultation = self.render_consultation(cx);
         let toast = self.render_active_toast(cx);
         let content = div()
             .key_context("Waku")
@@ -468,6 +471,7 @@ impl Render for Waku {
             .children(command_palette)
             .children(commit_dialog)
             .children(goal_dialog)
+            .children(consultation)
             .children(image_preview)
             .children(task_switcher)
             .into_any_element();

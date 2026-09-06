@@ -144,6 +144,14 @@ pub struct ChildSessionSummary {
 )]
 pub enum Command {
     StewardWorkspace { operation: crate::model::StewardWorkspaceOperation },
+    /// Authenticated user entry, unavailable to scoped steward MCP clients.
+    Consult {
+        source_session_id: Uuid,
+        question: String,
+    },
+    LoadConsultation {
+        source_session_id: Uuid,
+    },
     StewardWait {
         session_ids: Vec<Uuid>,
     },
@@ -499,6 +507,9 @@ pub enum ResponseOutcome {
 )]
 pub enum ResponsePayload {
     TaskWorkspace { session: AgentSession },
+    Consultation {
+        consultation: Option<crate::consultation::Consultation>,
+    },
     StewardWait {
         wait: Option<StewardWait>,
         sessions: Vec<ChildSessionSummary>,

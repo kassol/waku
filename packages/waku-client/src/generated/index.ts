@@ -28,6 +28,8 @@ export type { ComposerDraftTarget } from "./ComposerDraftTarget";
 export type { ComposerDrafts } from "./ComposerDrafts";
 export type { ComputerAppGrant } from "./ComputerAppGrant";
 export type { ComputerPermissions } from "./ComputerPermissions";
+export type { Consultation } from "./Consultation";
+export type { ConsultationExchange } from "./ConsultationExchange";
 export type { ContextUsage } from "./ContextUsage";
 export type { CostQuality } from "./CostQuality";
 export type { CreatedWorktree } from "./CreatedWorktree";

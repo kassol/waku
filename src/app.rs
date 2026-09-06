@@ -1209,6 +1209,7 @@ pub struct Waku {
     /// off-thread; frames only read this in-memory value.
     commit_dialog: Option<commit_dialog::CommitDialogState>,
     goal_dialog: Option<goal_dialog::GoalDialogState>,
+    consultation: Option<consultation::ConsultationDialog>,
     goal_dialog_request: Option<goal_dialog::GoalDialogRequest>,
     /// Goal operations accepted before the session's runtime exists. Goals
     /// attach to the provider thread, not to any turn, so `/goal` on a fresh
@@ -1608,6 +1609,7 @@ mod branches;
 mod command_palette;
 mod commit_dialog;
 mod goal_dialog;
+mod consultation;
 mod components;
 mod composer;
 mod drafts;
@@ -1636,6 +1638,7 @@ use background_work::{
 pub use command_palette::init as init_command_palette;
 pub use commit_dialog::init as init_commit_dialog_keys;
 pub use goal_dialog::init as init_goal_dialog_keys;
+pub use consultation::init as init_consultation_keys;
 use components::*;
 pub use image_preview::init as init_image_preview_keys;
 pub use settings::init as init_settings_keys;
@@ -2788,6 +2791,7 @@ impl Waku {
                 branch_operation_pending: false,
                 commit_dialog: None,
                 goal_dialog: None,
+                consultation: None,
                 goal_dialog_request: None,
                 pending_goal_operations: HashMap::new(),
                 goal_runtime_starts: HashSet::new(),

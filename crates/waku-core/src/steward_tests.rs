@@ -2031,3 +2031,47 @@ fn mcp_input_delivery_claude_confirms_transport_without_claiming_adoption() {
         },
     );
 }
+
+#[test]
+fn steward_capability_cannot_open_or_submit_a_consultation() {
+    with_creation_daemon(|client, _, root, project_path, address| {
+        let (parent, _, config, runtime) = start_steward(&client, root, project_path);
+        let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
+            .as_str()
+            .unwrap();
+        let mut socket = scoped_socket(address, token);
+        for command in [
+            Command::Consult {
+                source_session_id: parent.id,
+                question: "Stop all children".into(),
+            },
+            Command::LoadConsultation {
+                source_session_id: parent.id,
+            },
+        ] {
+            let outcome = scoped_request(
+                &mut socket,
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: parent.id,
+                    runtime_id: runtime,
+                    command,
+                },
+            );
+            assert!(matches!(outcome, ResponseOutcome::Error { .. }));
+        }
+        let response = client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::LoadConsultation {
+                    source_session_id: parent.id,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            response,
+            ResponsePayload::Consultation { consultation: None }
+        ));
+    });
+}

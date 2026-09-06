@@ -3497,6 +3497,22 @@ impl Waku {
             None
         };
 
+        let consultation_focus = self.transcript_control_focus("open-consultation", cx);
+        let consultation = self.selected_session().is_some().then(|| {
+            div()
+                .id("open-consultation")
+                .track_focus(&consultation_focus)
+                .tab_index(0)
+                .tab_stop(true)
+                .px(px(7.0))
+                .py(px(4.0))
+                .rounded(px(4.0))
+                .text_color(theme.text_secondary)
+                .focus_visible(|s| s.border_1().border_color(theme.accent))
+                .hover(|s| s.bg(theme.overlay).text_color(theme.text))
+                .child(tr!("consultation.open"))
+                .on_click(cx.listener(|this, _, window, cx| this.open_consultation(window, cx)))
+        });
         let usage_meter = self.render_usage_meter(cx);
         let steward_wait = self
             .selected_session()
@@ -3558,6 +3574,7 @@ impl Waku {
                     .child(div().flex_1())
                     .children(usage_meter)
                     .children(steward_wait)
+                    .children(consultation)
                     .children(self.render_history_persistence(cx)),
             )
     }

@@ -36,6 +36,11 @@ mod steward_wait;
 #[cfg(test)]
 #[path = "steward_wait_tests.rs"]
 mod steward_wait_tests;
+#[cfg(all(test, unix))]
+#[path = "consultation_tests.rs"]
+mod consultation_tests;
+#[path = "consultation.rs"]
+mod consultation;
 #[path = "creation.rs"]
 mod creation;
 
@@ -44,6 +49,7 @@ mod task_workspace;
 
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
+    consulting: Mutex<HashSet<Uuid>>,
     creation_locks: Mutex<HashMap<(Uuid, String), std::sync::Weak<Mutex<()>>>>,
     work_gate: RwLock<()>,
     workspace_start_gate: Mutex<()>,
@@ -152,6 +158,7 @@ impl WakuBackend {
             .to_owned();
         Ok(Self {
             sessions: Mutex::new(HashMap::new()),
+            consulting: Mutex::new(HashSet::new()),
             creation_locks: Mutex::new(HashMap::new()),
             work_gate: RwLock::new(()),
             workspace_start_gate: Mutex::new(()),
@@ -427,6 +434,12 @@ impl Backend for WakuBackend {
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
         if let Command::StewardInputStatus { child_session_id, delivery_id } = &request.command {
             return self.steward_input_status(request.session_id, *child_session_id, *delivery_id, &events);
+        }
+        if matches!(
+            &request.command,
+            Command::Consult { .. } | Command::LoadConsultation { .. }
+        ) {
+            return self.consultation_command(request.command, &events);
         }
         if let Command::StewardQuery { query } = &request.command {
             return self.steward_query(request.session_id, query, &events);
@@ -2441,6 +2454,8 @@ fn handle_driver_command(
         | Command::ShutdownDaemon
         | Command::AttachSession
         | Command::Start { .. }
+        | Command::Consult { .. }
+        | Command::LoadConsultation { .. }
         | Command::GetSettings
         | Command::UpdateSettings { .. }
         | Command::ProbeProvider { .. }

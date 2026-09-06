@@ -966,6 +966,34 @@ impl StateStore {
         &self.path
     }
 
+    pub fn load_consultation(
+        &self,
+        source_id: Uuid,
+    ) -> io::Result<Option<waku_protocol::consultation::Consultation>> {
+        let connection = self.open()?;
+        let data: Option<String> = connection
+            .query_row(
+                "SELECT data FROM consultations WHERE source_session_id = ?1",
+                params![source_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_io_error)?;
+        data.map(|data| serde_json::from_str(&data).map_err(to_io_error))
+            .transpose()
+    }
+
+    pub fn save_consultation(
+        &self,
+        consultation: &waku_protocol::consultation::Consultation,
+    ) -> io::Result<()> {
+        self.open()?.execute(
+            "INSERT INTO consultations(source_session_id, data) VALUES (?1, ?2) ON CONFLICT(source_session_id) DO UPDATE SET data = excluded.data",
+            params![consultation.source_session_id.to_string(), serde_json::to_string(consultation).map_err(to_io_error)?],
+        ).map_err(to_io_error)?;
+        Ok(())
+    }
+
     fn open(&self) -> io::Result<Connection> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;

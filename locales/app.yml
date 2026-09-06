@@ -2198,3 +2198,31 @@ session.input_uncertain:
 
 session.input_unsupported:
   en: Input steering unsupported
+consultation.open:
+  en: Discuss
+consultation.title:
+  en: Read-only discussion · Claude
+consultation.read_only:
+  en: Discuss ideas and saved progress. No tools or task controls.
+consultation.placeholder:
+  en: Ask about progress or discuss an idea…
+consultation.context_time:
+  en: "Records as of %{time}"
+consultation.answering:
+  en: Loading or answering…
+consultation.saved:
+  en: Discussion saved
+consultation.send:
+  en: Send
+consultation.close:
+  en: Close
+consultation.interrupted:
+  en: Question saved; no answer was saved. Send another question to continue.
+consultation.invalid_response:
+  en: The daemon returned an invalid discussion response.
+
+consultation.not_saved:
+  en: Could not confirm the discussion state.
+
+consultation.not_configured:
+  en: Read-only discussion requires an already configured Claude provider.

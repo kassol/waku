@@ -38,10 +38,10 @@ const CODEX_COMMIT_MODEL: &str = "gpt-5.6-luna";
 // `unsupported_value`, listing `none` as the lowest it accepts.
 const CODEX_COMMIT_EFFORT: &str = r#"model_reasoning_effort="none""#;
 
-struct CapturedOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct CapturedOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 pub fn inspect(cwd: &Path) -> anyhow::Result<Snapshot> {
@@ -561,6 +561,17 @@ fn git_capture(cwd: &Path, args: &[&str]) -> anyhow::Result<CapturedOutput> {
 }
 
 fn run_capture(command: &mut Command, timeout: Duration) -> anyhow::Result<CapturedOutput> {
+    run_capture_cancellable(command, timeout, || false)
+}
+
+pub(crate) fn run_capture_cancellable(
+    command: &mut Command,
+    timeout: Duration,
+    cancelled: impl Fn() -> bool,
+) -> anyhow::Result<CapturedOutput> {
+    if cancelled() {
+        bail!("process cancelled");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -575,30 +586,57 @@ fn run_capture(command: &mut Command, timeout: Duration) -> anyhow::Result<Captu
     let mut child = crate::command_env::spawn(command).context("could not start process")?;
     let stdout = child.stdout.take().context("process stdout unavailable")?;
     let stderr = child.stderr.take().context("process stderr unavailable")?;
-    let stdout_reader = thread::spawn(move || read_bounded(stdout, MAX_STDOUT_BYTES));
-    let stderr_reader = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel(1);
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel(1);
+    let stdout_reader = thread::spawn(move || {
+        let _ = stdout_tx.send(read_bounded(stdout, MAX_STDOUT_BYTES));
+    });
+    let stderr_reader = thread::spawn(move || {
+        let _ = stderr_tx.send(read_bounded(stderr, MAX_STDERR_BYTES));
+    });
+    let mut stdout = None;
+    let mut stderr = None;
     let deadline = Instant::now() + timeout;
     let status = loop {
-        if let Some(status) = child.try_wait().context("could not wait for process")? {
+        if stdout.is_none() {
+            stdout = stdout_rx.try_recv().ok();
+        }
+        if stderr.is_none() {
+            stderr = stderr_rx.try_recv().ok();
+        }
+        // Reap only after both pipes close. Until then the leader retains its
+        // PID, so cancellation cannot signal a recycled, unrelated process group.
+        if stdout.is_some()
+            && stderr.is_some()
+            && let Some(status) = child.try_wait().context("could not wait for process")?
+        {
             break status;
         }
-        if Instant::now() >= deadline {
+        let cancelled = cancelled();
+        if cancelled || Instant::now() >= deadline {
             #[cfg(unix)]
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
             let _ = child.kill();
             let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+            // A descendant may retain a pipe. Dropping these handles keeps the
+            // drain itself bounded; readers exit once the owned group closes it.
+            drop(stdout_reader);
+            drop(stderr_reader);
+            if cancelled {
+                bail!("process cancelled");
+            }
             bail!("process timed out after {} seconds", timeout.as_secs());
         }
         thread::sleep(PROCESS_POLL_INTERVAL);
     };
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
     Ok(CapturedOutput {
         status,
-        stdout: stdout_reader.join().unwrap_or_default(),
-        stderr: stderr_reader.join().unwrap_or_default(),
+        stdout: stdout.unwrap_or_default(),
+        stderr: stderr.unwrap_or_default(),
     })
 }
 

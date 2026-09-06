@@ -114,3 +114,9 @@ export const sessionCreations = sqliteTable("session_creations", {
   uniqueIndex("session_creations_by_manager_key").on(table.managerSessionId, table.idempotencyKey),
   index("session_creations_incomplete").on(table.complete),
 ]);
+
+/** Independent read-only discussion history; retained when its source is removed. */
+export const consultations = sqliteTable("consultations", {
+  sourceSessionId: text("source_session_id").primaryKey(),
+  data: text("data").notNull(),
+});
