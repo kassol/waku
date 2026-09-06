@@ -4,7 +4,7 @@
 
 ## 当前扩展与交付边界
 
-管家协作扩展已完成设计澄清和测试边界确认，规格发布为 [Issue #13](https://github.com/kassol/waku/issues/13)，见[协作规格](waku-steward-orchestration-spec.md)。范围包括可靠 steer/反馈排队、独立即时交流、动态分工与任务集成分支、安全清理。尚未拆分纵向任务或实现；不改变以下等待回调包的交付状态。
+管家协作扩展已完成设计澄清和测试边界确认，规格发布为 [Issue #13](https://github.com/kassol/waku/issues/13)，见[协作规格](waku-steward-orchestration-spec.md)。范围包括可靠 steer/反馈排队、独立即时交流、动态分工与任务集成分支、安全清理。9 张纵向任务 #14–#22 已按确认的依赖发布，见[任务清单](waku-steward-orchestration-tickets.md)；尚未实现，不改变以下等待回调包的交付状态。
 
 用户已批准新增 `waku_wait`，详见[管家等待与完成通知](waku-steward-wait.md)。一期六工具验收仍为历史基线。当前扩展要求管家登记持久等待后结束当前轮；父轮成功结束且子轮次可处理时，由 daemon 的事件回调自动开启一次通知轮。用户新输入、已接受的 steer 或取消，以及父轮失败或中断，均撤销旧等待。
 
