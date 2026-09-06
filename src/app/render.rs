@@ -291,6 +291,7 @@ impl Render for Waku {
             let content = div()
                 .relative()
                 .size_full()
+                .on_key_down(crate::ui::navigate_tab)
                 .on_action(cx.listener(Self::toggle_command_palette_action))
                 .on_action(cx.listener(Self::open_resume_picker_action))
                 .on_action(cx.listener(Self::switch_task_forward_action))
@@ -324,6 +325,7 @@ impl Render for Waku {
         let toast = self.render_active_toast(cx);
         let content = div()
             .key_context("Waku")
+            .on_key_down(crate::ui::navigate_tab)
             .on_action(cx.listener(Self::close_window_or_right_panel_tab_action))
             .on_action(cx.listener(Self::new_session_action))
             .on_action(cx.listener(Self::new_project_action))

@@ -640,7 +640,7 @@ struct VerticalNavigation {
 
 impl TextInput {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let focus_handle = cx.focus_handle();
+        let focus_handle = cx.focus_handle().tab_stop(true);
         let blink_cursor = cx.new(|_| BlinkCursor::new());
         let _subscriptions = vec![
             cx.observe(&blink_cursor, |_, _, cx| cx.notify()),

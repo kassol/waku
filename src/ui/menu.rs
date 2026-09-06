@@ -251,7 +251,7 @@ impl ContextMenuHandle {
     pub fn new(cx: &mut App) -> Self {
         Self {
             state: Rc::new(RefCell::new(MenuState::default())),
-            trigger_focus: cx.focus_handle(),
+            trigger_focus: cx.focus_handle().tab_stop(true),
             focus: cx.focus_handle(),
             trigger_bounds: Rc::new(Cell::new(None)),
             on_toggle: Rc::new(Vec::new()),

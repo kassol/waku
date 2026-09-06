@@ -1589,7 +1589,7 @@ impl Waku {
             .sidebar_group_header_focuses
             .borrow_mut()
             .entry(group)
-            .or_insert_with(|| cx.focus_handle())
+            .or_insert_with(|| cx.focus_handle().tab_stop(true))
             .clone();
         let show_folder_icon =
             matches!(group, SidebarGroup::Project(_) | SidebarGroup::Projectless);
@@ -1622,7 +1622,7 @@ impl Waku {
                 .sidebar_group_compose_focuses
                 .borrow_mut()
                 .entry(group)
-                .or_insert_with(|| cx.focus_handle())
+                .or_insert_with(|| cx.focus_handle().tab_stop(true))
                 .clone();
             div()
                 .w(px(20.0))
@@ -1784,7 +1784,7 @@ impl Waku {
             .sidebar_show_more_focuses
             .borrow_mut()
             .entry(group)
-            .or_insert_with(|| cx.focus_handle())
+            .or_insert_with(|| cx.focus_handle().tab_stop(true))
             .clone();
         let button = div()
             .id(SharedString::from(format!("sidebar-show-more-{group_key}")))

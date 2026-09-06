@@ -14,6 +14,25 @@ pub mod tooltip;
 use crate::model::{ActivityKind, ProviderKind, SessionStatus};
 use crate::theme::{Theme, sp};
 
+/// Move between declared tab stops after a child has had a chance to consume Tab.
+pub fn navigate_tab(event: &KeyDownEvent, window: &mut Window, cx: &mut App) {
+    let modifiers = event.keystroke.modifiers;
+    if event.keystroke.key != "tab"
+        || modifiers.control
+        || modifiers.alt
+        || modifiers.platform
+        || modifiers.function
+    {
+        return;
+    }
+    if modifiers.shift {
+        window.focus_prev(cx);
+    } else {
+        window.focus_next(cx);
+    }
+    cx.stop_propagation();
+}
+
 /// A monochrome icon from the embedded set, tinted via text color. Sized in
 /// `sp` so icons keep pace with the chrome text they sit beside when the UI
 /// font size setting moves.
@@ -455,6 +474,75 @@ impl RenderOnce for ProjectNameSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    gpui::actions!(tab_navigation_test, [ConsumeTab]);
+
+    struct TabHarness {
+        first: gpui::FocusHandle,
+        second: gpui::FocusHandle,
+        consume_tab: bool,
+        bind_tab: bool,
+    }
+
+    impl gpui::Render for TabHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let consume_tab = self.consume_tab;
+            div()
+                .size(px(100.0))
+                .on_key_down(navigate_tab)
+                .child(
+                    div()
+                        .size(px(20.0))
+                        .track_focus(&self.first)
+                        .tab_index(0)
+                        .when(self.bind_tab, |element| {
+                            element
+                                .key_context("TabHarness")
+                                .on_action(|_: &ConsumeTab, _, cx| cx.stop_propagation())
+                        })
+                        .on_key_down(move |event, _, cx| {
+                            if consume_tab && event.keystroke.key == "tab" {
+                                cx.stop_propagation();
+                            }
+                        }),
+                )
+                .child(div().size(px(20.0)).track_focus(&self.second).tab_index(0))
+        }
+    }
+
+    #[gpui::test]
+    fn tab_navigation_moves_focus_and_respects_child_consumption(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new("tab", ConsumeTab, Some("TabHarness"))])
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| TabHarness {
+            first: menu::ContextMenuHandle::new(cx).trigger_focus_handle().clone(),
+            second: menu::ContextMenuHandle::new(cx).trigger_focus_handle().clone(),
+            consume_tab: false,
+            bind_tab: false,
+        });
+        let (first, second) =
+            cx.read_entity(&view, |view, _| (view.first.clone(), view.second.clone()));
+        cx.update(|window, cx| window.focus(&first, cx));
+        cx.simulate_keystrokes("tab");
+        assert!(cx.update(|window, _| second.is_focused(window)));
+        cx.simulate_keystrokes("shift-tab");
+        assert!(cx.update(|window, _| first.is_focused(window)));
+        cx.update_entity(&view, |view, cx| {
+            view.consume_tab = true;
+            cx.notify();
+        });
+        cx.simulate_keystrokes("tab");
+        assert!(cx.update(|window, _| first.is_focused(window)));
+        cx.simulate_keystrokes("ctrl-tab");
+        assert!(cx.update(|window, _| first.is_focused(window)));
+        cx.update_entity(&view, |view, cx| {
+            view.consume_tab = false;
+            view.bind_tab = true;
+            cx.notify();
+        });
+        cx.simulate_keystrokes("tab");
+        assert!(cx.update(|window, _| first.is_focused(window)));
+    }
 
     #[test]
     fn nested_scroll_chains_only_after_reaching_a_boundary() {
