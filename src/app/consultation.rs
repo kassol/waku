@@ -18,11 +18,16 @@ pub(super) struct ConsultationDialog {
     input: Entity<TextInput>,
     record: Option<Arc<Consultation>>,
     pending: bool,
+    request_id: Uuid,
+    execution_attempt: Option<(String, Uuid)>,
     error: Option<String>,
     rows: ListState,
     history_focus: FocusHandle,
     send_focus: FocusHandle,
     close_focus: FocusHandle,
+    execute_focus: FocusHandle,
+    refresh_focus: FocusHandle,
+    retry_focus: FocusHandle,
 }
 
 impl Waku {
@@ -65,11 +70,16 @@ impl Waku {
             input,
             record: None,
             pending: true,
+            request_id: Uuid::nil(),
+            execution_attempt: None,
             error: None,
             rows: ListState::new(0, ListAlignment::Bottom, px(256.0)),
             history_focus: cx.focus_handle(),
             send_focus: cx.focus_handle(),
             close_focus: cx.focus_handle(),
+            execute_focus: cx.focus_handle(),
+            refresh_focus: cx.focus_handle(),
+            retry_focus: cx.focus_handle(),
         });
         self.request_consultation(
             waku_client::Command::LoadConsultation {
@@ -86,8 +96,20 @@ impl Waku {
         source_id: Uuid,
         cx: &mut Context<Self>,
     ) {
+        let request_id = Uuid::new_v4();
+        let Some(dialog) = self
+            .consultation
+            .as_mut()
+            .filter(|d| d.source_id == source_id)
+        else {
+            return;
+        };
+        dialog.request_id = request_id;
         let submitted = match &command {
             waku_client::Command::Consult { question, .. } => Some(question.clone()),
+            waku_client::Command::ExecuteConsultation { instruction, .. } => {
+                Some(instruction.clone())
+            }
             _ => None,
         };
         let daemon = self.daemon.client();
@@ -100,22 +122,25 @@ impl Waku {
                 let Some(dialog) = this
                     .consultation
                     .as_mut()
-                    .filter(|d| d.source_id == source_id)
+                    .filter(|d| d.source_id == source_id && d.request_id == request_id)
                 else {
                     return;
                 };
                 dialog.pending = false;
                 match result {
                     Ok(waku_client::ResponsePayload::Consultation { consultation }) => {
-                        dialog
-                            .rows
-                            .reset(consultation.as_ref().map_or(0, |c| c.exchanges.len()));
+                        dialog.rows.reset(
+                            consultation
+                                .as_ref()
+                                .map_or(0, |c| c.exchanges.len() + c.instructions.len()),
+                        );
                         dialog.record = consultation.map(Arc::new);
                         dialog.error = None;
                         if submitted
                             .as_ref()
                             .is_some_and(|q| dialog.input.read(cx).content().trim() == q)
                         {
+                            dialog.execution_attempt = None;
                             dialog
                                 .input
                                 .update(cx, |input, cx| input.set_content(String::new(), cx));
@@ -140,12 +165,62 @@ impl Waku {
             return;
         }
         let source_id = dialog.source_id;
+        dialog.execution_attempt = None;
         dialog.pending = true;
         dialog.error = None;
         self.request_consultation(
             waku_client::Command::Consult {
                 source_session_id: source_id,
                 question,
+            },
+            source_id,
+            cx,
+        );
+    }
+
+    fn execute_consultation(&mut self, retry: bool, cx: &mut Context<Self>) {
+        let Some(dialog) = self.consultation.as_mut().filter(|d| !d.pending) else {
+            return;
+        };
+        let (instruction, delivery_id) = if retry {
+            let Some(last) = dialog.record.as_ref().and_then(|r| r.instructions.last()) else {
+                return;
+            };
+            (last.instruction.clone(), last.delivery_id)
+        } else {
+            let text = dialog.input.read(cx).content().trim().to_owned();
+            if text.is_empty() {
+                return;
+            }
+            match &dialog.execution_attempt {
+                Some((previous, id)) if previous == &text => (text, *id),
+                _ => (text, Uuid::new_v4()),
+            }
+        };
+        dialog.execution_attempt = Some((instruction.clone(), delivery_id));
+        dialog.pending = true;
+        dialog.error = None;
+        let source_id = dialog.source_id;
+        self.request_consultation(
+            waku_client::Command::ExecuteConsultation {
+                source_session_id: source_id,
+                delivery_id,
+                instruction,
+            },
+            source_id,
+            cx,
+        );
+    }
+
+    fn refresh_consultation(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.consultation.as_mut().filter(|d| !d.pending) else {
+            return;
+        };
+        dialog.pending = true;
+        let source_id = dialog.source_id;
+        self.request_consultation(
+            waku_client::Command::LoadConsultation {
+                source_session_id: source_id,
             },
             source_id,
             cx,
@@ -166,12 +241,106 @@ impl Waku {
         let record = dialog.record.clone();
         let rows = dialog.rows.clone();
         let scroll_rows = rows.clone();
-        let count = record.as_ref().map_or(0, |r| r.exchanges.len());
+        let count = record
+            .as_ref()
+            .map_or(0, |r| r.exchanges.len() + r.instructions.len());
         let history = list(rows, move |index, _, cx| {
             let theme = Theme::current(cx);
-            let Some(exchange) = record.as_ref().and_then(|r| r.exchanges.get(index)) else {
+            let Some(record) = record.as_ref() else {
                 return div().into_any_element();
             };
+            if index >= record.exchanges.len() {
+                let Some(instruction) = record.instructions.get(index - record.exchanges.len())
+                else {
+                    return div().into_any_element();
+                };
+                let (status, reason) = match instruction.delivery.as_ref() {
+                    Some(delivery) => {
+                        use waku_client::model::{InputConfirmation, InputDeliveryState};
+                        let status = match delivery.state {
+                            InputDeliveryState::Accepted => tr!("session.input_accepted"),
+                            InputDeliveryState::Queued => tr!("session.input_queued"),
+                            InputDeliveryState::Failed => tr!("session.input_failed"),
+                            InputDeliveryState::Uncertain => tr!("session.input_uncertain"),
+                            InputDeliveryState::Unsupported => tr!("session.input_unsupported"),
+                            InputDeliveryState::Received => {
+                                if delivery.confirmation == Some(InputConfirmation::Provider) {
+                                    tr!("session.input_received_provider")
+                                } else {
+                                    tr!("session.input_received_transport")
+                                }
+                            }
+                        };
+                        (
+                            status,
+                            instruction
+                                .error
+                                .clone()
+                                .or_else(|| delivery.reason.clone()),
+                        )
+                    }
+                    None => (
+                        if instruction.error.is_some() {
+                            tr!("session.input_failed")
+                        } else {
+                            tr!("consultation.instruction_saved")
+                        },
+                        instruction.error.clone(),
+                    ),
+                };
+                return div()
+                    .px(px(16.0))
+                    .py(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .text_size(sp(14.0))
+                    .line_height(sp(21.0))
+                    .text_color(theme.text)
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(tr!("consultation.execution_record")),
+                    )
+                    .child(instruction.instruction.clone())
+                    .child(
+                        div()
+                            .text_size(sp(12.0))
+                            .text_color(theme.text_secondary)
+                            .child(status),
+                    )
+                    .child(
+                        div()
+                            .text_size(sp(12.0))
+                            .text_color(theme.text_secondary)
+                            .child(format!(
+                                "{} · {}",
+                                DateTime::<Utc>::from_timestamp(instruction.context_at as i64, 0)
+                                    .map(|t| t
+                                        .with_timezone(&Local)
+                                        .format("%Y-%m-%d %H:%M:%S")
+                                        .to_string())
+                                    .unwrap_or_default(),
+                                instruction.delivery_id
+                            )),
+                    )
+                    .when(!instruction.pending_targets.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .text_size(sp(12.0))
+                                .text_color(theme.text_secondary)
+                                .child(tr!(
+                                    "consultation.pending_targets",
+                                    count = instruction.pending_targets.len()
+                                )),
+                        )
+                    })
+                    .when_some(reason, |row, reason| {
+                        row.child(div().text_size(sp(12.0)).child(reason))
+                    })
+                    .into_any_element();
+            }
+            let exchange = &record.exchanges[index];
             let time = DateTime::<Utc>::from_timestamp(exchange.context_at as i64, 0)
                 .map(|t| {
                     t.with_timezone(&Local)
@@ -217,7 +386,9 @@ impl Waku {
             .h(px(300.0))
             .focus_visible(|s| s.border_1().border_color(theme.accent))
             .on_key_down(move |event, _, cx| {
-                if count == 0 { return; }
+                if count == 0 {
+                    return;
+                }
                 let offset = scroll_rows.logical_scroll_top();
                 let next = match event.keystroke.key.as_str() {
                     "up" => offset.item_ix.saturating_sub(1),
@@ -245,7 +416,7 @@ impl Waku {
             }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .w_full()
-            .max_w(px(620.0))
+            .max_w(px(780.0))
             .rounded(px(18.0))
             .bg(theme.composer)
             .shadow_xl()
@@ -295,6 +466,7 @@ impl Waku {
                 div()
                     .p(px(12.0))
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.0))
                     .child(
@@ -308,6 +480,71 @@ impl Waku {
                                 tr!("consultation.not_saved")
                             } else {
                                 tr!("consultation.saved")
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("consultation-refresh")
+                            .track_focus(&dialog.refresh_focus)
+                            .tab_index(0)
+                            .tab_stop(true)
+                            .px(px(10.0))
+                            .py(px(7.0))
+                            .rounded(px(6.0))
+                            .text_size(sp(13.0))
+                            .text_color(theme.text)
+                            .focus_visible(|s| s.border_1().border_color(theme.accent))
+                            .child(tr!("consultation.refresh"))
+                            .when(can_send, |b| {
+                                b.on_click(
+                                    cx.listener(|this, _, _, cx| this.refresh_consultation(cx)),
+                                )
+                            }),
+                    )
+                    .when(
+                        dialog
+                            .record
+                            .as_ref()
+                            .is_some_and(|r| !r.instructions.is_empty()),
+                        |footer| {
+                            footer.child(
+                                div()
+                                    .id("consultation-retry")
+                                    .track_focus(&dialog.retry_focus)
+                                    .tab_index(0)
+                                    .tab_stop(true)
+                                    .px(px(10.0))
+                                    .py(px(7.0))
+                                    .rounded(px(6.0))
+                                    .text_size(sp(13.0))
+                                    .text_color(theme.text)
+                                    .focus_visible(|s| s.border_1().border_color(theme.accent))
+                                    .child(tr!("consultation.retry"))
+                                    .when(can_send, |b| {
+                                        b.on_click(cx.listener(|this, _, _, cx| {
+                                            this.execute_consultation(true, cx)
+                                        }))
+                                    }),
+                            )
+                        },
+                    )
+                    .child(
+                        div()
+                            .id("consultation-execute")
+                            .track_focus(&dialog.execute_focus)
+                            .tab_index(0)
+                            .tab_stop(true)
+                            .px(px(10.0))
+                            .py(px(7.0))
+                            .rounded(px(6.0))
+                            .text_size(sp(13.0))
+                            .text_color(theme.text)
+                            .focus_visible(|s| s.border_1().border_color(theme.accent))
+                            .child(tr!("consultation.execute"))
+                            .when(can_send, |b| {
+                                b.on_click(cx.listener(|this, _, _, cx| {
+                                    this.execute_consultation(false, cx)
+                                }))
                             }),
                     )
                     .child(

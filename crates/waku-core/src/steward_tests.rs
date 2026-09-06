@@ -2064,6 +2064,7 @@ fn steward_capability_cannot_open_or_submit_a_consultation() {
             Command::LoadConsultation {
                 source_session_id: parent.id,
             },
+            Command::ExecuteConsultation { source_session_id:parent.id, delivery_id:Uuid::new_v4(), instruction:"Stop all children".into() },
         ] {
             let outcome = scoped_request(
                 &mut socket,

@@ -431,3 +431,20 @@ test('queued input transitions to its saved new turn without duplicating the led
   expect(received.input_deliveries).toHaveLength(1)
   expect(received.input_deliveries?.[0]).toMatchObject({ turn_id: 'new-turn', state: 'received' })
 })
+
+test('a late steer receipt preserves a wait registered by the revised plan', () => {
+  const original = idleSession()
+  const oldTurn = original.turns[0]!.id
+  const pending = apply(original, 'inputDeliveryChanged', {
+    id: 'old-direction', caller_session_id: original.id, target_session_id: original.id,
+    prompt: 'Previous direction', turn_id: oldTurn, mode: 'steer', state: 'uncertain',
+    confirmation: null, reason: 'Receipt lost', created_at: 100,
+  })
+  const revised = apply(pending, 'promptSubmitted', { message: 'Revised plan', turnId: 'revised-turn', messageId: 'revised-message' })
+  const wait = { id: 'revised-wait', parent_turn_id: 'revised-turn', targets: [{ session_id: 'child', turn_id: 'child-turn' }] }
+  const waiting = apply(revised, 'stewardWaitChanged', wait)
+  expect(waiting.steward_wait).toEqual(wait)
+  const received = apply(waiting, 'inputDeliveryOutcome', { id: 'old-direction', state: 'received', confirmation: 'provider', reason: null })
+  expect(received.steward_wait).toEqual(wait)
+  expect(received.messages.at(-1)?.turn_id).toBe(oldTurn)
+})

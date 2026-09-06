@@ -128,7 +128,7 @@ export function reduceRuntimeEvent(
         delivery.confirmation = outcome.confirmation
         delivery.reason = outcome.reason
         if (delivery.state === 'received' && delivery.mode === 'steer') {
-          delete session.steward_wait
+          if (session.steward_wait?.parent_turn_id === delivery.turn_id) delete session.steward_wait
           session.messages.push({ id: clock.randomUUID(), role: 'user', content: delivery.prompt,
             turn_id: delivery.turn_id, created_at: clock.nowSeconds(), streaming: false })
         }

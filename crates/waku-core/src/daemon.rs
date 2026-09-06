@@ -462,7 +462,7 @@ impl Backend for WakuBackend {
         }
         if matches!(
             &request.command,
-            Command::Consult { .. } | Command::LoadConsultation { .. }
+            Command::Consult { .. } | Command::LoadConsultation { .. } | Command::ExecuteConsultation { .. }
         ) {
             return self.consultation_command(request.command, &events);
         }
@@ -2498,6 +2498,7 @@ fn handle_driver_command(
         | Command::Start { .. }
         | Command::Consult { .. }
         | Command::LoadConsultation { .. }
+        | Command::ExecuteConsultation { .. }
         | Command::GetSettings
         | Command::UpdateSettings { .. }
         | Command::ProbeProvider { .. }

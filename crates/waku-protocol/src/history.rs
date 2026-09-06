@@ -72,7 +72,9 @@ impl HistoryReducer {
                         if delivery.state == InputDeliveryState::Received && delivery.mode == InputDeliveryMode::Steer {
                             let turn_id = delivery.turn_id;
                             let prompt = delivery.prompt.clone();
-                            session.steward_wait = None;
+                            if session.steward_wait.as_ref().is_some_and(|wait| wait.parent_turn_id == turn_id) {
+                                session.steward_wait = None;
+                            }
                             session.messages.push(Message::new_for_turn(MessageRole::User, prompt, turn_id));
                         }
                     }

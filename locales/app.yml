@@ -2203,7 +2203,7 @@ consultation.open:
 consultation.title:
   en: Read-only discussion · Claude
 consultation.read_only:
-  en: Discuss ideas and saved progress. No tools or task controls.
+  en: Discussion is read-only. Only “Give to steward to execute” changes the task.
 consultation.placeholder:
   en: Ask about progress or discuss an idea…
 consultation.context_time:
@@ -2213,7 +2213,7 @@ consultation.answering:
 consultation.saved:
   en: Discussion saved
 consultation.send:
-  en: Send
+  en: Ask
 consultation.close:
   en: Close
 consultation.interrupted:
@@ -2229,3 +2229,16 @@ consultation.not_configured:
 
 session.input_queued:
   en: Input queued
+
+consultation.execute:
+  en: Give to steward to execute
+consultation.execution_record:
+  en: Explicit execution instruction
+consultation.refresh:
+  en: Refresh status
+consultation.retry:
+  en: Retry last instruction
+consultation.pending_targets:
+  en: "%{count} child results retained for this direction; the steward must review them and renew required waits."
+consultation.instruction_saved:
+  en: Instruction saved; no submission confirmed. Retry to continue.

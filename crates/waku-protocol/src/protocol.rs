@@ -152,6 +152,11 @@ pub enum Command {
     LoadConsultation {
         source_session_id: Uuid,
     },
+    ExecuteConsultation {
+        source_session_id: Uuid,
+        delivery_id: Uuid,
+        instruction: String,
+    },
     StewardWait {
         session_ids: Vec<Uuid>,
     },

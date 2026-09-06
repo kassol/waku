@@ -151,6 +151,11 @@ impl WakuBackend {
                 || parent.pending_user_input.is_some()
                 || !parent.queued_messages.is_empty()
                 || parent.input_deliveries.iter().any(|delivery| delivery.state == crate::model::InputDeliveryState::Queued)
+                || parent.input_deliveries.iter().any(|delivery| {
+                    delivery.caller_session_id == parent.id
+                        && delivery.turn_id == wait.parent_turn_id
+                        && matches!(delivery.state, crate::model::InputDeliveryState::Accepted | crate::model::InputDeliveryState::Uncertain)
+                })
             {
                 return Ok(());
             }

@@ -10,21 +10,34 @@ struct QueueDriver {
     events: EventSink,
     calls: crossbeam_channel::Sender<(Uuid, String)>,
     target: Uuid,
+    steer: bool,
+    callback_gate: Arc<Mutex<Option<crossbeam_channel::Receiver<()>>>>,
 }
 
 impl DriverControl for QueueDriver {
-    fn prompt(&self, _: String) {
+    fn prompt(&self, prompt: String) {
+        if prompt.contains("automatic child-session notification") {
+            let gate = self.callback_gate.lock().clone();
+            if let Some(gate) = gate {
+                self.calls.send((self.target, prompt)).unwrap();
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
         self.events
             .send(event_to_wire(DriverEvent::TurnStarted).unwrap())
             .unwrap();
     }
     fn deliver_input(&self, prompt: String, id: Uuid, steer: bool) -> anyhow::Result<()> {
         assert!(
-            !steer,
+            !steer || self.steer,
             "unsupported provider must never receive native steer"
         );
-        self.events.send(event_to_wire(DriverEvent::TurnStarted)?)?;
-        if prompt != "lose confirmation" {
+        if !steer {
+            self.events.send(event_to_wire(DriverEvent::TurnStarted)?)?;
+        }
+        if prompt != "lose confirmation"
+            && !prompt.contains("\"instruction\":\"lose confirmation\"")
+        {
             self.events
                 .send(event_to_wire(DriverEvent::InputDeliveryOutcome(
                     InputDeliveryOutcome {
@@ -37,6 +50,9 @@ impl DriverControl for QueueDriver {
         }
         self.calls.send((self.target, prompt)).unwrap();
         Ok(())
+    }
+    fn supports_steer(&self) -> bool {
+        self.steer
     }
     fn cancel(&self) {}
     fn respond(&self, _: String, _: String) {}
@@ -52,6 +68,8 @@ struct QueueBackend {
     sinks: Mutex<HashMap<Uuid, EventSink>>,
     calls: crossbeam_channel::Sender<(Uuid, String)>,
     paused: AtomicBool,
+    steer: AtomicBool,
+    callback_gate: Arc<Mutex<Option<crossbeam_channel::Receiver<()>>>>,
 }
 impl Backend for QueueBackend {
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
@@ -64,6 +82,8 @@ impl Backend for QueueBackend {
                         events: events.clone(),
                         calls: self.calls.clone(),
                         target: request.session_id,
+                        steer: self.steer.load(Ordering::Acquire),
+                        callback_gate: self.callback_gate.clone(),
                     })),
                 ),
             );
@@ -113,6 +133,8 @@ impl QueueServer {
             sinks: Mutex::new(HashMap::new()),
             calls: sender,
             paused: AtomicBool::new(false),
+            steer: AtomicBool::new(false),
+            callback_gate: Arc::new(Mutex::new(None)),
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -688,5 +710,473 @@ fn input_queue_socket_restart_keeps_delivery_id_bound_to_the_original_target() {
     assert!(reopened.calls.try_recv().is_err());
     drop(client);
     drop(reopened);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn consultation_unconfirmed_direction_blocks_only_its_old_wait() {
+    for reject in [true, false] {
+        let (root, parent, child) = seed_queue();
+        let server = QueueServer::open(&root);
+        server.backend.steer.store(true, Ordering::Release);
+        let (client, parent_runtime) = begin_queue_work(&server, &root, parent.id);
+        let (_, child_runtime) = begin_queue_work(&server, &root, child.id);
+        client
+            .request(
+                parent.id,
+                parent_runtime,
+                Command::StewardWait {
+                    session_ids: vec![child.id],
+                },
+            )
+            .unwrap();
+        let id = Uuid::new_v4();
+        let reply = client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::ExecuteConsultation {
+                    source_session_id: parent.id,
+                    delivery_id: id,
+                    instruction: "lose confirmation".into(),
+                },
+            )
+            .unwrap();
+        let reply = serde_json::to_value(reply).unwrap();
+        assert_eq!(
+            reply["consultation"]["instructions"][0]["delivery"]["state"],
+            "uncertain"
+        );
+        assert!(
+            server
+                .calls
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .1
+                .contains(&child.id.to_string())
+        );
+        server.finish(child.id);
+        server.finish(parent.id);
+        // Allow the event-driven worker to process the two controlled completions.
+        std::thread::sleep(Duration::from_millis(150));
+        let snapshot = |client: &DaemonClient| {
+            let ResponsePayload::Session {
+                session: Some(session),
+            } = client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::HydrateSession {
+                        session_id: parent.id,
+                    },
+                )
+                .unwrap()
+            else {
+                panic!()
+            };
+            session
+        };
+        let waiting = snapshot(&client);
+        assert!(
+            waiting.steward_wait.is_some(),
+            "an unconfirmed direction must not resume the old plan"
+        );
+        assert_eq!(waiting.turns.len(), 2);
+        if !reject {
+            client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::ExecuteConsultation {
+                        source_session_id: parent.id,
+                        delivery_id: Uuid::new_v4(),
+                        instruction: "Proceed with a fresh confirmed direction".into(),
+                    },
+                )
+                .unwrap();
+            assert!(
+                server
+                    .calls
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .1
+                    .contains(&child.id.to_string())
+            );
+            client
+                .request(
+                    child.id,
+                    child_runtime,
+                    Command::Prompt {
+                        prompt: "Follow the revised plan".into(),
+                        turn_id: None,
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+            client
+                .request(
+                    parent.id,
+                    parent_runtime,
+                    Command::StewardWait {
+                        session_ids: vec![child.id],
+                    },
+                )
+                .unwrap();
+            server.finish(parent.id);
+            server.finish(child.id);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let current = snapshot(&client);
+                if current.turns.len() == 4 {
+                    assert_eq!(
+                        current
+                            .input_deliveries
+                            .iter()
+                            .find(|d| d.id == id)
+                            .unwrap()
+                            .state,
+                        InputDeliveryState::Uncertain
+                    );
+                    assert!(current.steward_wait.is_none());
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a historical uncertain delivery blocked the revised plan"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            client
+                .request(
+                    child.id,
+                    child_runtime,
+                    Command::Prompt {
+                        prompt: "Another revised child task".into(),
+                        turn_id: None,
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+            client
+                .request(
+                    parent.id,
+                    parent_runtime,
+                    Command::StewardWait {
+                        session_ids: vec![child.id],
+                    },
+                )
+                .unwrap();
+            let latest_wait = snapshot(&client).steward_wait.unwrap();
+            server
+                .backend
+                .sinks
+                .lock()
+                .get(&parent.id)
+                .unwrap()
+                .send(
+                    event_to_wire(DriverEvent::InputDeliveryOutcome(InputDeliveryOutcome {
+                        id,
+                        state: InputDeliveryState::Received,
+                        confirmation: Some(InputConfirmation::Provider),
+                        reason: None,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                snapshot(&client).steward_wait.unwrap().id,
+                latest_wait.id,
+                "old receipt erased a newer wait"
+            );
+            server.finish(parent.id);
+            server.finish(child.id);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while snapshot(&client).turns.len() != 5 {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(client);
+            drop(server);
+            std::fs::remove_dir_all(root).unwrap();
+            continue;
+        }
+        server
+            .backend
+            .sinks
+            .lock()
+            .get(&parent.id)
+            .unwrap()
+            .send(
+                event_to_wire(DriverEvent::InputDeliveryOutcome(InputDeliveryOutcome {
+                    id,
+                    state: InputDeliveryState::Failed,
+                    confirmation: None,
+                    reason: Some("native turn rejected the input".into()),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = snapshot(&client);
+            if current.turns.len() == 3 {
+                assert!(current.steward_wait.is_none());
+                assert!(
+                    current
+                        .messages
+                        .last()
+                        .unwrap()
+                        .content
+                        .contains("automatic child-session notification")
+                );
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(client);
+        drop(server);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn consultation_direction_coordinates_both_callback_orders_and_preserves_other_tasks() {
+    for callback_first in [false, true] {
+        for steer in [false, true] {
+            let (root, parent, child) = seed_queue();
+            let mut other = child.clone();
+            other.id = Uuid::new_v4();
+            other.title = "unrelated task".into();
+            let store = StateStore::daemon(root.join("state.db"));
+            let mut seed = store.load().unwrap();
+            seed.sessions.push(other.clone());
+            seed.mark_session_dirty(other.id);
+            store.save(&mut seed).unwrap();
+            let server = QueueServer::open(&root);
+            server.backend.steer.store(steer, Ordering::Release);
+            let (client, parent_runtime) = begin_queue_work(&server, &root, parent.id);
+            let (_, child_runtime) = begin_queue_work(&server, &root, child.id);
+            let (_, _) = begin_queue_work(&server, &root, other.id);
+            client
+                .request(
+                    parent.id,
+                    parent_runtime,
+                    Command::StewardWait {
+                        session_ids: vec![child.id, other.id],
+                    },
+                )
+                .unwrap();
+            let snapshot = |id| {
+                let ResponsePayload::Session {
+                    session: Some(session),
+                } = client
+                    .request(
+                        Uuid::nil(),
+                        Uuid::nil(),
+                        Command::HydrateSession { session_id: id },
+                    )
+                    .unwrap()
+                else {
+                    panic!()
+                };
+                session
+            };
+            if callback_first {
+                server.finish(child.id);
+                server.finish(parent.id);
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while snapshot(parent.id).turns.len() != 3 {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            let id = Uuid::new_v4();
+            let reply = serde_json::to_value(
+                client
+                    .request(
+                        Uuid::nil(),
+                        Uuid::nil(),
+                        Command::ExecuteConsultation {
+                            source_session_id: parent.id,
+                            delivery_id: id,
+                            instruction: "Change only the parser task; preserve unrelated work."
+                                .into(),
+                        },
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                reply["consultation"]["instructions"][0]["delivery"]["state"],
+                if steer { "received" } else { "queued" }
+            );
+            if !callback_first {
+                server.finish(child.id);
+            }
+            server.finish(parent.id);
+            let (_, prompt) = server.calls.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(prompt.contains("Change only the parser task"));
+            if !callback_first {
+                assert!(
+                    prompt.contains(&child.id.to_string())
+                        && prompt.contains(&other.id.to_string())
+                );
+            }
+            assert!(snapshot(other.id).active_turn_id().is_some());
+            assert!(snapshot(other.id).cancellation_requested_turn_id.is_none());
+            assert!(snapshot(parent.id).steward_wait.is_none());
+            let expected_turns = 2 + usize::from(callback_first) + usize::from(!steer);
+            assert_eq!(snapshot(parent.id).turns.len(), expected_turns);
+            // A later independent result cannot revive the previous wait.
+            server.finish(other.id);
+            assert!(
+                server
+                    .calls
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err()
+            );
+            assert_eq!(snapshot(parent.id).turns.len(), expected_turns);
+            assert!(snapshot(child.id).active_turn_id().is_none());
+            let _ = child_runtime;
+            drop(client);
+            drop(server);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn consultation_execution_keeps_rejected_text_while_cancellation_is_unconfirmed() {
+    let (root, parent, child) = seed_queue();
+    let server = QueueServer::open(&root);
+    let (client, runtime) = begin_queue_work(&server, &root, parent.id);
+    let (_, _) = begin_queue_work(&server, &root, child.id);
+    client.request(parent.id, runtime, Command::Cancel).unwrap();
+    let id = Uuid::new_v4();
+    let reply = serde_json::to_value(
+        client
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::ExecuteConsultation {
+                    source_session_id: parent.id,
+                    delivery_id: id,
+                    instruction: "Switch direction after the current work has stopped".into(),
+                },
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let record = &reply["consultation"]["instructions"][0];
+    assert!(
+        record["error"]
+            .as_str()
+            .unwrap()
+            .contains("cancellation has not settled")
+    );
+    assert!(record["delivery"].is_null());
+    assert_eq!(
+        record["instruction"],
+        "Switch direction after the current work has stopped"
+    );
+    assert!(server.calls.try_recv().is_err());
+    let ResponsePayload::Session {
+        session: Some(parent),
+    } = client
+        .request(
+            Uuid::nil(),
+            Uuid::nil(),
+            Command::HydrateSession {
+                session_id: parent.id,
+            },
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(parent.active_turn_id().is_some());
+    assert!(parent.cancellation_requested_turn_id.is_some());
+    let loaded = client
+        .request(
+            Uuid::nil(),
+            Uuid::nil(),
+            Command::LoadConsultation {
+                source_session_id: parent.id,
+            },
+        )
+        .unwrap();
+    assert_eq!(serde_json::to_value(loaded).unwrap(), reply);
+    drop(client);
+    drop(server);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn consultation_execution_waits_for_an_inflight_callback_before_steering_it() {
+    let (root, parent, child) = seed_queue();
+    let server = QueueServer::open(&root);
+    server.backend.steer.store(true, Ordering::Release);
+    let (release, gate) = crossbeam_channel::bounded(1);
+    *server.backend.callback_gate.lock() = Some(gate);
+    let (client, runtime) = begin_queue_work(&server, &root, parent.id);
+    let (_, _) = begin_queue_work(&server, &root, child.id);
+    client
+        .request(
+            parent.id,
+            runtime,
+            Command::StewardWait {
+                session_ids: vec![child.id],
+            },
+        )
+        .unwrap();
+    server.finish(child.id);
+    server.finish(parent.id);
+    assert!(
+        server
+            .calls
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .1
+            .contains("automatic child-session notification")
+    );
+    let concurrent = server.connect();
+    let (done, reply) = crossbeam_channel::bounded(1);
+    let id = Uuid::new_v4();
+    let writer = std::thread::spawn(move || {
+        done.send(concurrent.request(
+            Uuid::nil(),
+            Uuid::nil(),
+            Command::ExecuteConsultation {
+                source_session_id: parent.id,
+                delivery_id: id,
+                instruction: "Use the corrected plan".into(),
+            },
+        ))
+        .unwrap();
+    });
+    assert!(reply.recv_timeout(Duration::from_millis(100)).is_err());
+    release.send(()).unwrap();
+    let response =
+        serde_json::to_value(reply.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()).unwrap();
+    assert_eq!(
+        response["consultation"]["instructions"][0]["delivery"]["mode"],
+        "steer"
+    );
+    assert_eq!(
+        response["consultation"]["instructions"][0]["delivery"]["state"],
+        "received"
+    );
+    assert!(
+        server
+            .calls
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .1
+            .contains("Use the corrected plan")
+    );
+    writer.join().unwrap();
+    drop(client);
+    drop(server);
     std::fs::remove_dir_all(root).unwrap();
 }

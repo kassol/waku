@@ -983,6 +983,26 @@ impl StateStore {
             .transpose()
     }
 
+    /// Read only the summary and four recent messages. Call outside task_state:
+    /// SQLite parses the saved JSON without allocating a full Rust transcript.
+    pub fn consultation_history(&self, session_id: Uuid) -> io::Result<serde_json::Value> {
+        let mut fields = vec![
+            "'turn', json_object('turn_id', json_extract(data, '$.turns[#-1].id'), 'status', json_extract(data, '$.turns[#-1].status'), 'started_at', json_extract(data, '$.turns[#-1].started_at'), 'completed_at', json_extract(data, '$.turns[#-1].completed_at'))".to_owned(),
+            "'permission', json_type(data, '$.pending_permission') = 'object'".to_owned(),
+            "'user_input', json_type(data, '$.pending_user_input') = 'object'".to_owned(),
+        ];
+        let messages = (1..=4).rev().map(|offset| format!(
+            "json_object('role', json_extract(data, '$.messages[#-{offset}].role'), 'content', substr(json_extract(data, '$.messages[#-{offset}].content'), 1, 1500), 'created_at', json_extract(data, '$.messages[#-{offset}].created_at'))"
+        )).collect::<Vec<_>>().join(",");
+        fields.push(format!("'recent_messages', json_array({messages})"));
+        let data: Option<String> = self.open()?.query_row(
+            &format!("SELECT json_object({}) FROM session_details WHERE session_id = ?1", fields.join(",")),
+            params![session_id.to_string()], |row| row.get(0),
+        ).optional().map_err(to_io_error)?;
+        data.map(|s| serde_json::from_str(&s).map_err(to_io_error)).transpose()
+            .map(|value| value.unwrap_or(serde_json::Value::Null))
+    }
+
     pub fn save_consultation(
         &self,
         consultation: &waku_protocol::consultation::Consultation,

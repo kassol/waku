@@ -49,3 +49,19 @@ input with its failure reason.
 Cancellation fails queued inputs before provider submission. A restart that loses
 an unanswered provider interaction retains those inputs as failed and requires a
 new user decision.
+
+Explicit user directions from an independent discussion use `ExecuteConsultation`.
+The daemon retains the original instruction, a fixed prompt, its delivery ID,
+and the pending child targets in the discussion record before submission. This
+user-only command targets the source task; scoped MCP clients cannot use it.
+`LoadConsultation` reads current delivery states without resending any input.
+A retry reuses the saved prompt and ID, including after restart.
+
+An accepted or uncertain user steer holds the previous wait for that same turn.
+It cannot automatically resume the old plan while the new direction is unresolved.
+A confirmed rejection permits the old wait to resume; receipt clears the wait.
+Historical uncertain deliveries from other turns do not block a new wait. Queued
+input uses the existing durable queue. The instruction asks the steward to retain
+pending results, steer only affected direct children, preserve unrelated work,
+and establish necessary waits under the new plan. A cancellation is complete only
+after actual stopped confirmation.

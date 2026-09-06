@@ -2,6 +2,111 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 
 #[test]
+fn consultation_execution_is_explicit_durable_and_retries_the_same_delivery() {
+    let root = std::env::temp_dir().join(format!("waku-consult-input-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let binary = root.join("codex");
+    std::fs::write(
+        &binary,
+        include_str!("../tests/fixtures/codex_input_delivery.py"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let settings = DaemonSettingsStore::open(root.join("settings.json")).unwrap();
+    let mut config = settings.get();
+    config
+        .provider_binary_overrides
+        .insert(ProviderKind::Codex, binary.to_string_lossy().into());
+    settings.replace(config).unwrap();
+    let project = Project::from_path(root.clone());
+    let mut source = AgentSession::new(project.id, ProviderKind::Codex);
+    source.push_message(crate::model::MessageRole::User, "Original task");
+    let store = StateStore::daemon(root.join("state.db"));
+    let mut seed = PersistedState::empty();
+    seed.projects = vec![project];
+    seed.sessions = vec![source.clone()];
+    seed.mark_session_dirty(source.id);
+    store.save(&mut seed).unwrap();
+    let backend = Arc::new(WakuBackend::new(settings, store).unwrap());
+    let (client, stop, server) = serve_consultation(backend.clone());
+    let id = Uuid::new_v4();
+    let command = || {
+        serde_json::from_value::<Command>(json!({"type":"executeConsultation", "sourceSessionId": source.id, "deliveryId": id, "instruction":"Change the parser; keep unrelated tasks running."})).unwrap()
+    };
+    let result = client.request(Uuid::nil(), Uuid::nil(), command()).unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    assert_eq!(
+        result["consultation"]["instructions"][0]["instruction"],
+        "Change the parser; keep unrelated tasks running."
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let saved = loop {
+        let loaded = serde_json::to_value(
+            client
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::LoadConsultation {
+                        source_session_id: source.id,
+                    },
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        if loaded["consultation"]["instructions"][0]["delivery"]["state"] == "received" {
+            break loaded;
+        }
+        assert!(std::time::Instant::now() < deadline, "{loaded}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let prompt = saved["consultation"]["instructions"][0]["prompt"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(prompt.contains("actual stopped") && prompt.contains("unrelated"));
+    client.request(Uuid::nil(), Uuid::nil(), command()).unwrap();
+    let conflict = serde_json::from_value::<Command>(json!({"type":"executeConsultation", "sourceSessionId":source.id,"deliveryId":id,"instruction":"Different instruction"})).unwrap();
+    assert!(client.request(Uuid::nil(), Uuid::nil(), conflict).is_err());
+    assert_eq!(
+        std::fs::read_to_string(root.join("input-calls.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    drop(client);
+    stop.store(true, Ordering::Release);
+    server.join().unwrap();
+    drop(backend);
+    let backend = Arc::new(
+        WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("state.db")),
+        )
+        .unwrap(),
+    );
+    let (client, stop, server) = serve_consultation(backend.clone());
+    let resumed =
+        serde_json::to_value(client.request(Uuid::nil(), Uuid::nil(), command()).unwrap()).unwrap();
+    assert_eq!(
+        resumed["consultation"]["instructions"],
+        saved["consultation"]["instructions"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("input-calls.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    drop(client);
+    stop.store(true, Ordering::Release);
+    server.join().unwrap();
+    drop(backend);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn consultation_is_scoped_and_does_not_change_the_source_turn_or_wait() {
     let root = std::env::temp_dir().join(format!("waku-consult-test-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
@@ -59,7 +164,12 @@ else:
         extra.parent_session_id = Some(source.id);
         extra.created_at = child.created_at + index + 1;
         extra.updated_at = 1;
-        extra.push_message(crate::model::MessageRole::Assistant, "ADDITIONAL_CHILD");
+        for _ in 0..4 {
+            extra.push_message(
+                crate::model::MessageRole::Assistant,
+                format!("ADDITIONAL_CHILD {}", "界".repeat(1500)),
+            );
+        }
         seed.sessions.push(extra);
     }
     for id in seed.sessions.iter().map(|s| s.id).collect::<Vec<_>>() {
