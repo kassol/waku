@@ -90,6 +90,11 @@ impl HistoryReducer {
                 }
             }
             DriverEvent::HistorySnapshot(mut snapshot) => {
+                if session.managed_workspace.as_ref().is_some_and(|current| {
+                    snapshot.managed_workspace.as_ref().is_none_or(|incoming| incoming.revision < current.revision)
+                }) {
+                    snapshot.managed_workspace = session.managed_workspace.clone();
+                }
                 if history_snapshot_is_stale(session, &snapshot) {
                     return effects;
                 }

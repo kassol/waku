@@ -39,10 +39,15 @@ mod steward_wait_tests;
 #[path = "creation.rs"]
 mod creation;
 
+#[path = "task_workspace.rs"]
+mod task_workspace;
+
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
     creation_locks: Mutex<HashMap<(Uuid, String), std::sync::Weak<Mutex<()>>>>,
     work_gate: RwLock<()>,
+    workspace_start_gate: Mutex<()>,
+    runtime_workspaces: Mutex<HashMap<Uuid, PathBuf>>,
     quitting: AtomicBool,
     saving_failed: AtomicBool,
     failed_sessions: Mutex<HashSet<Uuid>>,
@@ -149,6 +154,8 @@ impl WakuBackend {
             sessions: Mutex::new(HashMap::new()),
             creation_locks: Mutex::new(HashMap::new()),
             work_gate: RwLock::new(()),
+            workspace_start_gate: Mutex::new(()),
+            runtime_workspaces: Mutex::new(HashMap::new()),
             quitting: AtomicBool::new(false),
             saving_failed: AtomicBool::new(false),
             failed_sessions: Mutex::new(HashSet::new()),
@@ -246,6 +253,9 @@ impl WakuBackend {
             .is_some_and(|id| runtime_id.is_none_or(|runtime| runtime == *id))
         {
             bail!("the provider exit could not be confirmed; normal exit remains blocked");
+        }
+        if !self.sessions.lock().contains_key(&session_id) {
+            self.runtime_workspaces.lock().remove(&session_id);
         }
         Ok(())
     }
@@ -462,6 +472,7 @@ impl Backend for WakuBackend {
             request.command,
             Command::CreateSession { .. }
                 | Command::StewardWait { .. }
+                | Command::StewardWorkspace { .. }
                 | Command::StewardPrompt { .. }
                 | Command::Start { .. }
                 | Command::Prompt { .. }
@@ -625,6 +636,7 @@ impl WakuBackend {
             }
         }
         match request.command {
+            Command::StewardWorkspace { operation } => self.steward_workspace(session_id, operation, &events),
             Command::StewardWait { session_ids } => {
                 self.register_steward_wait(session_id, session_ids, &events)
             }
@@ -838,6 +850,7 @@ impl WakuBackend {
                 for mut session in sessions {
                     session.steward_wait = None;
                     session.input_deliveries.clear();
+                    session.managed_workspace = None;
                     if let Some(existing) = state
                         .sessions
                         .iter_mut()
@@ -849,6 +862,10 @@ impl WakuBackend {
                         session.parent_session_id = existing.parent_session_id;
                         session.steward_wait = existing.steward_wait.clone();
                         session.input_deliveries = existing.input_deliveries.clone();
+                        session.managed_workspace = existing.managed_workspace.clone();
+                        if existing.managed_workspace.is_some() {
+                            session.workspace = existing.workspace.clone();
+                        }
                         if existing.runtime_event_cursor.is_some()
                             || session_projection_precedes(
                                 existing,
@@ -1250,6 +1267,9 @@ impl WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             Command::Start { options } => {
+                let _workspace_start = self.workspace_start_gate.lock();
+                self.check_workspace_writer(session_id, &options.cwd)?;
+                let runtime_workspace = task_workspace::canonical_workspace(&options.cwd)?;
                 validate_child_options(
                     &self.task_store,
                     &mut self.task_state.lock(),
@@ -1298,6 +1318,7 @@ impl WakuBackend {
                 let (event_sender, event_receiver) = driver::event_channel(wake);
                 let handle =
                     driver::start_local_with_mcp(provider, options, event_sender, mcp_config)?;
+                self.runtime_workspaces.lock().insert(session_id, runtime_workspace);
                 let supports_steer = handle.supports_steer();
                 let forwarder = std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
@@ -2410,6 +2431,7 @@ fn handle_driver_command(
             return Ok(ResponsePayload::Cursor { cursor });
         }
         Command::StewardInputStatus { .. }
+        | Command::StewardWorkspace { .. }
         | Command::StewardQuery { .. }
         | Command::StewardWait { .. }
         | Command::StewardPrompt { .. }
@@ -3629,3 +3651,7 @@ mod tests {
 #[cfg(all(test, unix))]
 #[path = "daemon_shutdown_tests.rs"]
 mod daemon_shutdown_tests;
+
+#[cfg(test)]
+#[path = "task_workspace_tests.rs"]
+mod task_workspace_tests;

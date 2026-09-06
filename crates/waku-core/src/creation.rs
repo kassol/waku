@@ -181,6 +181,19 @@ impl WakuBackend {
                 .parent()
                 .ok_or_else(|| anyhow!("the task database has no workspace directory"))?
                 .join("worktrees");
+            let task_base = parent
+                .managed_workspace
+                .as_ref()
+                .map(|task| {
+                    if !task.ready {
+                        bail!("task integration workspace is not ready");
+                    }
+                    task_workspace::git(
+                        &task.repository,
+                        &["rev-parse", "--verify", &task.integration_branch],
+                    )
+                })
+                .transpose()?;
             match workspace {
                 CreationWorkspace::Worktree => {
                     if project.is_projectless() {
@@ -194,12 +207,24 @@ impl WakuBackend {
                         project.id,
                         child_id,
                         &name,
-                        None,
+                        task_base.as_deref(),
                         |planned| {
                             child.workspace = crate::model::SessionWorkspace::Worktree {
                                 path: planned.path.clone(),
                                 branch: planned.branch.clone(),
                             };
+                            if let Some(task) = &parent.managed_workspace {
+                                let mut managed = task.clone();
+                                managed.coordination = None;
+                                managed.name = child.display_title().to_string();
+                                managed.base_commit = task_base.clone().expect("managed task has a base");
+                                managed.path = planned.path.clone();
+                                managed.branch = planned.branch.clone();
+                                managed.owned = true;
+                                managed.ready = false;
+                                managed.error = None;
+                                child.managed_workspace = Some(managed);
+                            }
                             record.workspace_path = Some(planned.path.clone());
                             record.branch = Some(planned.branch.clone());
                             record.session = Some(child.clone());
@@ -236,6 +261,18 @@ impl WakuBackend {
                     "the requested workspace is not an existing directory: {}",
                     path.display()
                 );
+            }
+            if let Some(task) = &parent.managed_workspace {
+                let mut managed = task.clone();
+                managed.coordination = None;
+                managed.name = child.display_title().to_string();
+                managed.base_commit = task_workspace::git(&path, &["rev-parse", "HEAD"])?;
+                managed.path = path.clone();
+                managed.branch = task_workspace::git(&path, &["branch", "--show-current"])?;
+                managed.owned = workspace == CreationWorkspace::Worktree;
+                managed.ready = true;
+                managed.error = None;
+                child.managed_workspace = Some(managed);
             }
             record.stage = CreationStage::SessionSave;
             record.session = Some(child.clone());

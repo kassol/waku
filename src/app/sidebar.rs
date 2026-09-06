@@ -1328,6 +1328,7 @@ impl Waku {
         );
         for session in &self.state.sessions {
             fingerprint = mix(fingerprint, u64::from(session.has_started()));
+            fingerprint = mix(fingerprint, u64::from(session.managed_workspace.is_some()));
             fingerprint = mix_uuid(fingerprint, session.parent_session_id.unwrap_or_default());
             fingerprint = mix_uuid(fingerprint, session.id);
             fingerprint = mix_uuid(fingerprint, session.project_id);
@@ -1400,6 +1401,7 @@ impl Waku {
             .iter()
             .filter(|session| {
                 session.has_started()
+                    || session.managed_workspace.is_some()
                     || session.parent_session_id.is_some()
                     || referenced.contains(&session.id)
             })

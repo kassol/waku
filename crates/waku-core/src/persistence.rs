@@ -98,8 +98,8 @@ pub struct RememberedModelTraits {
 
 /// Small, independently persisted composer state.
 ///
-/// Session storage intentionally excludes blank sessions. Keeping drafts in a
-/// separate atomic JSON document preserves that lifecycle and also lets the
+/// Session storage excludes blank sessions without managed Git resources.
+/// Keeping drafts in a separate atomic JSON document preserves that lifecycle and lets the
 /// app debounce writes onto the background executor without cloning the
 /// transcript database state.
 #[derive(Clone)]
@@ -504,7 +504,10 @@ impl PersistedState {
         self.selected_session.filter(|selected| {
             self.sessions
                 .iter()
-                .any(|session| session.id == *selected && session.has_started())
+                .any(|session| {
+                    session.id == *selected
+                        && (session.has_started() || session.managed_workspace.is_some())
+                })
         })
     }
 
@@ -1198,19 +1201,23 @@ impl StateStore {
             .collect();
         drop(sessions);
 
-        // Recover durable waits without hydrating any transcript. This runs
+        // Recover daemon-owned wait and workspace records without hydrating a transcript. This runs
         // once when opening the store; later catalogs use the in-memory projection.
         let mut waits = connection
-            .prepare("SELECT session_id, json_extract(data, '$.steward_wait'), json_extract(data, '$.input_deliveries') FROM session_details")
+            .prepare("SELECT session_id, json_extract(data, '$.steward_wait'), json_extract(data, '$.input_deliveries'), json_extract(data, '$.managed_workspace') FROM session_details")
             .map_err(to_io_error)?;
         let mut waits_by_session = HashMap::new();
         let mut inputs_by_session = HashMap::new();
+        let mut workspaces_by_session = HashMap::new();
         for row in waits
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)))
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?)))
             .map_err(to_io_error)?
         {
-            let (id, wait, inputs) = row.map_err(to_io_error)?;
+            let (id, wait, inputs, workspace) = row.map_err(to_io_error)?;
             if let Some(inputs) = inputs { inputs_by_session.insert(id.clone(), serde_json::from_str(&inputs).map_err(to_io_error)?); }
+            if let Some(workspace) = workspace {
+                workspaces_by_session.insert(id.clone(), serde_json::from_str(&workspace).map_err(to_io_error)?);
+            }
             if let Some(wait) = wait {
                 waits_by_session.insert(id, serde_json::from_str(&wait).map_err(to_io_error)?);
             }
@@ -1218,6 +1225,7 @@ impl StateStore {
         for session in &mut state.sessions {
             session.steward_wait = waits_by_session.remove(&session.id.to_string());
             session.input_deliveries = inputs_by_session.remove(&session.id.to_string()).unwrap_or_default();
+            session.managed_workspace = workspaces_by_session.remove(&session.id.to_string());
         }
         drop(waits);
 
@@ -1316,6 +1324,7 @@ impl StateStore {
         session.cancellation_requested_turn_id = stored.cancellation_requested_turn_id;
         session.steward_wait = stored.steward_wait;
         session.input_deliveries = stored.input_deliveries;
+        session.managed_workspace = stored.managed_workspace;
         session.pending_permission = stored.pending_permission;
         session.pending_user_input = stored.pending_user_input;
 
@@ -1464,7 +1473,7 @@ impl StateStore {
         for session in state
             .sessions
             .iter()
-            .filter(|session| session.has_started())
+            .filter(|session| session.has_started() || session.managed_workspace.is_some())
         {
             live.insert(session.id);
             if pending_sessions.contains(&session.id) {
@@ -1769,6 +1778,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         parent_session_id: parent_session_id.and_then(|id| Uuid::parse_str(&id).ok()),
         steward_wait: None,
         input_deliveries: Vec::new(),
+        managed_workspace: None,
         title,
         auto_title,
         project_id: Uuid::parse_str(&project_id).ok()?,

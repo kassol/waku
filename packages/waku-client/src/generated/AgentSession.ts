@@ -2,6 +2,7 @@
 import type { AgentTurn } from "./AgentTurn";
 import type { ContextUsage } from "./ContextUsage";
 import type { InputDelivery } from "./InputDelivery";
+import type { ManagedWorkspace } from "./ManagedWorkspace";
 import type { Message } from "./Message";
 import type { PendingPermission } from "./PendingPermission";
 import type { ProviderKind } from "./ProviderKind";
@@ -21,7 +22,7 @@ export type AgentSession = { id: string,
 /**
  * Immutable creator assigned by the daemon; retained when that parent is removed.
  */
-parent_session_id?: string | null, steward_wait?: StewardWait | null, input_deliveries?: Array<InputDelivery>,
+parent_session_id?: string | null, steward_wait?: StewardWait | null, input_deliveries?: Array<InputDelivery>, managed_workspace?: ManagedWorkspace | null,
 /**
  * A title explicitly chosen by the user. [`Self::DEFAULT_TITLE`] means
  * no explicit title has been set, so [`Self::auto_title`] may be shown.

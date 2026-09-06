@@ -956,6 +956,52 @@ pub struct StewardWait {
     pub targets: Vec<StewardWaitTarget>,
 }
 
+/// Daemon-owned resources explicitly created for a code task. Legacy sessions have none.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct ManagedWorkspaceLocation {
+    #[ts(type = "string")]
+    pub path: PathBuf,
+    pub branch: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct ManagedWorkspace {
+    #[serde(default)]
+    pub revision: u64,
+    pub coordination: Option<ManagedWorkspaceLocation>,
+    pub task_id: Uuid,
+    pub name: String,
+    #[ts(type = "string")]
+    pub repository: PathBuf,
+    pub base_commit: String,
+    pub target_branch: String,
+    pub target_commit: String,
+    pub integration_branch: String,
+    pub branch: String,
+    #[ts(type = "string")]
+    pub path: PathBuf,
+    pub owned: bool,
+    pub ready: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum StewardWorkspaceOperation {
+    Begin {
+        name: String,
+        target_branch: String,
+        expected_commit: String,
+    },
+    Inspect {
+        session_id: Uuid,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct AgentSession {
     pub id: Uuid,
@@ -966,6 +1012,8 @@ pub struct AgentSession {
     pub steward_wait: Option<StewardWait>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_deliveries: Vec<InputDelivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_workspace: Option<ManagedWorkspace>,
     /// A title explicitly chosen by the user. [`Self::DEFAULT_TITLE`] means
     /// no explicit title has been set, so [`Self::auto_title`] may be shown.
     pub title: String,
@@ -1072,6 +1120,7 @@ impl AgentSession {
             parent_session_id: None,
             steward_wait: None,
             input_deliveries: Vec::new(),
+            managed_workspace: None,
             title: Self::DEFAULT_TITLE.to_owned(),
             auto_title: None,
             project_id,
@@ -1118,6 +1167,7 @@ impl AgentSession {
             parent_session_id: self.parent_session_id,
             steward_wait: self.steward_wait.clone(),
             input_deliveries: self.input_deliveries.clone(),
+            managed_workspace: self.managed_workspace.clone(),
             title: self.title.clone(),
             auto_title: self.auto_title.clone(),
             project_id: self.project_id,
@@ -1659,6 +1709,7 @@ impl AgentSession {
         fork.parent_session_id = None;
         fork.steward_wait = None;
         fork.input_deliveries.clear();
+        fork.managed_workspace = None;
         fork.title = Self::DEFAULT_TITLE.to_owned();
         fork.auto_title = Some(fork_title.to_owned());
         fork.status = SessionStatus::Idle;

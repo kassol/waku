@@ -143,6 +143,7 @@ pub struct ChildSessionSummary {
     rename_all_fields = "camelCase"
 )]
 pub enum Command {
+    StewardWorkspace { operation: crate::model::StewardWorkspaceOperation },
     StewardWait {
         session_ids: Vec<Uuid>,
     },
@@ -497,6 +498,7 @@ pub enum ResponseOutcome {
     rename_all_fields = "camelCase"
 )]
 pub enum ResponsePayload {
+    TaskWorkspace { session: AgentSession },
     StewardWait {
         wait: Option<StewardWait>,
         sessions: Vec<ChildSessionSummary>,

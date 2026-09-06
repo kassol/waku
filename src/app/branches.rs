@@ -6,6 +6,92 @@ enum BranchOperation {
 }
 
 impl Waku {
+    pub(super) fn begin_managed_code_task(
+        &mut self,
+        target_branch: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.selected_session().cloned() else {
+            return;
+        };
+        if session.has_started() || self.branch_operation_pending {
+            return;
+        }
+        let prompt = self.composer.read(cx).content(cx).trim();
+        let name = if prompt.is_empty() {
+            session.display_title().to_owned()
+        } else {
+            prompt.lines().next().unwrap().chars().take(80).collect()
+        };
+        let projects = self.state.projects.clone();
+        let live_session_ids = self
+            .state
+            .sessions
+            .iter()
+            .map(|session| session.id)
+            .collect();
+        let client = self.daemon.client();
+        self.branch_operation_pending = true;
+        cx.notify();
+        cx.spawn(async move |waku, cx| {
+            let session_id = session.id;
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    client.request(
+                        session_id,
+                        Uuid::nil(),
+                        waku_client::Command::SaveTaskState {
+                            projects,
+                            sessions: vec![session.clone()],
+                            live_session_ids,
+                        },
+                    )?;
+                    client.request(
+                        session_id,
+                        Uuid::nil(),
+                        waku_client::Command::StewardWorkspace {
+                            operation: waku_protocol::model::StewardWorkspaceOperation::Begin {
+                                name,
+                                target_branch,
+                                expected_commit: String::new(),
+                            },
+                        },
+                    )
+                })
+                .await;
+            let _ = waku.update(cx, |waku, cx| {
+                waku.branch_operation_pending = false;
+                match result {
+                    Ok(waku_client::ResponsePayload::TaskWorkspace { session }) => {
+                        if let Some(local) = waku
+                            .state
+                            .sessions
+                            .iter_mut()
+                            .find(|local| local.id == session_id)
+                        {
+                            local.workspace = session.workspace;
+                            local.managed_workspace = session.managed_workspace;
+                            if let Some(error) = local
+                                .managed_workspace
+                                .as_ref()
+                                .and_then(|task| task.error.clone())
+                            {
+                                waku.show_toast(error);
+                            }
+                        }
+                        waku.invalidate_workspace_queries(cx);
+                        waku.save();
+                    }
+                    Err(error) => waku.show_toast(error.to_string()),
+                    _ => waku.show_toast("Invalid task workspace response".to_owned()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn sync_branch_picker_rows(&self, rows: &[crate::git_branch::BranchEntry]) {
         let mut cached = self.branch_picker_row_cache.borrow_mut();
         if cached.as_slice() == rows {

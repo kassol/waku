@@ -1695,3 +1695,6 @@ fn failed_initial_child_save_disables_new_creation_before_provider_start() {
 
 #[path = "steward_tests.rs"]
 mod steward_tests;
+
+#[path = "task_workspace_socket_tests.rs"]
+mod task_workspace_socket_tests;

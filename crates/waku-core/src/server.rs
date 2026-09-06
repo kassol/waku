@@ -1231,6 +1231,7 @@ fn dispatch_steward(
                 | Command::StewardPrompt { .. }
                 | Command::StewardCancel { .. }
                 | Command::StewardWait { .. }
+                | Command::StewardWorkspace { .. }
         )
         && active
         && backend

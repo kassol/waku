@@ -75,3 +75,14 @@ creation, runtime start, option changes, and saved permission changes enforce
 the parent's permission limit. Across Claude and Codex, automatic approval
 modes have different authority: an explicit Ask child or a FullAccess parent
 provides the supported safe mapping.
+
+Managed code tasks use the explicit `StewardWorkspace` command before the root
+runtime starts. `begin` records the chosen target and commit, creates a separate
+coordination worktree for the root runtime, and reserves an integration worktree
+for daemon Git operations. Child worktrees start at a fixed integration commit.
+`waku_workspace` exposes scoped inspection; ordinary sessions keep their existing
+workspace behavior. All current provider runtimes can acquire write access, so
+managed resources reject another runtime at the same canonical execution path,
+including `inherit` and symlink aliases. Static queries do not acquire a writer.
+The daemon retains ownership through stale client saves and restarts. Failed
+creation retains its recorded resources; it never adopts an unrelated branch.

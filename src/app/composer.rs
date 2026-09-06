@@ -2860,7 +2860,9 @@ impl Waku {
         let workspace_path = self.workspace_path_for_session(session)?.to_path_buf();
         self.selected_project()
             .filter(|project| !project.is_projectless())?;
-        let branch_enabled = !session.is_busy() && !self.branch_operation_pending;
+        let branch_enabled = !session.is_busy()
+            && session.managed_workspace.is_none()
+            && !self.branch_operation_pending;
         let planned_worktree = matches!(workspace, SessionWorkspace::NewWorktree { .. });
         let snapshot = self.branch_snapshot_for_workspace(&workspace_path, cx)?;
         let selected_branch = match &workspace {
@@ -3287,7 +3289,7 @@ impl Waku {
             .unwrap_or_else(|| tr!("project.choose_project"));
         let can_configure_workspace = self
             .selected_session()
-            .is_some_and(|session| !session.has_started() && !session.is_busy());
+            .is_some_and(|session| !session.has_started() && session.managed_workspace.is_none() && !session.is_busy());
 
         let project_handle = self.menu_handle("workspace-project", cx);
         let project_trigger = MenuChip::new("workspace-project")
@@ -3428,6 +3430,72 @@ impl Waku {
         };
 
         let branch_selector = self.render_branch_selector(cx);
+        let task_workspace = self.selected_session().and_then(|session| {
+            if let Some(task) = &session.managed_workspace {
+                return Some(
+                    div()
+                        .px(px(7.0))
+                        .text_color(theme.text_secondary)
+                        .child(format!(
+                            "{} · {} → {} · base {} · owner {}{}",
+                            task.name,
+                            task.coordination
+                                .as_ref()
+                                .map_or(task.branch.as_str(), |location| location.branch.as_str()),
+                            task.target_branch,
+                            &task.base_commit[..task.base_commit.len().min(8)],
+                            &session.id.to_string()[..8],
+                            format!(
+                                " · integration {}{}",
+                                task.integration_branch,
+                                task.error
+                                    .as_ref()
+                                    .map(|error| format!(" · {error}"))
+                                    .unwrap_or_default()
+                            )
+                        ))
+                        .into_any_element(),
+                );
+            }
+            None
+        });
+        let begin_task = if self
+            .selected_session()
+            .is_some_and(|session| !session.has_started() && session.managed_workspace.is_none())
+            && !self.branch_operation_pending
+        {
+            self.visible_branch_snapshot
+                .as_ref()
+                .filter(|(path, _)| self.selected_workspace_path() == Some(path.as_path()))
+                .and_then(|(_, snapshot)| match &self.selected_session()?.workspace {
+                    SessionWorkspace::NewWorktree { base_branch } => base_branch.clone()
+                        .or_else(|| snapshot.default_branch.clone())
+                        .or_else(|| snapshot.current.clone()),
+                    _ => snapshot.current.clone(),
+                })
+                .map(|branch| {
+                    let focus = self.transcript_control_focus("begin-managed-code-task", cx);
+                    div()
+                        .id("begin-managed-code-task")
+                        .track_focus(&focus)
+                        .tab_index(0)
+                        .tab_stop(true)
+                        .px(px(7.0))
+                        .py(px(4.0))
+                        .rounded(px(4.0))
+                        .cursor_default()
+                        .text_color(theme.text_secondary)
+                        .focus_visible(|style| style.border_1().border_color(theme.accent))
+                        .hover(|style| style.bg(theme.overlay))
+                        .child("创建任务集成分支")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.begin_managed_code_task(branch.clone(), cx)
+                        }))
+                        .into_any_element()
+                })
+        } else {
+            None
+        };
 
         let usage_meter = self.render_usage_meter(cx);
         let steward_wait = self
@@ -3485,6 +3553,8 @@ impl Waku {
                     .child(project_selector)
                     .child(worktree_selector)
                     .children(branch_selector)
+                    .children(task_workspace)
+                    .children(begin_task)
                     .child(div().flex_1())
                     .children(usage_meter)
                     .children(steward_wait)
