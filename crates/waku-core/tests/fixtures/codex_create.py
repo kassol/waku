@@ -8,6 +8,8 @@ if '--version' in sys.argv:
     print('codex-cli 0.0.0')
     sys.exit(0)
 
+pathlib.Path('codex-args.json').write_text(json.dumps(sys.argv[1:]))
+
 def send(value):
     print(json.dumps(value), flush=True)
 

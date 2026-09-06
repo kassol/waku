@@ -281,6 +281,7 @@ onboarding.open_project_to_begin: プロジェクトを開いて始めましょ�
 onboarding.description: Waku は選択したフォルダでコーディングエージェントを実行します。コード、タスク、履歴はこのコンピュータに保存されます
 onboarding.web_description: デーモンホスト上のパスを選ぶか、プロジェクトなしで開始してください。
 onboarding.open_project_folder: プロジェクトフォルダを開く…
+onboarding.steward_hint: Git プロジェクトでは、タスクの委任と直属の子セッションの確認を依頼できます。承認と質問は各子セッションで処理します。
 onboarding.what_should_we_build: 何を作りましょうか？
 onboarding.what_should_we_build_in: ""
 onboarding.question_mark: " で何を作りましょうか？"

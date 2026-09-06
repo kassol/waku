@@ -1180,3 +1180,6 @@ fn query_preserves_failed_turn_reason_across_storage_restart() {
         },
     );
 }
+
+#[path = "recursion_tests.rs"]
+mod recursion_tests;

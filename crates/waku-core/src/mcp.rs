@@ -94,13 +94,14 @@ pub fn run_stdio(
                 "tools": [
                     {
                         "name": "waku_spawn_session",
-                        "description": "Create a direct Codex child in a new Git worktree. No automatic retry after a lost response.",
+                        "description": "Create a direct Claude or Codex child in a new Git worktree. No automatic retry after a lost response.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "provider": {
                                     "type": "string",
                                     "enum": [
+                                        "claude",
                                         "codex"
                                     ]
                                 },

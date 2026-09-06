@@ -2735,6 +2735,26 @@ impl Waku {
                             .child(tr_cow!("onboarding.question_mark"))
                     }),
             )
+            .when(
+                !projectless_selected
+                    && matches!(
+                        self.selected_session()
+                            .map_or(self.state.last_provider, |session| session.provider),
+                        ProviderKind::Claude | ProviderKind::Codex
+                    ),
+                |element| {
+                    element.child(
+                        div()
+                            .mt(px(10.0))
+                            .max_w(px(440.0))
+                            .text_center()
+                            .text_size(sp(12.5))
+                            .line_height(sp(19.0))
+                            .text_color(theme.text_secondary)
+                            .child(tr_cow!("onboarding.steward_hint")),
+                    )
+                },
+            )
     }
 }
 

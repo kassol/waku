@@ -267,6 +267,7 @@ onboarding.open_project_to_begin: 打开一个项目即可开始
 onboarding.description: Waku 会在你选择的文件夹中运行编程智能体。代码、任务和历史记录都保留在这台电脑上
 onboarding.web_description: 请选择守护进程主机上的路径，或在不使用项目的情况下开始。
 onboarding.open_project_folder: 打开项目文件夹…
+onboarding.steward_hint: 在 Git 项目中，可直接要求助手委派任务并查询直属子会话；审批和提问在子会话中处理。
 onboarding.what_should_we_build: 想构建什么？
 onboarding.what_should_we_build_in: "想在 "
 onboarding.question_mark: " 中构建什么？"

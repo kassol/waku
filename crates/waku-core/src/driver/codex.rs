@@ -203,7 +203,11 @@ fn configure_computer_use_command(command: &mut Command, config: Option<&CodexCo
 }
 
 impl CodexDriver {
-    pub fn start(options: DriverStartOptions, events: DriverEventSender) -> anyhow::Result<Self> {
+    pub fn start(
+        options: DriverStartOptions,
+        events: DriverEventSender,
+        mcp_config: Option<String>,
+    ) -> anyhow::Result<Self> {
         let DriverStartOptions {
             binary,
             cwd,
@@ -243,6 +247,13 @@ impl CodexDriver {
         let mut command = crate::command_env::command(&binary);
         command.args(["app-server", "--stdio"]);
         configure_computer_use_command(&mut command, computer_use.as_ref());
+        if let Some(config) = mcp_config {
+            let config: Value = serde_json::from_str(&config)?;
+            let server = &config["mcpServers"]["waku"];
+            let mut settings = toml::Value::try_from(server.clone())?;
+            settings.as_table_mut().unwrap().remove("type");
+            command.arg("-c").arg(format!("mcp_servers.waku={settings}"));
+        }
         let command = command
             .current_dir(&cwd)
             .stdin(Stdio::piped())
