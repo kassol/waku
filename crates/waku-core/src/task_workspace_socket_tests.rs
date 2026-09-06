@@ -99,7 +99,7 @@ fn managed_children_use_integration_commit_and_reject_shared_runtime_aliases() {
             options: crate::WireDriverStartOptions {
                 provider: "codex".into(),
                 binary: root.join("codex-fixture"),
-                cwd: alias,
+                cwd: alias.clone(),
                 mode: "ask".into(),
                 model: None,
                 reasoning_effort: None,
@@ -127,6 +127,103 @@ fn managed_children_use_integration_commit_and_reject_shared_runtime_aliases() {
             .unwrap_err()
             .to_string();
         assert!(error.contains("already owned"), "{error}");
+        let git_snapshot = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace_path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        let head_before = git_snapshot(&["rev-parse", "HEAD"]);
+        let status_before = git_snapshot(&["status", "--porcelain=v1", "--untracked-files=all"]);
+        let baseline_before = std::fs::read(workspace_path.join("integration-only")).unwrap();
+        let result_before = std::fs::read(workspace_path.join("child-result.txt")).unwrap();
+        for read_path in [&workspace_path, &alias] {
+            let ResponsePayload::Workspace {
+                result: crate::WorkspaceResult::TextFile { content },
+            } = client
+                .request(
+                    other.id,
+                    Uuid::nil(),
+                    Command::Workspace {
+                        operation: crate::WorkspaceOperation::ReadTextFile {
+                            root: read_path.clone(),
+                            relative_path: "integration-only".into(),
+                        },
+                    },
+                )
+                .unwrap()
+            else {
+                panic!("shared text read must remain available");
+            };
+            assert_eq!(content, "required baseline");
+            let ResponsePayload::Workspace {
+                result: crate::WorkspaceResult::ReviewDiff { data },
+            } = client
+                .request(
+                    other.id,
+                    Uuid::nil(),
+                    Command::Workspace {
+                        operation: crate::WorkspaceOperation::CollectReviewDiff {
+                            cwd: read_path.clone(),
+                            source: waku_protocol::workspace::ReviewDiffSource::Committed,
+                        },
+                    },
+                )
+                .unwrap()
+            else {
+                panic!("shared committed review must remain available");
+            };
+            assert_eq!(
+                data.source,
+                waku_protocol::workspace::ReviewDiffSource::Committed
+            );
+            assert!(
+                data.numstat.contains("integration-only"),
+                "{}",
+                data.numstat
+            );
+            assert!(data.patch.contains("+required baseline"), "{}", data.patch);
+            assert!(!data.patch.contains("child-result.txt"));
+            assert!(
+                matches!(client.request(child.id, runtime_id, Command::AttachSession).unwrap(),
+                ResponsePayload::SessionRuntime { runtime_id: Some(active), .. } if active == runtime_id)
+            );
+            assert!(matches!(
+                client
+                    .request(other.id, Uuid::nil(), Command::AttachSession)
+                    .unwrap(),
+                ResponsePayload::SessionRuntime {
+                    runtime_id: None,
+                    ..
+                }
+            ));
+            assert_eq!(git_snapshot(&["rev-parse", "HEAD"]), head_before);
+            assert_eq!(
+                git_snapshot(&["status", "--porcelain=v1", "--untracked-files=all"]),
+                status_before
+            );
+            assert_eq!(
+                std::fs::read(read_path.join("integration-only")).unwrap(),
+                baseline_before
+            );
+            assert_eq!(
+                std::fs::read(read_path.join("child-result.txt")).unwrap(),
+                result_before
+            );
+        }
+        let error = client
+            .request(other.id, Uuid::new_v4(), start.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already owned"), "{error}");
+
         client
             .request(child.id, runtime_id, Command::CloseSession)
             .unwrap();
