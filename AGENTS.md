@@ -108,3 +108,17 @@
 - Validate visible changes in the freshly rebuilt, signed app managed by the
   dev watcher against the exact provider interaction; a successful Rust build
   alone is insufficient.
+
+## Agent skills
+
+### Issue tracker
+
+Use GitHub Issues in `kassol/waku`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five default triage labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use single-context domain docs. See `docs/agents/domain.md`.
