@@ -3440,12 +3440,13 @@ impl Waku {
                     .w_full()
                     .max_w(px(CONTENT_MAX_WIDTH))
                     .mx_auto()
-                    .h(px(28.0))
+                    .min_h(px(28.0))
                     // The chip contributes 7px, lining its icon up with the
                     // composer's 10px padding plus the controls' 7px inset.
                     .pl(px(10.0))
                     .pr(px(10.0))
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(2.0))
                     .tab_index(0)
@@ -3457,7 +3458,8 @@ impl Waku {
                     .child(worktree_selector)
                     .children(branch_selector)
                     .child(div().flex_1())
-                    .children(usage_meter),
+                    .children(usage_meter)
+                    .children(self.render_history_persistence(cx)),
             )
     }
 }

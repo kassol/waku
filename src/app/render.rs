@@ -25,8 +25,9 @@ fn history_is_saved(session: &AgentSession, local_pending: bool) -> Option<bool>
 }
 
 impl Waku {
-    fn render_history_persistence(&self) -> Option<Div> {
+    pub(super) fn render_history_persistence(&self, cx: &App) -> Option<Div> {
         let session = self.selected_session()?;
+        let theme = Theme::current(cx);
         let message = if let Some(error) = &session.history_save_error {
             tr!("session.history_save_failed", error = error)
         } else {
@@ -35,12 +36,24 @@ impl Waku {
                 self.submission_preparations.contains(&session.id)
                     || self.state.is_session_dirty(session.id),
             )? {
-                tr!("session.history_saved")
+                return None;
             } else {
                 tr!("session.history_pending")
             }
         };
-        Some(div().px_4().py_1().text_size(px(12.0)).child(message))
+        Some(
+            div()
+                .px(px(7.0))
+                .text_color(if session.history_save_error.is_some() {
+                    theme.danger
+                } else {
+                    theme.text_secondary
+                })
+                .when(session.history_save_error.is_some(), |element| {
+                    element.w_full().whitespace_normal()
+                })
+                .child(message),
+        )
     }
 
     pub(super) fn render_panel_resize_handle(
@@ -408,7 +421,6 @@ impl Render for Waku {
                             .cached(StyleRefinement::default().flex_1().min_h(px(0.0)).w_full())
                             .into_any_element()
                     })
-                    .children(self.render_history_persistence())
                     .children(permission)
                     .when(self.selected_project().is_some(), |element| {
                         element
