@@ -7,8 +7,10 @@ and daemon-owned settings. It depends on the serializable contract in
 [`waku-protocol`](../waku-protocol), but contains no desktop transport or UI.
 
 The transport is an authenticated WebSocket (loopback by default). Requests
-have stable UUIDs for idempotency; session events carry monotonically
-increasing sequence numbers and runtime-generation IDs. The daemon commits
+have stable UUIDs for idempotency. Concurrent retransmissions share one
+execution and response; completed responses use a bounded in-memory cache.
+Session events carry monotonically increasing sequence numbers and
+runtime-generation IDs. The daemon commits
 ordered events and the shared readable-history projection in one SQLite
 transaction with WAL `synchronous=FULL`. Only a successful commit emits a
 `HistoryPersistence` acknowledgment. Failed batches remain available for retry.
@@ -36,3 +38,20 @@ Projectless task directories are daemon-owned too and live beneath
 
 The protocol types use Serde's tagged JSON representation and are exported by
 `waku-protocol`, including checked-in TypeScript bindings.
+
+`CreateSession` creates one Codex child from the request's parent session ID.
+The daemon validates the existing parent and Git project, creates a worktree
+beneath the task database directory, saves the child, and submits its first
+prompt. Success follows the provider's durable first-turn acceptance and
+returns the child ID, runtime ID, worktree path, and branch. Startup failures
+retain the workspace and readable failed history. Runtime replacement and
+removal are rejected while creation is in progress; no automatic retry or
+workspace cleanup is performed.
+
+The daemon assigns immutable `parent_session_id`. Client snapshots cannot
+reparent existing sessions or create that relationship, and manual response
+forks begin without a parent. Parent deletion preserves child history. Child
+creation, runtime start, option changes, and saved permission changes enforce
+the parent's permission limit. Across Claude and Codex, automatic approval
+modes have different authority: an explicit Ask child or a FullAccess parent
+provides the supported safe mapping.

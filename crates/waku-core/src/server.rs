@@ -62,7 +62,11 @@ pub trait Backend: Send + Sync + 'static {
     }
 
     /// Drain a previous provider before the hub replaces its runtime identity.
-    fn prepare_start(&self, _session_id: Uuid) -> anyhow::Result<()> {
+    fn prepare_start(
+        &self,
+        _session_id: Uuid,
+        _options: &crate::WireDriverStartOptions,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -74,16 +78,89 @@ pub struct EventSink {
     session_id: Uuid,
     runtime_id: Uuid,
     hub: Arc<Hub>,
+    creation_started: Option<Sender<Result<(), String>>>,
+}
+
+pub(crate) struct ChildCreationGuard {
+    session_id: Uuid,
+    hub: Arc<Hub>,
+}
+
+impl Drop for ChildCreationGuard {
+    fn drop(&mut self) {
+        self.hub
+            .state
+            .lock()
+            .creating_sessions
+            .remove(&self.session_id);
+    }
 }
 
 impl EventSink {
+    pub(crate) fn reserve_child(&self, session_id: Uuid) -> ChildCreationGuard {
+        self.hub.state.lock().creating_sessions.insert(session_id);
+        ChildCreationGuard {
+            session_id,
+            hub: self.hub.clone(),
+        }
+    }
+
+    pub(crate) fn begin_child(
+        &self,
+        session_id: Uuid,
+        runtime_id: Uuid,
+    ) -> (Self, Receiver<Result<(), String>>) {
+        self.hub.begin_runtime(session_id, runtime_id);
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let mut sink = self.hub.event_sink(session_id, runtime_id);
+        sink.creation_started = Some(sender);
+        (sink, receiver)
+    }
+
+    pub(crate) fn end_runtime(&self) {
+        self.hub.end_runtime(self.session_id, Some(self.runtime_id));
+    }
+
     pub fn send(&self, event: WireDriverEvent) -> anyhow::Result<()> {
         self.send_batch(vec![event])
     }
 
     pub fn send_batch(&self, events: Vec<WireDriverEvent>) -> anyhow::Result<()> {
-        self.hub
-            .emit_batch(self.session_id, self.runtime_id, events, true)
+        let started = self.creation_started.as_ref().and_then(|_| {
+            events.iter().find_map(|event| match event.kind.as_str() {
+                "turnStarted" => Some(Ok(())),
+                "error" => Some(Err(event
+                    .payload
+                    .as_str()
+                    .unwrap_or("provider startup failed")
+                    .to_owned())),
+                "processExited" => Some(Err(
+                    "provider exited before accepting the first prompt".into()
+                )),
+                _ => None,
+            })
+        });
+        let saved = self
+            .hub
+            .emit_batch(self.session_id, self.runtime_id, events, true);
+        // Creation completes only after provider acceptance is durable. The
+        // single-slot channel never blocks the ordinary event forwarding path.
+        if let Some(sender) = &self.creation_started {
+            if let Some(result) = saved
+                .as_ref()
+                .err()
+                .map(|error| Err(format!("{error:#}")))
+                .or(started)
+            {
+                let state = self.hub.state.lock();
+                if state.creating_sessions.contains(&self.session_id)
+                    && state.active_runtimes.get(&self.session_id) == Some(&self.runtime_id)
+                {
+                    let _ = sender.try_send(result);
+                }
+            }
+        }
+        saved
     }
 
     /// Broadcast a live-only event without retaining it in the replay journal.
@@ -103,10 +180,12 @@ struct HubState {
     task_state_revision: u64,
     subscribers: HashMap<u64, Sender<ServerMessage>>,
     active_runtimes: HashMap<Uuid, Uuid>,
+    creating_sessions: HashSet<Uuid>,
     next_sequences: HashMap<(Uuid, Uuid), u64>,
     journal: HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>,
     history_persistence: HashMap<(Uuid, Uuid), ServerMessage>,
     responses: VecDeque<(Uuid, ResponseOutcome)>,
+    response_waiters: HashMap<Uuid, Vec<Sender<ServerMessage>>>,
     catalog_projects: HashMap<Uuid, ProjectCatalogEntry>,
     catalog_sessions: HashMap<Uuid, SessionCatalogEntry>,
 }
@@ -198,6 +277,7 @@ impl Hub {
             session_id,
             runtime_id,
             hub: self.clone(),
+            creation_started: None,
         }
     }
 
@@ -420,6 +500,38 @@ impl Hub {
         });
     }
 
+    /// Reserve a UUID before dispatch. Retransmissions share the first
+    /// execution's response without occupying another worker or mailbox.
+    fn reserve_request(&self, request_id: Uuid, outgoing: &Sender<ServerMessage>) -> bool {
+        if request_id.is_nil() {
+            return true;
+        }
+        let mut state = self.state.lock();
+        if let Some(outcome) = state
+            .responses
+            .iter()
+            .rev()
+            .find_map(|(id, outcome)| (*id == request_id).then(|| outcome.clone()))
+        {
+            drop(state);
+            let _ = outgoing.send(ServerMessage::Response {
+                request_id,
+                outcome,
+            });
+            return false;
+        }
+        match state.response_waiters.entry(request_id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().push(outgoing.clone());
+                false
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Vec::new());
+                true
+            }
+        }
+    }
+
     fn cached_response(&self, request_id: Uuid) -> Option<ResponseOutcome> {
         self.state
             .lock()
@@ -430,10 +542,22 @@ impl Hub {
     }
 
     fn cache_response(&self, request_id: Uuid, outcome: ResponseOutcome) {
-        let mut state = self.state.lock();
-        state.responses.push_back((request_id, outcome));
-        while state.responses.len() > MAX_CACHED_RESPONSES {
-            state.responses.pop_front();
+        let waiters = {
+            let mut state = self.state.lock();
+            state.responses.push_back((request_id, outcome.clone()));
+            while state.responses.len() > MAX_CACHED_RESPONSES {
+                state.responses.pop_front();
+            }
+            state
+                .response_waiters
+                .remove(&request_id)
+                .unwrap_or_default()
+        };
+        for outgoing in waiters {
+            let _ = outgoing.send(ServerMessage::Response {
+                request_id,
+                outcome: outcome.clone(),
+            });
         }
     }
 }
@@ -453,6 +577,9 @@ impl RequestDispatcher {
         outgoing: Sender<ServerMessage>,
         source_subscriber_id: u64,
     ) {
+        if !self.hub.reserve_request(request.request_id, &outgoing) {
+            return;
+        }
         if command_targets_runtime(&request.command) {
             self.dispatch_runtime(request, outgoing, source_subscriber_id);
         } else {
@@ -939,6 +1066,7 @@ enum TaskCatalogAction {
     Load,
     Save { projects: Vec<Project> },
     Changed,
+    Created,
 }
 
 fn handle_request(
@@ -957,12 +1085,20 @@ fn handle_request(
         &request.command,
         Command::Start { .. } | Command::OpenTerminal { .. }
     );
+    let mut began_runtime = false;
     let (outcome, executed) = if !notification && let Some(cached) = hub.cached_response(request_id)
     {
         (cached, false)
     } else {
-        let prepared = if matches!(&request.command, Command::Start { .. }) {
-            backend.prepare_start(session_id)
+        let mutation = (command_targets_runtime(&request.command)
+            && !matches!(&request.command, Command::AttachSession))
+            || matches!(&request.command, Command::CreateSession { .. });
+        let prepared = if mutation && hub.state.lock().creating_sessions.contains(&session_id) {
+            Err(anyhow::anyhow!(
+                "child session creation is still in progress"
+            ))
+        } else if let Command::Start { options } = &request.command {
+            backend.prepare_start(session_id, options)
         } else {
             Ok(())
         };
@@ -971,6 +1107,7 @@ fn handle_request(
                 hub.confirm_drained_history(session_id, None);
             }
             hub.begin_runtime(session_id, runtime_id);
+            began_runtime = true;
         }
         let outcome = match prepared
             .and_then(|_| backend.handle(request, hub.event_sink(session_id, runtime_id)))
@@ -985,7 +1122,7 @@ fn handle_request(
         }
         (outcome, true)
     };
-    if executed && starts_runtime && matches!(&outcome, ResponseOutcome::Error { .. }) {
+    if began_runtime && matches!(&outcome, ResponseOutcome::Error { .. }) {
         hub.end_runtime(session_id, Some(runtime_id));
     }
     if executed {
@@ -1005,7 +1142,8 @@ fn handle_request(
                     payload: ResponsePayload::TaskStateSaved { sessions },
                 },
             ) => hub.task_state_saved(source_subscriber_id, projects, sessions),
-            (TaskCatalogAction::Changed, ResponseOutcome::Ok { .. }) => {
+            (TaskCatalogAction::Changed, ResponseOutcome::Ok { .. })
+            | (TaskCatalogAction::Created, _) => {
                 hub.task_state_changed(source_subscriber_id);
             }
             _ => {}
@@ -1022,6 +1160,7 @@ fn handle_request(
 
 fn task_catalog_action(command: &Command) -> TaskCatalogAction {
     match command {
+        Command::CreateSession { .. } => TaskCatalogAction::Created,
         Command::LoadTaskState => TaskCatalogAction::Load,
         Command::SaveTaskState { projects, .. } => TaskCatalogAction::Save {
             projects: projects.clone(),
@@ -2421,7 +2560,11 @@ mod tests {
     fn replacing_runtime_drains_old_history_before_changing_its_identity() {
         struct DrainingBackend(EventSink);
         impl Backend for DrainingBackend {
-            fn prepare_start(&self, _: Uuid) -> anyhow::Result<()> {
+            fn prepare_start(
+                &self,
+                _: Uuid,
+                _: &crate::WireDriverStartOptions,
+            ) -> anyhow::Result<()> {
                 self.0.send(WireDriverEvent::new(
                     "processExited",
                     serde_json::Value::Null,
@@ -2746,3 +2889,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "session_creation_tests.rs"]
+mod session_creation_tests;

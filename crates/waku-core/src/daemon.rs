@@ -20,7 +20,7 @@ use crate::computer_use::{ComputerTarget, ComputerUsePhase, ComputerUseState};
 use crate::driver::{self, DriverHandle, DriverStartOptions, SessionOptions};
 use crate::model::{
     ActivityKind, AgentSession, Checkpoint, CheckpointStatus, DriverEvent, PermissionOption,
-    Project, ProviderKind, ProviderResumeCursor, SessionStatus,
+    Project, ProviderKind, ProviderResumeCursor, RuntimeMode, SessionStatus,
 };
 use crate::persistence::{ComposerDraftStore, PersistedState, StateStore};
 use crate::settings::DaemonSettingsStore;
@@ -305,6 +305,165 @@ impl Backend for WakuBackend {
         let session_id = request.session_id;
         let runtime_id = request.runtime_id;
         match request.command {
+            Command::CreateSession {
+                provider,
+                prompt,
+                model,
+                title,
+                runtime_mode,
+            } => {
+                if provider != ProviderKind::Codex {
+                    bail!("child creation currently supports Codex only");
+                }
+                if prompt.trim().is_empty() {
+                    bail!("a child session requires a nonempty prompt");
+                }
+                let (parent, project) = {
+                    let mut state = self.task_state.lock();
+                    let parent = state
+                        .sessions
+                        .iter_mut()
+                        .find(|session| session.id == session_id)
+                        .ok_or_else(|| anyhow!("the parent session is unavailable"))?;
+                    self.task_store.hydrate(parent)?;
+                    if !parent.has_started()
+                        || !matches!(parent.provider, ProviderKind::Claude | ProviderKind::Codex)
+                    {
+                        bail!("the parent must be an existing Claude or Codex session");
+                    }
+                    let parent = parent.clone();
+                    let project = state
+                        .projects
+                        .iter()
+                        .find(|project| project.id == parent.project_id)
+                        .ok_or_else(|| anyhow!("the parent project is unavailable"))?
+                        .clone();
+                    (parent, project)
+                };
+                if project.is_projectless() {
+                    bail!("child worktrees require a Git project");
+                }
+                let mode = runtime_mode.unwrap_or(parent.runtime_mode);
+                validate_child_mode(parent.provider, parent.runtime_mode, mode)?;
+                let binary = self.provider_binary(provider)?;
+                let mut child = AgentSession::new(project.id, provider);
+                child.parent_session_id = Some(parent.id);
+                child.runtime_mode = mode;
+                child.model = model.clone();
+                child.set_title_from_prompt(&prompt);
+                if let Some(title) = title {
+                    child.set_title(title);
+                }
+                let worktree_root = self
+                    .task_store
+                    .path()
+                    .parent()
+                    .ok_or_else(|| anyhow!("the task database has no workspace directory"))?
+                    .join("worktrees");
+                let worktree = crate::worktree::create_in(
+                    &project.path,
+                    &worktree_root,
+                    project.id,
+                    child.id,
+                    &prompt,
+                    None,
+                )?;
+                child.workspace = crate::model::SessionWorkspace::Worktree {
+                    path: worktree.path.clone(),
+                    branch: worktree.branch.clone(),
+                };
+                let turn_id = child.begin_turn(prompt.clone());
+                let message_id = child.messages.last().expect("begin_turn adds its input").id;
+                child.status = SessionStatus::Connecting;
+                let child_id = child.id;
+                // Reserve the lifecycle before this child can appear in a
+                // catalog. Other clients may attach, but cannot replace or
+                // remove its provider while the first prompt is being accepted.
+                let _creation = events.reserve_child(child_id);
+                {
+                    let mut state = self.task_state.lock();
+                    let current_parent = state
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == parent.id)
+                        .ok_or_else(|| {
+                            anyhow!("the parent was removed during worktree creation")
+                        })?;
+                    validate_child_mode(
+                        current_parent.provider,
+                        current_parent.runtime_mode,
+                        mode,
+                    )?;
+                    state.push_session(child.clone());
+                    if let Err(error) = self.task_store.save(&mut state) {
+                        state.sessions.retain(|session| session.id != child_id);
+                        return Err(error).with_context(|| {
+                            format!(
+                                "could not save child {child_id}; worktree retained at {}",
+                                worktree.path.display()
+                            )
+                        });
+                    }
+                }
+                let child_runtime = Uuid::new_v4();
+                let (child_events, creation_started) = events.begin_child(child_id, child_runtime);
+                let start = self.handle(Request {
+                    request_id: Uuid::new_v4(), session_id: child_id, runtime_id: child_runtime,
+                    command: Command::Start { options: crate::WireDriverStartOptions {
+                        provider: "codex".into(), binary, cwd: worktree.path.clone(), mode: serde_json::to_value(mode)?.as_str().unwrap().to_owned(),
+                        model, reasoning_effort: None, service_tier: None, context_window: None, agent_preset: None,
+                        computer_use_enabled: false, provider_cursor: None,
+                    } },
+                }, child_events.clone()).and_then(|_| self.handle(Request {
+                    request_id: Uuid::new_v4(), session_id: child_id, runtime_id: child_runtime,
+                    command: Command::Prompt { prompt, turn_id: Some(turn_id), message_id: Some(message_id) },
+                }, child_events.clone())).and_then(|_| {
+                    creation_started.recv_timeout(std::time::Duration::from_secs(60))
+                        .context("timed out waiting for the child provider to accept its first prompt")?
+                        .map_err(anyhow::Error::msg)
+                });
+                if let Err(error) = start {
+                    let message = format!(
+                        "could not start child {child_id} in {}: {error:#}",
+                        worktree.path.display()
+                    );
+                    let saved = child_events.send_batch(vec![
+                        event_to_wire(DriverEvent::Error(message.clone()))?,
+                        event_to_wire(DriverEvent::TurnFinished {
+                            success: false,
+                            summary: Some(message.clone()),
+                        })?,
+                    ]);
+                    let stopped = self.close_runtime(child_id, Some(child_runtime));
+                    if saved.is_ok() && stopped.is_ok() {
+                        child_events.end_runtime();
+                    }
+                    return Err(anyhow!(
+                        "{message}; history save: {}; provider stop: {}",
+                        saved
+                            .err()
+                            .map_or("saved".into(), |error| error.to_string()),
+                        stopped
+                            .err()
+                            .map_or("stopped".into(), |error| error.to_string())
+                    ));
+                }
+                let session = self
+                    .task_state
+                    .lock()
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == child_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("the child was removed while starting"))?;
+                Ok(ResponsePayload::SessionCreated {
+                    session,
+                    runtime_id: child_runtime,
+                    turn_id,
+                    workspace_path: worktree.path,
+                    branch: worktree.branch,
+                })
+            }
             Command::AttachSession => {
                 let sessions = self.sessions.lock();
                 let Some((runtime_id, driver)) = sessions.get(&session_id) else {
@@ -449,6 +608,44 @@ impl Backend for WakuBackend {
                     .collect::<HashMap<_, _>>();
                 let mut state = self.task_state.lock();
                 let removed_session_ids = self.removed_session_ids.lock();
+                // Validate every submitted permission before mutating the catalog.
+                // Parent identity always comes from the daemon's stored row.
+                for incoming in &sessions {
+                    if removed_session_ids.contains(&incoming.id) {
+                        continue;
+                    }
+                    validate_child_options(
+                        &self.task_store,
+                        &mut state,
+                        incoming.id,
+                        incoming.provider,
+                        incoming.runtime_mode,
+                    )?;
+                    if let Some(existing) = state
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == incoming.id)
+                    {
+                        if let Some(parent_id) = existing.parent_session_id {
+                            if incoming.provider != ProviderKind::Codex {
+                                bail!("a Codex child cannot switch provider");
+                            }
+                            if incoming.detail_loaded
+                                && let Some(parent) = sessions.iter().find(|session| {
+                                    session.id == parent_id && session.detail_loaded
+                                })
+                            {
+                                validate_child_mode(
+                                    parent.provider,
+                                    parent.runtime_mode,
+                                    incoming.runtime_mode,
+                                )?;
+                            }
+                        }
+                    } else if incoming.parent_session_id.is_some() {
+                        bail!("only daemon creation can assign a parent session");
+                    }
+                }
                 for project in projects {
                     if let Some(existing) = state
                         .projects
@@ -478,6 +675,7 @@ impl Backend for WakuBackend {
                         // Startup catalogs are skeletons. Read the authoritative
                         // cursor before accepting any full client projection.
                         self.task_store.hydrate(existing)?;
+                        session.parent_session_id = existing.parent_session_id;
                         if existing.runtime_event_cursor.is_some()
                             || session_projection_precedes(
                                 existing,
@@ -872,6 +1070,13 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             Command::Start { options } => {
+                validate_child_options(
+                    &self.task_store,
+                    &mut self.task_state.lock(),
+                    session_id,
+                    decode_enum(&options.provider)?,
+                    decode_enum(&options.mode)?,
+                )?;
                 self.close_runtime(session_id, None)?;
                 self.history.lock().retain(|(id, _), _| *id != session_id);
                 self.pending_history
@@ -958,6 +1163,15 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             command => {
+                if let Command::ApplyOptions { options } = &command {
+                    validate_child_options(
+                        &self.task_store,
+                        &mut self.task_state.lock(),
+                        session_id,
+                        ProviderKind::Codex,
+                        decode_enum(&options.mode)?,
+                    )?;
+                }
                 let driver = {
                     let sessions = self.sessions.lock();
                     let (active_runtime_id, driver) = sessions
@@ -1004,7 +1218,18 @@ impl Backend for WakuBackend {
         }
     }
 
-    fn prepare_start(&self, session_id: Uuid) -> anyhow::Result<()> {
+    fn prepare_start(
+        &self,
+        session_id: Uuid,
+        options: &crate::WireDriverStartOptions,
+    ) -> anyhow::Result<()> {
+        validate_child_options(
+            &self.task_store,
+            &mut self.task_state.lock(),
+            session_id,
+            decode_enum(&options.provider)?,
+            decode_enum(&options.mode)?,
+        )?;
         self.close_runtime(session_id, None)
     }
 
@@ -1014,6 +1239,73 @@ impl Backend for WakuBackend {
         let terminals = std::mem::take(&mut *self.terminals.lock());
         drop(terminals);
     }
+}
+
+fn validate_child_options(
+    store: &StateStore,
+    state: &mut PersistedState,
+    session_id: Uuid,
+    provider: ProviderKind,
+    mode: RuntimeMode,
+) -> anyhow::Result<()> {
+    let Some(index) = state
+        .sessions
+        .iter()
+        .position(|session| session.id == session_id)
+    else {
+        return Ok(());
+    };
+    let Some(parent_id) = state.sessions[index].parent_session_id else {
+        return Ok(());
+    };
+    if provider != ProviderKind::Codex {
+        bail!("a Codex child cannot switch provider");
+    }
+    store.hydrate(&mut state.sessions[index])?;
+    if let Some(parent) = state
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == parent_id)
+    {
+        store.hydrate(parent)?;
+        validate_child_mode(parent.provider, parent.runtime_mode, mode)
+    } else {
+        // Removing a parent preserves child history. A surviving child may
+        // resume or lower its last saved permission, but cannot raise it.
+        validate_child_mode(
+            ProviderKind::Codex,
+            state.sessions[index].runtime_mode,
+            mode,
+        )
+    }
+}
+
+fn validate_child_mode(
+    parent_provider: ProviderKind,
+    parent: RuntimeMode,
+    child: RuntimeMode,
+) -> anyhow::Result<()> {
+    // Claude's auto approval classifier and Codex's auto_review approver have
+    // different authority. Their matching enum names do not establish a safe
+    // permission mapping. Ask and an unrestricted parent are unambiguous.
+    let allowed = if parent_provider != ProviderKind::Codex {
+        child == RuntimeMode::Ask || parent == RuntimeMode::FullAccess
+    } else {
+        match parent {
+            RuntimeMode::Ask => child == RuntimeMode::Ask,
+            RuntimeMode::AutoAcceptEdits => {
+                matches!(child, RuntimeMode::Ask | RuntimeMode::AutoAcceptEdits)
+            }
+            RuntimeMode::Auto => child != RuntimeMode::FullAccess,
+            RuntimeMode::FullAccess => true,
+        }
+    };
+    if !allowed {
+        bail!(
+            "child permissions exceed the parent's safe provider mapping; request Ask or lower permissions"
+        );
+    }
+    Ok(())
 }
 
 fn session_projection_precedes(
@@ -1919,7 +2211,8 @@ fn handle_driver_command(
             let cursor = Some(serde_json::to_value(driver.fork(turns_to_remove)?)?);
             return Ok(ResponsePayload::Cursor { cursor });
         }
-        Command::AttachSession
+        Command::CreateSession { .. }
+        | Command::AttachSession
         | Command::Start { .. }
         | Command::GetSettings
         | Command::UpdateSettings { .. }

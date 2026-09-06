@@ -132,6 +132,7 @@ pub(super) fn merge_remote_session_catalog(
             local.title = remote.title;
             local.auto_title = remote.auto_title;
             local.project_id = remote.project_id;
+            local.parent_session_id = remote.parent_session_id;
             local.provider = remote.provider;
             local.model = remote.model;
             local.created_at = remote.created_at;

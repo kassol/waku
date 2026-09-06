@@ -912,6 +912,9 @@ pub struct RuntimeEventCursor {
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct AgentSession {
     pub id: Uuid,
+    /// Immutable creator assigned by the daemon; retained when that parent is removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<Uuid>,
     /// A title explicitly chosen by the user. [`Self::DEFAULT_TITLE`] means
     /// no explicit title has been set, so [`Self::auto_title`] may be shown.
     pub title: String,
@@ -1010,6 +1013,7 @@ impl AgentSession {
         let now = unix_time();
         Self {
             id: Uuid::new_v4(),
+            parent_session_id: None,
             title: Self::DEFAULT_TITLE.to_owned(),
             auto_title: None,
             project_id,
@@ -1051,6 +1055,7 @@ impl AgentSession {
     pub fn list_projection(&self) -> Self {
         Self {
             id: self.id,
+            parent_session_id: self.parent_session_id,
             title: self.title.clone(),
             auto_title: self.auto_title.clone(),
             project_id: self.project_id,
@@ -1578,6 +1583,7 @@ impl AgentSession {
 
         let now = unix_time();
         fork.id = fork_id;
+        fork.parent_session_id = None;
         fork.title = Self::DEFAULT_TITLE.to_owned();
         fork.auto_title = Some(fork_title.to_owned());
         fork.status = SessionStatus::Idle;
@@ -4218,6 +4224,7 @@ mod tests {
     fn response_fork_is_a_distinct_idle_session_through_the_selected_turn() {
         let project = Project::from_path(PathBuf::from("/tmp/waku"));
         let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.parent_session_id = Some(Uuid::new_v4());
 
         let first_turn = session.begin_turn("first");
         let first_message = session.push_message(MessageRole::Assistant, "first answer");
@@ -4237,6 +4244,7 @@ mod tests {
             .unwrap();
 
         assert_ne!(fork.id, session.id);
+        assert_eq!(fork.parent_session_id, None);
         assert_eq!(fork.title, AgentSession::DEFAULT_TITLE);
         assert_eq!(fork.auto_title.as_deref(), Some("New task (2)"));
         assert_eq!(fork.status, SessionStatus::Idle);

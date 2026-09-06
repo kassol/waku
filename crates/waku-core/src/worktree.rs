@@ -35,7 +35,7 @@ pub fn create(
     )
 }
 
-fn create_in(
+pub(crate) fn create_in(
     project_path: &Path,
     worktree_root: &Path,
     project_id: Uuid,

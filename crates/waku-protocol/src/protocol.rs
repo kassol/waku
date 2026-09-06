@@ -9,7 +9,7 @@ use crate::attachments::{AttachmentUpload, StoredAttachment};
 use crate::computer_use::ComputerPermissions;
 use crate::model::{
     AgentSession, GoalOperation, Project, ProviderKind, ProviderProbe, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, UserInputAnswer,
+    ProviderSessionHistory, ProviderSessionSummary, RuntimeMode, UserInputAnswer,
 };
 use crate::persistence::{ComposerDraftChange, ComposerDrafts, SessionMessageMatch};
 use crate::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
@@ -19,7 +19,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -77,6 +77,17 @@ pub struct ReplayCursor {
     rename_all_fields = "camelCase"
 )]
 pub enum Command {
+    /// Create a direct child of Request.session_id on the daemon host.
+    CreateSession {
+        provider: ProviderKind,
+        prompt: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        runtime_mode: Option<RuntimeMode>,
+    },
     /// Resolve the daemon-owned provider runtime for an existing task.
     ///
     /// Clients use this after reconnecting or opening the same daemon from a
@@ -385,6 +396,13 @@ pub enum ResponseOutcome {
     rename_all_fields = "camelCase"
 )]
 pub enum ResponsePayload {
+    SessionCreated {
+        session: AgentSession,
+        runtime_id: Uuid,
+        turn_id: Uuid,
+        workspace_path: PathBuf,
+        branch: String,
+    },
     Ack,
     SessionRuntime {
         runtime_id: Option<Uuid>,
@@ -544,7 +562,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 
     #[test]
@@ -553,7 +571,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 
     #[test]

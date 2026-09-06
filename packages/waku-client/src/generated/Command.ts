@@ -10,6 +10,7 @@ import type { ProviderKind } from "./ProviderKind";
 import type { ProviderResumeCursor } from "./ProviderResumeCursor";
 import type { ProviderSessionForkRequest } from "./ProviderSessionForkRequest";
 import type { ReplayCursor } from "./ReplayCursor";
+import type { RuntimeMode } from "./RuntimeMode";
 import type { UsageWindow } from "./UsageWindow";
 import type { UserInputAnswer } from "./UserInputAnswer";
 import type { WireComputerToolRequest } from "./WireComputerToolRequest";
@@ -18,7 +19,7 @@ import type { WireSessionOptions } from "./WireSessionOptions";
 import type { WorkspaceOperation } from "./WorkspaceOperation";
 import type { JsonValue } from "./serde_json/JsonValue";
 
-export type Command = { "type": "attachSession" } | { "type": "start", options: WireDriverStartOptions, } | { "type": "prompt", prompt: string,
+export type Command = { "type": "createSession", provider: ProviderKind, prompt: string, model: string | null, title: string | null, runtimeMode: RuntimeMode | null, } | { "type": "attachSession" } | { "type": "start", options: WireDriverStartOptions, } | { "type": "prompt", prompt: string,
 /**
  * The ids the submitting client already gave this turn and its user
  * message. The daemon republishes them with the submission so every

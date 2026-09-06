@@ -1396,6 +1396,7 @@ function mergeSessionSummary(previous: AgentSession, next: AgentSession): AgentS
   return {
     ...previous,
     title: next.title,
+    parent_session_id: next.parent_session_id,
     auto_title: next.auto_title,
     project_id: next.project_id,
     workspace: next.workspace,
