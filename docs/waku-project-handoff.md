@@ -4,11 +4,11 @@
 
 ## 当前扩展与交付边界
 
-管家协作扩展已按 [Issue #13](https://github.com/kassol/waku/issues/13) 的[协作规格](waku-steward-orchestration-spec.md)实现可靠 steer/反馈排队、独立即时交流、动态分工与任务集成分支、安全清理，并补充公共接口回归。9 张纵向任务 #14–#22 的完整验收尚未结束，均未关闭；见[任务清单](waku-steward-orchestration-tickets.md)和[本轮验收记录](waku-steward-orchestration-acceptance.md)。签名 Debug App 的后台 CUA 交互受阻，原生界面验收待完成；自动化通过项不替代该验收。
+2026-09-07，管家协作扩展已按 [Issue #13](https://github.com/kassol/waku/issues/13) 的[协作规格](waku-steward-orchestration-spec.md)实现可靠 steer/反馈排队、独立即时交流、动态分工与任务集成分支、安全清理。`c431614` 的 Rust 全量 985 项通过、29 项忽略、0 失败，共享客户端 46 项及三端类型检查通过。9 张纵向任务 #14–#22 的公共组合流程和签名 Debug App 原生交互验收完成，任务待关闭；见[任务清单](waku-steward-orchestration-tickets.md)和[本轮验收记录](waku-steward-orchestration-acceptance.md)。原生复核覆盖真实 Claude 只读长答复、讨论前后父子快照不变、对话框键盘循环、明确指令原文与接收回执，以及两项依赖成果整合交付、清理状态和保留历史。
 
 用户已批准新增 `waku_wait`，详见[管家等待与完成通知](waku-steward-wait.md)。一期六工具验收仍为历史基线。管家登记持久等待后结束当前轮；父轮成功结束且子轮次可处理时，由 daemon 的事件回调自动开启一次通知轮。即时交流查询保留等待。经可靠输入提交的用户 steer 在受理或待核实时暂停旧等待回调，接收确认后撤销同轮旧等待，明确失败允许旧等待继续；新计划按需登记新等待。普通新轮输入、取消及父轮失败或中断继续遵循原有撤销边界。
 
-本轮禁止替换运行中的 `Waku Steward.app`，交付包待用户结束当前工作后安装。以下历史构建、安装与验收记录不代表本次扩展的交付状态。
+用户已明确授权验收后推送、关闭任务并更新安装 `Waku Steward.app`，此前暂缓替换的边界已更新。当前 Steward 待安装；安装后须补记签名、启动与既有历史保护核验。原版 `Waku.app` 继续保持隔离，不得替换或修改。以下历史构建、安装与验收记录不代表本次扩展的安装状态。
 
 ## 已有资料（引用，不重做）
 
@@ -83,7 +83,7 @@ Matt 流程产生仓库产物时，遵循用户的独立提交及默认 push 约
 
 ## 安全退出实现基线
 
-- 2026-09-06 后续修复：daemon 终端关闭在发送 HUP 和等待子进程退出期间继续读取输出，避免 PTY 排空受阻；自有 shell 超过 2 秒仍未退出时发送 KILL，再停止输出读取。只处理持有的子进程。本轮安装中的 Steward 保持不变。
+- 2026-09-06 后续修复：daemon 终端关闭在发送 HUP 和等待子进程退出期间继续读取输出，避免 PTY 排空受阻；自有 shell 超过 2 秒仍未退出时发送 KILL，再停止输出读取。只处理持有的子进程。该次修复验证期间安装中的 Steward 保持不变。
 
 - macOS 菜单退出先返回 `NSTerminateCancel`，让 GPUI 主队列继续完成保存与 daemon 排空；成功后经 `cx.quit()` 异步发起第二次退出，一次性允许 `NSTerminateNow`。禁止在此使用 `NSTerminateLater`，它的嵌套循环会阻塞主队列中的保存任务。`cargo run --example quit_bridge_probe` 在隐藏窗口验证真实退出桥、保存失败重试及最终退出；旧实现会在 5 秒看门狗处失败。
 - 独立 Steward 优化安装包已验证原生应用菜单 Quit：窗口与自有 daemon 均正常退出，后台重开后历史消息与轮次数量一致。系统外部发起的退出与应用主队列发起的退出必须分别覆盖，前者成功不能证明后者正常。
@@ -129,7 +129,7 @@ Matt 流程产生仓库产物时，遵循用户的独立提交及默认 push 约
 ## 后续输入与取消实现边界
 
 - `waku_prompt` 向直属 Claude/Codex 子会话投递：空闲时开始保存后的新轮，忙碌且支持 steer 时发送当前轮输入，明确不支持时持久排队。等待用户或取消未确认时拒绝普通输入。`delivery_id` 绑定调用者、目标与原文，同键重试返回原记录，`waku_prompt_status` 查询实际状态；投递及查询重验关系与权限。
-- daemon 提交前保存受理记录；Codex 确认 provider 接收，Claude 确认传输接收。部分写入、断连、确认丢失或重启后的不确定输入不自动重发。持久队列按受理顺序消费，出队再次核对当前轮次、权限和用户等待；具体边界见[可靠输入说明](waku-steward-input.md)。这些扩展的实际检查和未完成项见[本轮验收记录](waku-steward-orchestration-acceptance.md)。
+- daemon 提交前保存受理记录；Codex 确认 provider 接收，Claude 确认传输接收。部分写入、断连、确认丢失或重启后的不确定输入不自动重发。持久队列按受理顺序消费，出队再次核对当前轮次、权限和用户等待；具体边界见[可靠输入说明](waku-steward-input.md)。这些扩展的实际验收及安装状态见[本轮验收记录](waku-steward-orchestration-acceptance.md)。
 - `waku_cancel` 返回独立的 accepted 与 stopped。取消受理保留开放轮次；provider 中断、结束或进程退出确认后才显示 Interrupted。取消按当前轮次记录，保留历史和工作区；Codex 忽略旧轮次的迟到结束通知。Claude 仍有后台任务时请求关闭原生运行时，保持开放轮次直到进程退出确认。
 - 桌面及共享 TypeScript 客户端沿用同一停止边界。真实 Claude 经 MCP 向 Astra 提交后续输入并精确返回标记；第二轮实际执行 sleep 60，取消先受理、18 秒时确认 Interrupted，状态/结果及保存历史一致，#9 已验收。自动回归使用临时数据库、Git 目录和可控子进程。
 
