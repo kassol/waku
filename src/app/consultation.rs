@@ -240,11 +240,10 @@ impl Waku {
         let theme = Theme::current(cx);
         let record = dialog.record.clone();
         let rows = dialog.rows.clone();
-        let scroll_rows = rows.clone();
         let count = record
             .as_ref()
             .map_or(0, |r| r.exchanges.len() + r.instructions.len());
-        let history = list(rows, move |index, _, cx| {
+        let history = list(rows.clone(), move |index, _, cx| {
             let theme = Theme::current(cx);
             let Some(record) = record.as_ref() else {
                 return div().into_any_element();
@@ -378,31 +377,7 @@ impl Waku {
                 .into_any_element()
         })
         .size_full();
-        let history = div()
-            .id("consultation-history")
-            .track_focus(&dialog.history_focus)
-            .tab_index(0)
-            .tab_stop(true)
-            .h(px(300.0))
-            .focus_visible(|s| s.border_1().border_color(theme.accent))
-            .on_key_down(move |event, _, cx| {
-                if count == 0 {
-                    return;
-                }
-                let offset = scroll_rows.logical_scroll_top();
-                let next = match event.keystroke.key.as_str() {
-                    "up" => offset.item_ix.saturating_sub(1),
-                    "down" => (offset.item_ix + 1).min(count.saturating_sub(1)),
-                    "home" => 0,
-                    "end" => count.saturating_sub(1),
-                    _ => return,
-                };
-                scroll_rows.scroll_to(ListOffset {
-                    item_ix: next,
-                    offset_in_item: px(0.0),
-                });
-                cx.stop_propagation();
-            })
+        let history = consultation_history(rows.clone(), &dialog.history_focus, count, theme, cx)
             .child(history);
         let can_send = !dialog.pending;
         let card = div()
@@ -604,5 +579,108 @@ impl Waku {
             )
             .child(card);
         Some(gpui::deferred(layer).with_priority(4).into_any_element())
+    }
+}
+
+fn consultation_history<T: 'static>(
+    scroll_rows: ListState,
+    focus: &FocusHandle,
+    count: usize,
+    theme: Theme,
+    cx: &mut Context<T>,
+) -> Stateful<Div> {
+    div()
+        .id("consultation-history")
+        .track_focus(focus)
+        .tab_index(0)
+        .tab_stop(true)
+        .h(px(300.0))
+        .focus_visible(|s| s.border_1().border_color(theme.accent))
+        .on_key_down(cx.listener(move |_, event: &KeyDownEvent, _, cx| {
+            if count == 0 {
+                return;
+            }
+            match event.keystroke.key.as_str() {
+                "up" => scroll_rows.scroll_by(px(-40.0)),
+                "down" => scroll_rows.scroll_by(px(40.0)),
+                "pageup" => scroll_rows.scroll_by(px(-300.0)),
+                "pagedown" => scroll_rows.scroll_by(px(300.0)),
+                "home" => scroll_rows.scroll_to(ListOffset {
+                    item_ix: 0,
+                    offset_in_item: px(0.0),
+                }),
+                "end" => scroll_rows.scroll_to_end(),
+                _ => return,
+            }
+            cx.notify();
+            cx.stop_propagation();
+        }))
+}
+
+#[cfg(test)]
+mod history_keyboard_tests {
+    use super::*;
+
+    struct HistoryView {
+        rows: ListState,
+        focus: FocusHandle,
+        renders: usize,
+    }
+
+    impl Render for HistoryView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            consultation_history(self.rows.clone(), &self.focus, 1, Theme::dark(), cx)
+                .w(px(400.0))
+                .child(
+                    list(self.rows.clone(), |_, _, _| {
+                        div()
+                            .h(px(900.0))
+                            .w_full()
+                            .child("A long, completed consultation answer.\n".repeat(40))
+                            .into_any_element()
+                    })
+                    .size_full(),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn static_long_answer_scrolls_and_repaints_by_keyboard(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| HistoryView {
+            rows: ListState::new(1, ListAlignment::Bottom, px(256.0)),
+            focus: cx.focus_handle(),
+            renders: 0,
+        });
+        let (rows, focus) =
+            cx.read_entity(&view, |view, _| (view.rows.clone(), view.focus.clone()));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_keystrokes("home");
+        cx.run_until_parked();
+        assert_eq!(rows.logical_scroll_top().offset_in_item, px(0.0));
+        for (key, expected) in [
+            ("down", 40.0),
+            ("end", 600.0),
+            ("up", 560.0),
+            ("pageup", 260.0),
+            ("pagedown", 560.0),
+            ("home", 0.0),
+        ] {
+            let renders = cx.read_entity(&view, |view, _| view.renders);
+            cx.simulate_keystrokes(key);
+            cx.run_until_parked();
+            assert_eq!(rows.logical_scroll_top().item_ix, 0, "{key}");
+            assert_eq!(
+                rows.logical_scroll_top().offset_in_item,
+                px(expected),
+                "{key}"
+            );
+            assert!(
+                cx.read_entity(&view, |view, _| view.renders) > renders,
+                "{key} must repaint the owner without provider events"
+            );
+            let bounds = rows.bounds_for_item(0).expect("answer remains rendered");
+            assert_eq!(bounds.size.height, px(900.0));
+        }
     }
 }
