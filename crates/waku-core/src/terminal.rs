@@ -162,20 +162,102 @@ mod platform {
 
     impl Drop for DaemonTerminal {
         fn drop(&mut self) {
-            self.stopped.store(true, Ordering::Release);
-            // The output reader may be blocked in `read` while the shell is
-            // idle. Alacritty hangs the child up when its PTY is dropped, but
-            // the reader owns another `Arc` to that PTY, so waiting for the
-            // reader first would keep both the child and its slave fd alive.
-            // Terminate the shell before joining so the master read wakes and
-            // the reader can observe `stopped`.
-            let child_pid = self.pty.lock().child().id() as libc::pid_t;
-            unsafe {
-                libc::kill(child_pid, libc::SIGHUP);
+            // Keep the owned child waitable until signaling is finished. A
+            // shell may ignore HUP; Alacritty's Drop would then wait forever.
+            // Keep reading output during shutdown: macOS can wait for PTY
+            // output to drain while the shell exits.
+            {
+                let pty = self.pty.lock();
+                let child = pty.child();
+                if matches!(child_is_running(child), Ok(true)) {
+                    unsafe {
+                        libc::kill(child.id() as libc::pid_t, libc::SIGHUP);
+                    }
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    while matches!(child_is_running(child), Ok(true)) {
+                        if std::time::Instant::now() >= deadline {
+                            unsafe {
+                                libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+                            }
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
             }
+            self.stopped.store(true, Ordering::Release);
             if let Some(reader) = self.reader.take() {
                 let _ = reader.join();
             }
+        }
+    }
+
+    fn child_is_running(child: &std::process::Child) -> std::io::Result<bool> {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        let info = unsafe { info.assume_init() };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(info.si_signo == 0)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn terminal_close_bounds_a_shell_that_ignores_hangup() {
+            let root =
+                std::env::temp_dir().join(format!("waku-terminal-close-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let options = tty::Options {
+                shell: Some(Shell::new(
+                    "/bin/sh".into(),
+                    vec![
+                        "-c".into(),
+                        "trap '' HUP; printf ready > ready; while [ ! -e release ]; do :; done"
+                            .into(),
+                    ],
+                )),
+                working_directory: Some(root.clone()),
+                ..Default::default()
+            };
+            let pty = tty::new(&options, window_size(80, 24), 0).unwrap();
+            let terminal = DaemonTerminal {
+                pty: Arc::new(Mutex::new(pty)),
+                stopped: Arc::new(AtomicBool::new(false)),
+                reader: None,
+            };
+            // Also release the old unbounded implementation so its red test
+            // finishes without leaving a fixture process behind.
+            let release_root = root.clone();
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(4));
+                std::fs::write(release_root.join("release"), "").unwrap();
+            });
+            let ready_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !root.join("ready").exists() && std::time::Instant::now() < ready_deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let ready = root.join("ready").exists();
+            let started = std::time::Instant::now();
+            drop(terminal);
+            let elapsed = started.elapsed();
+            release.join().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(ready, "shell must install its HUP handler before close");
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "terminal close took {elapsed:?}"
+            );
         }
     }
 
