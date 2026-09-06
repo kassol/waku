@@ -10,6 +10,8 @@ struct CoordinationTools {
     calls: Vec<String>,
     seen: HashSet<String>,
     repeated_results: usize,
+    last_status: Option<serde_json::Value>,
+    unchanged_queries: usize,
 }
 impl CoordinationTools {
     fn call(&mut self, name: &str, arguments: serde_json::Value) -> serde_json::Value {
@@ -31,6 +33,20 @@ impl CoordinationTools {
                     self.repeated_results += 1;
                 }
             }
+        }
+        if name == "waku_result" {
+            let version = json!({"session":result["session"]["session_id"],"turn":result["session"]["turn"],"reply":result["reply"],"error":result["session"]["error"],"waiting":result["session"]["waiting_for"]});
+            if !self.seen.insert(version.to_string()) {
+                self.repeated_results += 1;
+            }
+        }
+        if name == "waku_status" {
+            let states = result["sessions"].as_array().unwrap().iter().map(|session| json!({"session":session["session_id"],"turn":session["turn"],"error":session["error"],"waiting":session["waiting_for"]})).collect::<Vec<_>>();
+            let snapshot = json!(states);
+            if self.last_status.as_ref() == Some(&snapshot) {
+                self.unchanged_queries += 1;
+            }
+            self.last_status = Some(snapshot);
         }
         result
     }
@@ -110,6 +126,25 @@ fn completed(session: &AgentSession) -> bool {
 
 #[test]
 fn mcp_coordination_batches_reviews_feedback_wait_and_dependency_evidence() {
+    let current = run_coordination_strategy(false);
+    let repetitive = run_coordination_strategy(true);
+    for metric in [
+        "unchanged_queries",
+        "repeated_result_reads",
+        "avoidable_repeated_validations",
+    ] {
+        assert!(
+            current[metric].as_u64().unwrap() < repetitive[metric].as_u64().unwrap(),
+            "strategy contrast did not measure a difference in {metric}"
+        );
+    }
+    // This controlled comparison exercises query/read/check policy changes. Both
+    // send feedback with native steer; it makes no cancellation reduction claim.
+    assert_eq!(current["native_cancels"], repetitive["native_cancels"]);
+}
+
+fn run_coordination_strategy(repetitive: bool) -> serde_json::Value {
+    let mut measured = serde_json::Value::Null;
     with_creation_daemon(|client, _, root, repository, address| {
         let started = std::time::Instant::now();
         std::fs::write(
@@ -163,6 +198,8 @@ fn mcp_coordination_batches_reviews_feedback_wait_and_dependency_evidence() {
             calls: vec![],
             seen: HashSet::new(),
             repeated_results: 0,
+            last_status: None,
+            unchanged_queries: 0,
         };
         let assignment = json!({"owner":"implementer","scope":"feature.txt","baseline":task.base_commit,"acceptance":"feature.txt contains accepted; independent fixed-commit review"});
         let (implementer, implementation_path) = tools.spawn(assignment, json!([]));
@@ -176,13 +213,30 @@ fn mcp_coordination_batches_reviews_feedback_wait_and_dependency_evidence() {
             json!({"session_ids":[implementer,reviewer]}),
         );
         assert!(first["results"][0]["receipt"].is_null());
-        let reviewed = first["results"][1]["receipt"].clone();
+        let mut reviewed = first["results"][1]["receipt"].clone();
         assert!(
             first["results"][1]["reply"]
                 .as_str()
                 .unwrap()
                 .contains("replace initial with accepted")
         );
+        if repetitive {
+            // Replay the old coordination habits through real tools against the
+            // identical fixed task, without pretending this is an old binary.
+            tools.call("waku_status", json!({"session_ids":[implementer,reviewer]}));
+            tools.call("waku_status", json!({"session_ids":[implementer,reviewer]}));
+            tools.call("waku_result", json!({"session_id":reviewer}));
+            tools.call("waku_result", json!({"session_id":reviewer}));
+            tools.call("waku_prompt", json!({"session_id":reviewer,"delivery_id":Uuid::new_v4(),"prompt":json!({"owner":"reviewer","scope":"feature.txt","baseline":task.base_commit,"commit":initial["commit"],"expected":"initial","acceptance":"repeat the already completed identical check","findings":["replace initial with accepted"]}).to_string()}));
+            settled(&client, reviewer, |session| {
+                session.turns.len() == 2 && completed(session)
+            });
+            let repeated = tools.call(
+                "waku_results",
+                json!({"session_ids":[reviewer],"handled":[reviewed]}),
+            );
+            reviewed = repeated["results"][0]["receipt"].clone();
+        }
         let delivery_id = Uuid::new_v4();
         tools.call("waku_prompt", json!({"session_id":implementer,"delivery_id":delivery_id,"prompt":json!({"commit":initial["commit"],"findings":["replace initial with accepted"],"acceptance":"accepted content and fixed-commit review"}).to_string()}));
         settled(&client, implementer, |s| {
@@ -280,12 +334,8 @@ fn mcp_coordination_batches_reviews_feedback_wait_and_dependency_evidence() {
             std::fs::read_to_string(repository.join("feature.txt")).unwrap(),
             "accepted\n"
         );
-        assert_eq!(tools.repeated_results, 0);
-        let unchanged_queries = tools
-            .calls
-            .iter()
-            .filter(|name| name.as_str() == "waku_status")
-            .count();
+        assert_eq!(tools.repeated_results > 0, repetitive);
+        let unchanged_queries = tools.unchanged_queries;
         let feedback_cancels = tools
             .calls
             .iter()
@@ -323,13 +373,13 @@ fn mcp_coordination_batches_reviews_feedback_wait_and_dependency_evidence() {
             .len();
         let repeated_checks = checks.len() - unique_checks;
         assert_eq!(
-            repeated_checks, 1,
+            repeated_checks,
+            1 + usize::from(repetitive),
             "the implementation check is independently repeated by the fixed reviewer: {checks:?}"
         );
-        println!(
-            "coordination_metrics={}",
-            json!({"fixture_elapsed_ms":started.elapsed().as_millis(),"unchanged_queries":unchanged_queries,"repeated_result_reads":tools.repeated_results,"feedback_cancels":feedback_cancels,"native_steers":native_steers,"native_cancels":native_cancels,"validation_executions":checks.len(),"same_commit_scope_environment_rechecks":repeated_checks,"necessary_independent_review_rechecks":1,"avoidable_repeated_validations":repeated_checks.saturating_sub(1),"combined_acceptance_checks":2,"callbacks":callback_text.lines().count()})
-        );
+        let metrics = json!({"strategy":if repetitive {"repeated-query-read-check-policy"} else {"event-batch-policy"},"fixture_elapsed_ms":started.elapsed().as_millis(),"unchanged_queries":unchanged_queries,"repeated_result_reads":tools.repeated_results,"feedback_cancels":feedback_cancels,"native_steers":native_steers,"native_cancels":native_cancels,"validation_executions":checks.len(),"same_commit_scope_environment_rechecks":repeated_checks,"necessary_independent_review_rechecks":1,"avoidable_repeated_validations":repeated_checks.saturating_sub(1),"combined_acceptance_checks":2,"callbacks":callback_text.lines().count()});
+        println!("coordination_metrics={metrics}");
+        measured = metrics;
         for id in [parent.id, implementer, reviewer, fixed_reviewer, dependent] {
             client
                 .request(id, Uuid::nil(), Command::CloseSession)
@@ -456,4 +506,5 @@ fn mcp_coordination_batches_reviews_feedback_wait_and_dependency_evidence() {
             "coordination_cleanup_restart=passed accepted_children_removed=2 history_snapshots_equal=5 retained_delivery_ref=true"
         );
     });
+    measured
 }
