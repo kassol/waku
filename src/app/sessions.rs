@@ -15,7 +15,7 @@ fn new_task_runtime_mode(current: Option<&AgentSession>, remembered: RuntimeMode
 
 /// Fill a catalog entry only while it still needs its transcript. A runtime
 /// attachment may already have hydrated it and applied newer provider events.
-fn apply_session_hydration(sessions: &mut [AgentSession], hydrated: AgentSession) -> bool {
+fn apply_session_hydration(sessions: &mut [AgentSession], mut hydrated: AgentSession) -> bool {
     let Some(existing) = sessions
         .iter_mut()
         .find(|session| session.id == hydrated.id)
@@ -23,7 +23,10 @@ fn apply_session_hydration(sessions: &mut [AgentSession], hydrated: AgentSession
         return false;
     };
     if !existing.detail_loaded {
+        hydrated.apply_lifecycle_metadata(existing);
         *existing = hydrated;
+    } else {
+        existing.apply_lifecycle_metadata(&hydrated);
     }
     true
 }
@@ -53,7 +56,7 @@ impl Waku {
                 child
                     .completions
                     .iter()
-                    .map(move |completion| (completion.summary_message_id, child.id))
+                    .map(move |completion| (completion.summary_message_id, (child.id, completion.id)))
             })
             .collect();
         let mut missing: HashMap<Uuid, Vec<Uuid>> = HashMap::new();

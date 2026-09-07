@@ -1234,7 +1234,7 @@ pub(super) fn merge_saved_message(
     true
 }
 
-fn decision_answer_control(
+pub(super) fn decision_answer_control(
     id: &'static str,
     label: String,
     focus: &FocusHandle,
@@ -1262,7 +1262,7 @@ fn decision_answer_control(
         .child(label)
 }
 
-fn decision_card(focus_order: Vec<FocusHandle>) -> Stateful<Div> {
+pub(super) fn decision_card(focus_order: Vec<FocusHandle>) -> Stateful<Div> {
     super::consultation::consultation_card(focus_order, "decisions-card").key_context("Decisions")
 }
 

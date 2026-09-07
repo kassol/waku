@@ -2018,3 +2018,6 @@ fn lifecycle_socket_managed_noncode_and_latest_code_evidence_are_distinct() {
         drop(client);drop(server);std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[path = "task_continuation_tests.rs"]
+mod task_continuation_tests;

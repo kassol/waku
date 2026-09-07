@@ -61,6 +61,10 @@ mod task_integration;
 mod archive_workspace;
 #[path = "task_lifecycle.rs"]
 mod task_lifecycle;
+#[path = "task_continuation.rs"]
+mod task_continuation;
+#[path = "task_continuation_workspace.rs"]
+mod task_continuation_workspace;
 #[path = "task_cleanup.rs"]
 mod task_cleanup;
 #[cfg(test)]
@@ -189,6 +193,7 @@ impl WakuBackend {
             task_store.save(&mut task_state)?;
         }
         creation::recover(&task_store, &mut task_state)?;
+        task_continuation::recover(&task_store, &mut task_state)?;
         let composer_drafts = ComposerDraftStore::for_state_path(task_store.path());
         let attachments = AttachmentStore::new(
             task_store
@@ -550,6 +555,7 @@ impl Backend for WakuBackend {
             request.command,
             Command::CreateSession { .. }
                 | Command::AnswerNativeDecision { .. }
+        | Command::ContinueChild { .. }
                 | Command::Respond { .. }
                 | Command::RespondUserInput { .. }
         | Command::AnswerDecision { .. }
@@ -729,8 +735,9 @@ impl WakuBackend {
             if cancelled_queue && !self.sessions.lock().contains_key(&session_id) { return Ok(ResponsePayload::Ack); }
         }
         match request.command {
-            Command::StewardLifecycle { operation } => self.complete_child(session_id, operation, &events),
+            Command::StewardLifecycle { operation } => self.lifecycle_operation(session_id, operation, &events),
             Command::StewardWorkspace { operation } => self.steward_workspace(session_id, operation, &events),
+            Command::ContinueChild { child_session_id, completion_id, operation_id, instruction } => self.continue_child(session_id, child_session_id, completion_id, operation_id, instruction, None, &events),
             Command::AnswerNativeDecision { child_session_id, request_id, response } => self.answer_native(child_session_id, request_id, response, &events),
             Command::Respond { request_id, option_id } => self.respond_native_direct(session_id, request.runtime_id, request_id, crate::model::NativeDecisionResponse::Permission { option_id }, &events),
             Command::RespondUserInput { request_id, answers } => self.respond_native_direct(session_id, request.runtime_id, request_id, crate::model::NativeDecisionResponse::UserInput { answers }, &events),
@@ -951,13 +958,16 @@ impl WakuBackend {
                     .collect::<Vec<_>>();
                 let answer_message_ids = state.sessions.iter().flat_map(|session| &session.decision_requests)
                     .filter(|request| request.user_answer.is_some()).filter_map(|request| request.authority_message_id)
-                    .chain(state.sessions.iter().flat_map(|s|s.completions.iter().map(|c|c.summary_message_id))).collect::<HashSet<_>>();
+                    .chain(state.sessions.iter().flat_map(|s|s.completions.iter().map(|c|c.summary_message_id)))
+                    .chain(state.sessions.iter().flat_map(|s|s.continuations.iter().map(|c|c.authority_message_id))).collect::<HashSet<_>>();
                 for mut session in sessions {
                     session.steward_wait = None;
                     session.input_deliveries.clear();
                     session.decision_requests.clear();
                     session.archived = false;
                     session.completions.clear();
+                    session.continuations.clear();
+                    session.lifecycle_revision = 0;
                     session.managed_workspace = None;
                     if let Some(existing) = state
                         .sessions
@@ -970,6 +980,8 @@ impl WakuBackend {
                         if existing.archived { continue; }
                         session.archived = existing.archived;
                         session.completions = existing.completions.clone();
+                        session.continuations = existing.continuations.clone();
+                        session.lifecycle_revision = existing.lifecycle_revision;
                         session.parent_session_id = existing.parent_session_id;
                         session.steward_wait = existing.steward_wait.clone();
                         session.input_deliveries = existing.input_deliveries.clone();
@@ -2593,6 +2605,7 @@ fn handle_driver_command(
         | Command::StewardWorkspace { .. }
         | Command::StewardQuery { .. }
         | Command::AnswerNativeDecision { .. }
+        | Command::ContinueChild { .. }
         | Command::AnswerDecision { .. }
         | Command::StewardLifecycle { .. }
         | Command::StewardDecision { .. }

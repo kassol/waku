@@ -1041,7 +1041,7 @@ pub struct Waku {
     /// stay usable while the selected transcript hydrates asynchronously.
     session_hydrations: HashSet<Uuid>,
     completion_hydrations: HashMap<Uuid, Uuid>,
-    completion_sources: HashMap<Uuid, Uuid>,
+    completion_sources: HashMap<Uuid, (Uuid, Uuid)>,
     /// Selection is committed only after this target's transcript arrives, so
     /// the currently visible task stays intact during daemon latency.
     pending_session_activation: Option<PendingSessionActivation>,
@@ -1216,6 +1216,7 @@ pub struct Waku {
     goal_dialog: Option<goal_dialog::GoalDialogState>,
     consultation: Option<consultation::ConsultationDialog>,
     decision_dialog: Option<decisions::DecisionDialog>,
+    continuation_dialog: Option<continuation::ContinuationDialog>,
     goal_dialog_request: Option<goal_dialog::GoalDialogRequest>,
     /// Goal operations accepted before the session's runtime exists. Goals
     /// attach to the provider thread, not to any turn, so `/goal` on a fresh
@@ -1617,6 +1618,7 @@ mod commit_dialog;
 mod goal_dialog;
 mod consultation;
 mod decisions;
+mod continuation;
 mod components;
 mod composer;
 mod drafts;
@@ -2804,6 +2806,7 @@ impl Waku {
                 goal_dialog: None,
                 consultation: None,
                 decision_dialog: None,
+                continuation_dialog: None,
                 goal_dialog_request: None,
                 pending_goal_operations: HashMap::new(),
                 goal_runtime_starts: HashSet::new(),

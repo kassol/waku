@@ -172,6 +172,7 @@ pub enum Command {
     /// Trusted user entry. Scoped MCP clients cannot answer their own escalations.
     AnswerNativeDecision { child_session_id: Uuid, request_id: Uuid, response: crate::model::NativeDecisionResponse },
     AnswerDecision { child_session_id: Uuid, request_id: Uuid, answer: String },
+    ContinueChild { child_session_id: Uuid, completion_id: Uuid, operation_id: Uuid, instruction: String },
     StewardLifecycle { operation: crate::model::StewardLifecycleOperation },
     StewardDecision { operation: crate::model::StewardDecisionOperation },
     StewardWorkspace { operation: crate::model::StewardWorkspaceOperation },
@@ -544,6 +545,7 @@ pub enum ResponseOutcome {
     rename_all_fields = "camelCase"
 )]
 pub enum ResponsePayload {
+    LifecycleContinued { session: AgentSession, continuation: crate::model::ChildContinuation },
     LifecycleCompleted { session: AgentSession, completion: crate::model::ChildCompletion },
     StewardDecisions { requests: Vec<crate::model::DecisionRequest> },
     TaskWorkspace { session: AgentSession },

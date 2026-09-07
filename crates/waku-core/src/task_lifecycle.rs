@@ -6,7 +6,7 @@ use crate::model::{
 };
 
 pub(super) fn has_unsettled_decisions(session: &AgentSession) -> bool {
-    session.decision_requests.iter().any(|request| {
+    session.continuations.iter().any(|c| matches!(c.state, InputDeliveryState::Accepted | InputDeliveryState::Queued | InputDeliveryState::Uncertain)) || session.decision_requests.iter().any(|request| {
         matches!(
             request.state,
             DecisionState::WaitingManager
@@ -117,7 +117,7 @@ impl WakuBackend {
             receipt,
             disposition,
             summary,
-        } = operation;
+        } = operation else { unreachable!("completion operation") };
         events.ensure_steward_active()?;
         self.ensure_session_writable(manager)?;
         let _child = events.reserve_steward_target(child_id)?;
@@ -214,6 +214,7 @@ impl WakuBackend {
                 .find(|s| s.id == child_id)
                 .unwrap();
             saved.archived = true;
+            saved.lifecycle_revision += 1;
             saved.completions.push(completion.clone());
             state.mark_session_dirty(manager);
             state.mark_session_dirty(child_id);
@@ -244,6 +245,7 @@ impl WakuBackend {
                 .unwrap();
             saved.summary.resource_retention = Some(format!("Runtime resources retained: {error}"));
             let completion = saved.clone();
+            child.lifecycle_revision += 1;
             let text = completion_text(child, &completion.summary, &completion.disposition);
             if let Some(parent) = state.sessions.iter_mut().find(|s| s.id == manager) {
                 if let Some(message) = parent

@@ -2450,3 +2450,28 @@ task_workspace.completion_terminate:
 
 task_workspace.completion_version:
   en: "Result version: %{value}"
+
+continuation.open:
+  en: Continue task…
+continuation.title:
+  en: Continue · %{title}
+continuation.instruction:
+  en: Describe what should continue or change…
+continuation.submit:
+  en: Submit continuation
+continuation.query:
+  en: Check delivery
+continuation.result:
+  en: Open continued task
+continuation.checking:
+  en: Checking continuation…
+continuation.unconfirmed:
+  en: Delivery is unconfirmed. Check the saved operation before continuing.
+continuation.explanation:
+  en: Opening history is read-only. This explicit instruction requests execution and preserves the original completion.
+continuation.received:
+  en: Continuation received by transport
+continuation.queued:
+  en: Continuation queued
+continuation.retry:
+  en: Retry with a new operation

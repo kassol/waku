@@ -3555,7 +3555,9 @@ impl Waku {
     pub(super) fn render_workspace_footer(&mut self, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
         if self.selected_session().is_some_and(|session| session.archived) {
-            return div().px(px(20.0)).py(px(8.0)).children(self.render_managed_task_details(cx));
+            let continuation = self.selected_session().and_then(|session| session.completions.last().map(|completion| (session.id, completion.id)));
+            return div().px(px(20.0)).py(px(8.0)).children(self.render_managed_task_details(cx))
+                .when_some(continuation, |row, (source, completion)| row.child(self.render_continue_child_entry(source, completion, cx)));
         }
         let selected_project_id = self.state.selected_project;
         let projectless_selected = self.selected_project().is_some_and(Project::is_projectless);

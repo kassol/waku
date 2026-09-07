@@ -1383,12 +1383,15 @@ export function useRuntime() {
 }
 
 function mergeSessionSummary(previous: AgentSession, next: AgentSession): AgentSession {
+  const lifecycle = (next.lifecycle_revision ?? 0) >= (previous.lifecycle_revision ?? 0) ? next : previous
   return {
     ...previous,
     title: next.title,
     parent_session_id: next.parent_session_id,
-    archived: next.archived,
-    completions: next.completions,
+    archived: lifecycle.archived,
+    completions: lifecycle.completions,
+    continuations: lifecycle.continuations,
+    lifecycle_revision: lifecycle.lifecycle_revision,
     auto_title: next.auto_title,
     project_id: next.project_id,
     workspace: next.workspace,

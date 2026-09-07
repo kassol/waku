@@ -2247,3 +2247,21 @@ fn the_rail_draws_only_installed_providers_the_settings_left_on() {
         ProviderKind::Claude
     ));
 }
+
+#[test]
+fn continuation_catalog_accepts_unarchive_and_rejects_stale_archive() {
+    let mut child = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+    child.archived = true;
+    child.lifecycle_revision = 1;
+    child.push_message(MessageRole::Assistant, "Preserved completion history");
+    let stale = child.list_projection();
+    let mut continued = stale.clone();
+    continued.archived = false;
+    continued.lifecycle_revision = 2;
+    let mut catalog = vec![child];
+    merge_remote_session_catalog(&mut catalog, vec![continued], |_| true);
+    merge_remote_session_catalog(&mut catalog, vec![stale], |_| true);
+    assert!(!catalog[0].archived);
+    assert_eq!(catalog[0].lifecycle_revision, 2);
+    assert_eq!(catalog[0].messages[0].content, "Preserved completion history");
+}

@@ -6,6 +6,7 @@ use waku_client::consultation::Consultation;
 actions!(waku_consultation, [SendConsultation, CloseConsultation]);
 pub fn init(cx: &mut App) {
     super::decisions::init(cx);
+    super::continuation::init(cx);
     cx.bind_keys([
         KeyBinding::new("secondary-enter", SendConsultation, Some("Consultation")),
         KeyBinding::new("escape", CloseConsultation, Some("Consultation")),

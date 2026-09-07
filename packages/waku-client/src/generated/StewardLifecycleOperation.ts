@@ -3,4 +3,4 @@ import type { ChildCompletionSummary } from "./ChildCompletionSummary";
 import type { ChildResultReceipt } from "./ChildResultReceipt";
 import type { CompletionDisposition } from "./CompletionDisposition";
 
-export type StewardLifecycleOperation = { "type": "complete", session_id: string, receipt: ChildResultReceipt, disposition: CompletionDisposition, summary: ChildCompletionSummary, };
+export type StewardLifecycleOperation = { "type": "continue", session_id: string, completion_id: string, operation_id: string, instruction: string, authority_message_id: string, } | { "type": "status", session_id: string, operation_id: string, } | { "type": "complete", session_id: string, receipt: ChildResultReceipt, disposition: CompletionDisposition, summary: ChildCompletionSummary, };

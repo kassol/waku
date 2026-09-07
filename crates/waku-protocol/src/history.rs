@@ -70,6 +70,14 @@ impl HistoryReducer {
                 effects.invalidated_activity_diff = self.update_activity(session, input_delivery_activity(&delivery));
             }
             DriverEvent::InputDeliveryOutcome(outcome) => {
+                if let Some(record) = session.continuations.iter_mut().find(|c|c.id == outcome.id && matches!(c.state, InputDeliveryState::Accepted | InputDeliveryState::Uncertain)) {
+                    if record.state != outcome.state || record.reason != outcome.reason {
+                        record.state = outcome.state;
+                        record.reason = outcome.reason.clone();
+                        session.lifecycle_revision += 1;
+                    }
+                }
+
                 let mut received_native = None;
                 if let Some(request) = session.decision_requests.iter_mut().find(|r| r.id == outcome.id && r.native.is_some()) {
                     let native = request.native.as_mut().unwrap();
@@ -125,9 +133,11 @@ impl HistoryReducer {
                 }
             }
             DriverEvent::HistorySnapshot(mut snapshot) => {
-                if session.completions.len() > snapshot.completions.len() {
+                if session.lifecycle_revision > snapshot.lifecycle_revision {
                     snapshot.archived = session.archived;
                     snapshot.completions = session.completions.clone();
+                    snapshot.continuations = session.continuations.clone();
+                    snapshot.lifecycle_revision = session.lifecycle_revision;
                 }
                 if history_snapshot_is_stale(session, &snapshot) {
                     return effects;

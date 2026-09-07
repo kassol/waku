@@ -17,6 +17,7 @@ export type { CheckpointStatus } from "./CheckpointStatus";
 export type { ChildBatchResult } from "./ChildBatchResult";
 export type { ChildCompletion } from "./ChildCompletion";
 export type { ChildCompletionSummary } from "./ChildCompletionSummary";
+export type { ChildContinuation } from "./ChildContinuation";
 export type { ChildResultReceipt } from "./ChildResultReceipt";
 export type { ChildSessionSummary } from "./ChildSessionSummary";
 export type { ChildTurnSummary } from "./ChildTurnSummary";

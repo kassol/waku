@@ -61,7 +61,7 @@ fn attach_driver(
     Ok(Some((session, PreparedDriver { handle, events })))
 }
 
-fn load_remote_task_state(
+pub(super) fn load_remote_task_state(
     client: &waku_client::DaemonClient,
 ) -> anyhow::Result<RemoteTaskStateSnapshot> {
     let response = client.request(
@@ -129,13 +129,12 @@ pub(super) fn merge_remote_session_catalog(
 
     for remote in remote {
         if let Some(local) = local.iter_mut().find(|session| session.id == remote.id) {
+            local.apply_lifecycle_metadata(&remote);
             local.title = remote.title;
             local.auto_title = remote.auto_title;
             local.project_id = remote.project_id;
             local.parent_session_id = remote.parent_session_id;
             local.decision_requests = remote.decision_requests;
-            local.archived = remote.archived;
-            local.completions = remote.completions;
             if local.apply_managed_workspace(remote.managed_workspace)
                 && local.managed_workspace.is_some()
             {
@@ -671,7 +670,7 @@ impl Waku {
         }
     }
 
-    fn apply_remote_task_state(
+    pub(super) fn apply_remote_task_state(
         &mut self,
         snapshot: RemoteTaskStateSnapshot,
         cx: &mut Context<Self>,
@@ -692,6 +691,7 @@ impl Waku {
         }
         self.state.projects = snapshot.projects;
         self.sync_decision_catalog(cx);
+        self.sync_continuation_catalog(cx);
         self.refresh_completion_history(cx);
 
         let attach = self
@@ -804,9 +804,7 @@ impl Waku {
                     return;
                 };
                 if !self.runtimes.contains_key(&session_id) {
-                    for completion in &self.state.sessions[index].completions {
-                        if !session.completions.iter().any(|item| item.id == completion.id) { session.completions.push(completion.clone()); }
-                    }
+                    session.apply_lifecycle_metadata(&self.state.sessions[index]);
                     self.state.sessions[index] = session;
                     self.install_prepared_driver(session_id, prepared);
                     if self.state.selected_session == Some(session_id) {
@@ -3417,6 +3415,7 @@ impl Waku {
 
         if decisions_changed {
             self.sync_decision_catalog(cx);
+        self.sync_continuation_catalog(cx);
         }
         if !self.pending_queue_drains.is_empty() {
             let drains = std::mem::take(&mut self.pending_queue_drains);

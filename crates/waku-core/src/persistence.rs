@@ -1050,6 +1050,12 @@ impl StateStore {
         Ok((record, true))
     }
 
+    pub(crate) fn creation_by_key(&self, manager: Uuid, key: &str) -> io::Result<Option<CreationRecord>> {
+        let connection = self.open()?;
+        let data: Option<String> = connection.query_row("SELECT data FROM session_creations WHERE manager_session_id=?1 AND idempotency_key=?2", params![manager.to_string(), key], |row| row.get(0)).optional().map_err(to_io_error)?;
+        data.map(|data|serde_json::from_str(&data).map_err(to_io_error)).transpose()
+    }
+
     pub(crate) fn unfinished_creations(&self) -> io::Result<Vec<CreationRecord>> {
         let connection = self.open()?;
         let mut query = connection
@@ -1253,8 +1259,10 @@ impl StateStore {
         // once when opening the store; later catalogs use the in-memory projection.
         let mut archives_by_session = HashMap::new();
         let mut completions_by_session = HashMap::new();
+        let mut continuations_by_session = HashMap::new();
+        let mut lifecycle_revisions = HashMap::new();
         let mut waits = connection
-            .prepare("SELECT session_id, json_extract(data, '$.steward_wait'), json_extract(data, '$.input_deliveries'), json_extract(data, '$.managed_workspace'), json_extract(data, '$.decision_requests'), json_extract(data, '$.workspace'), json_extract(data, '$.archived'), json_extract(data, '$.completions') FROM session_details")
+            .prepare("SELECT session_id, json_extract(data, '$.steward_wait'), json_extract(data, '$.input_deliveries'), json_extract(data, '$.managed_workspace'), json_extract(data, '$.decision_requests'), json_extract(data, '$.workspace'), json_extract(data, '$.archived'), json_extract(data, '$.completions'), json_extract(data, '$.continuations'), json_extract(data, '$.lifecycle_revision') FROM session_details")
             .map_err(to_io_error)?;
         let mut waits_by_session = HashMap::new();
         let mut inputs_by_session = HashMap::new();
@@ -1262,11 +1270,13 @@ impl StateStore {
         let mut decisions_by_session = HashMap::new();
         let mut locations_by_session = HashMap::new();
         for row in waits
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<bool>>(6)?, row.get::<_, Option<String>>(7)?)))
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<bool>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, Option<String>>(8)?, row.get::<_, Option<u64>>(9)?)))
             .map_err(to_io_error)?
         {
-            let (id, wait, inputs, workspace, decisions, location, archived, completions) = row.map_err(to_io_error)?;
+            let (id, wait, inputs, workspace, decisions, location, archived, completions, continuations, revision) = row.map_err(to_io_error)?;
             if let Some(archived) = archived { archives_by_session.insert(id.clone(), archived); }
+            if let Some(continuations) = continuations { continuations_by_session.insert(id.clone(), serde_json::from_str(&continuations).map_err(to_io_error)?); }
+            lifecycle_revisions.insert(id.clone(), revision.unwrap_or_default());
             if let Some(completions) = completions { completions_by_session.insert(id.clone(), serde_json::from_str(&completions).map_err(to_io_error)?); }
             if let Some(location) = location { locations_by_session.insert(id.clone(), serde_json::from_str(&location).map_err(to_io_error)?); }
             if let Some(decisions) = decisions { decisions_by_session.insert(id.clone(), serde_json::from_str(&decisions).map_err(to_io_error)?); }
@@ -1281,6 +1291,8 @@ impl StateStore {
         for session in &mut state.sessions {
             session.archived = archives_by_session.remove(&session.id.to_string()).unwrap_or_default();
             session.completions = completions_by_session.remove(&session.id.to_string()).unwrap_or_default();
+            session.continuations = continuations_by_session.remove(&session.id.to_string()).unwrap_or_default();
+            session.lifecycle_revision = lifecycle_revisions.remove(&session.id.to_string()).unwrap_or_default();
             session.workspace = locations_by_session.remove(&session.id.to_string()).unwrap_or_default();
             session.decision_requests = decisions_by_session.remove(&session.id.to_string()).unwrap_or_default();
             session.steward_wait = waits_by_session.remove(&session.id.to_string());
@@ -1385,6 +1397,8 @@ impl StateStore {
         session.decision_requests = stored.decision_requests;
         session.archived = stored.archived;
         session.completions = stored.completions;
+        session.continuations = stored.continuations;
+        session.lifecycle_revision = stored.lifecycle_revision;
         session.steward_wait = stored.steward_wait;
         session.input_deliveries = stored.input_deliveries;
         session.managed_workspace = stored.managed_workspace;
@@ -1842,6 +1856,8 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         decision_requests: Vec::new(),
         archived: false,
         completions: Vec::new(),
+        continuations: Vec::new(),
+        lifecycle_revision: 0,
         steward_wait: None,
         input_deliveries: Vec::new(),
         managed_workspace: None,

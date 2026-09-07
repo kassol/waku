@@ -1031,8 +1031,22 @@ pub struct ChildCompletion {
     pub created_at: u64,
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct ChildContinuation {
+    pub id: Uuid,
+    pub source_completion_id: Uuid,
+    pub manager_session_id: Uuid,
+    pub authority_message_id: Uuid,
+    pub instruction: String,
+    pub result_session_id: Option<Uuid>,
+    pub state: InputDeliveryState,
+    pub reason: Option<String>,
+    pub created_at: u64,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum StewardLifecycleOperation {
+    Continue { session_id: Uuid, completion_id: Uuid, operation_id: Uuid, instruction: String, authority_message_id: Uuid },
+    Status { session_id: Uuid, operation_id: Uuid },
     Complete { session_id: Uuid, receipt: crate::protocol::ChildResultReceipt, disposition: CompletionDisposition, summary: ChildCompletionSummary },
 }
 
@@ -1218,6 +1232,12 @@ pub struct AgentSession {
     #[serde(default)]
     #[ts(optional, as = "Option<_>")]
     pub completions: Vec<ChildCompletion>,
+    #[serde(default)]
+    #[ts(optional, as = "Option<_>")]
+    pub continuations: Vec<ChildContinuation>,
+    #[serde(default)]
+    #[ts(optional, as = "Option<_>")]
+    pub lifecycle_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_workspace: Option<ManagedWorkspace>,
     /// A title explicitly chosen by the user. [`Self::DEFAULT_TITLE`] means
@@ -1340,6 +1360,8 @@ impl AgentSession {
             decision_requests: Vec::new(),
             archived: false,
             completions: Vec::new(),
+            continuations: Vec::new(),
+            lifecycle_revision: 0,
             managed_workspace: None,
             title: Self::DEFAULT_TITLE.to_owned(),
             auto_title: None,
@@ -1376,6 +1398,18 @@ impl AgentSession {
         }
     }
 
+    /// Merge daemon-owned lifecycle state without accepting an older revision.
+    pub fn apply_lifecycle_metadata(&mut self, incoming: &Self) -> bool {
+        if incoming.lifecycle_revision < self.lifecycle_revision { return false; }
+        let changed = self.archived != incoming.archived || self.completions != incoming.completions
+            || self.continuations != incoming.continuations || self.lifecycle_revision != incoming.lifecycle_revision;
+        self.archived = incoming.archived;
+        self.completions = incoming.completions.clone();
+        self.continuations = incoming.continuations.clone();
+        self.lifecycle_revision = incoming.lifecycle_revision;
+        changed
+    }
+
     /// Returns the lightweight projection used by task lists.
     ///
     /// A daemon can hold hydrated sessions in memory, but catalog refreshes
@@ -1390,6 +1424,8 @@ impl AgentSession {
             decision_requests: self.decision_requests.clone(),
             archived: self.archived,
             completions: self.completions.clone(),
+            continuations: self.continuations.clone(),
+            lifecycle_revision: self.lifecycle_revision,
             managed_workspace: self.managed_workspace.clone(),
             title: self.title.clone(),
             auto_title: self.auto_title.clone(),

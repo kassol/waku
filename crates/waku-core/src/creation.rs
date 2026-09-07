@@ -124,6 +124,23 @@ impl WakuBackend {
                 .clone();
             (parent, project)
         };
+        if let Some(key) = &idempotency_key && let Some(id) = key.strip_prefix("continuation:") {
+            let id = Uuid::parse_str(id)?;
+            let _workspace = self.workspace_start_gate.lock();
+            let mut state = self.task_state.lock();
+            let source = state.sessions.iter_mut().find(|s|s.continuations.iter().any(|c|c.id == id)).ok_or_else(||anyhow!("Continuation intent unavailable"))?;
+            self.task_store.hydrate(source)?;
+            let source = source.clone();
+            let record = source.continuations.iter().find(|c|c.id == id).unwrap();
+            if record.manager_session_id != parent_id || record.state != crate::model::InputDeliveryState::Accepted
+                || record.result_session_id.is_some() || !source.archived || super::task_continuation::replacement_prompt(&source, record)? != prompt
+                || source.provider != provider || source.model != model || source.runtime_mode != runtime_mode.unwrap_or(parent.runtime_mode)
+                || workspace != CreationWorkspace::Worktree || !dependencies.is_empty() {
+                bail!("Continuation creation does not match its saved intent");
+            }
+            self.validate_continuation_authority(&mut state, &source, record)?;
+            if self.continuation_workspace(&mut state, parent_id, &source)? { bail!("Source workspace is still available; do not create a duplicate"); }
+        }
         let mode = runtime_mode.unwrap_or(parent.runtime_mode);
         validate_child_mode(parent.provider, provider, parent.runtime_mode, mode)?;
         let mut child = AgentSession::new(project.id, provider);

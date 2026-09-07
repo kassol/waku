@@ -200,6 +200,16 @@ pub fn run_stdio(
                         }},"required":["operation"],"additionalProperties":false,"$defs":{"evidence":{"type":"array","minItems":1,"items":{"type":"object","properties":{"commit":{"type":"string"},"checks":{"type":"string","minLength":1},"environment":{"type":"string","minLength":1},"reviewer":{"type":"string","minLength":1}},"required":["commit","checks","environment","reviewer"],"additionalProperties":false}}}}
                     },
                     {
+                        "name":"waku_continue",
+                        "description":"Continue an archived direct child only after a new explicit user instruction. Cite the current real user message after its completion. Revalidate owned workspace and task lifecycle. A removed workspace creates a linked replacement with the existing creation pipeline. Keep operation_id stable; uncertain attempts must only be inspected.",
+                        "inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"completion_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"instruction":{"type":"string","minLength":1},"authority_message_id":{"type":"string","format":"uuid"}},"required":["session_id","completion_id","operation_id","instruction","authority_message_id"],"additionalProperties":false}
+                    },
+                    {
+                        "name":"waku_continue_status",
+                        "description":"Inspect a saved continuation without executing or resending work.",
+                        "inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"}},"required":["session_id","operation_id"],"additionalProperties":false}
+                    },
+                    {
                         "name":"waku_complete",
                         "description":"Explicitly take over a direct child's fixed result and archive its lifecycle after verification, or record retry, replacement or termination of failed work. Obtain receipt from waku_results. This saves a readable summary and retains full history atomically; active work, unsettled decisions, uncertain native attempts and unfinished descendants block completion. Archival does not force Git cleanup. Repeating the same receipt and summary is idempotent.",
                         "inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"receipt":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"turn_id":{"type":["string","null"]},"snapshot":{"type":"string"}},"required":["session_id","turn_id","snapshot"],"additionalProperties":false},"disposition":{"enum":["accepted","retry","replace","terminate"]},"summary":{"type":"object","properties":{"goal":{"type":"string"},"result":{"type":"string"},"decisions":{"type":["string","null"]},"verification":{"type":["string","null"]},"unresolved":{"type":["string","null"]},"resource_retention":{"type":["string","null"]}},"required":["goal","result"],"additionalProperties":false}},"required":["session_id","receipt","disposition","summary"],"additionalProperties":false}
@@ -411,6 +421,18 @@ fn tool_command(name: &str, arguments: Value) -> Result<Command, String> {
         let args: WorkspaceArguments = serde_json::from_value(arguments)
             .map_err(|error| format!("Invalid tool arguments: {error}"))?;
         Ok(Command::StewardWorkspace { operation: args.operation })
+    } else if name == "waku_continue" {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Arguments { session_id:Uuid, completion_id:Uuid, operation_id:Uuid, instruction:String, authority_message_id:Uuid }
+        let a:Arguments=serde_json::from_value(arguments).map_err(|e|format!("Invalid tool arguments: {e}"))?;
+        Ok(Command::StewardLifecycle { operation:crate::model::StewardLifecycleOperation::Continue { session_id:a.session_id,completion_id:a.completion_id,operation_id:a.operation_id,instruction:a.instruction,authority_message_id:a.authority_message_id } })
+    } else if name == "waku_continue_status" {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Arguments { session_id:Uuid, operation_id:Uuid }
+        let a:Arguments=serde_json::from_value(arguments).map_err(|e|format!("Invalid tool arguments: {e}"))?;
+        Ok(Command::StewardLifecycle { operation:crate::model::StewardLifecycleOperation::Status { session_id:a.session_id,operation_id:a.operation_id } })
     } else if name == "waku_complete" {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]

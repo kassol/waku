@@ -1350,10 +1350,10 @@ impl Waku {
                         // pane) keeps the tick from busting sibling islands.
                         motion::pulse_lease(window.current_view(), cx);
                     }
-                    if let Some(source) = self.completion_sources.get(&message.id).copied() {
+                    if let Some((source, completion)) = self.completion_sources.get(&message.id).copied() {
                         let focus = self.transcript_control_focus(format!("completion-source-{}", message.id), cx);
-                        div().child(rendered).child(super::composer::task_detail_link(source, tr!("task_workspace.open_source_history"), &focus, theme)
-                            .on_click(cx.listener(move |this, _, _, cx| this.select_session(source, cx)))).into_any_element()
+                        div().child(rendered).child(div().flex().gap(px(8.0)).child(self.render_continue_child_entry(source, completion, cx)).child(super::composer::task_detail_link(source, tr!("task_workspace.open_source_history"), &focus, theme)
+                            .on_click(cx.listener(move |this, _, _, cx| this.select_session(source, cx))))).into_any_element()
                     } else { rendered }
                 })
                 .unwrap_or_else(|| div().into_any_element()),

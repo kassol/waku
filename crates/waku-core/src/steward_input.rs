@@ -48,7 +48,8 @@ impl WakuBackend {
         self.ensure_accepting_work()?;
         events.ensure_steward_active()?;
         let _operation = events.reserve_input_target(target, caller == target)?;
-        self.ensure_session_writable(target)?;
+        let continuation_input = id.is_some_and(|id| self.task_state.lock().sessions.iter().any(|s| s.id == target && s.continuations.iter().any(|c| c.id == id && c.result_session_id == Some(target))));
+        if !continuation_input { self.ensure_session_writable(target)?; }
         self.ensure_accepting_work()?;
         let exited = self
             .forwarders
@@ -61,6 +62,7 @@ impl WakuBackend {
         let id = id.unwrap_or_else(Uuid::new_v4);
         let driver = self.sessions.lock().get(&target).cloned();
         let (session, project_path, delivery, message_id) = {
+            let workspace_guard = continuation_input.then(|| self.workspace_start_gate.lock());
             let mut state = self.task_state.lock();
             // Revalidate after acquiring the target operation, including retries.
             let (session, project_path) = if caller != target {
@@ -125,6 +127,13 @@ impl WakuBackend {
                 { bail!("Decision request is not eligible for delivery"); }
                 self.validate_decision_authority(&mut state, request)?;
             }
+            if continuation_input && let Some(record) = session.continuations.iter().find(|c|c.id == id) {
+                if record.state != InputDeliveryState::Accepted || record.instruction != prompt || record.manager_session_id != caller || !session.archived {
+                    bail!("Continuation is not eligible for delivery");
+                }
+                self.validate_continuation_authority(&mut state, &session, record)?;
+                if !self.continuation_workspace(&mut state, caller, &session)? { bail!("Continuation workspace was removed before delivery"); }
+            }
             if session.cancellation_requested_turn_id.is_some() {
                 bail!("session cancellation has not settled");
             }
@@ -137,7 +146,12 @@ impl WakuBackend {
             let supported = driver
                 .as_ref()
                 .is_some_and(|(_, driver)| driver.supports_steer());
+            let continuation_before = continuation_input.then(|| session.clone());
             let session = state.sessions.iter_mut().find(|s| s.id == target).unwrap();
+            if continuation_input {
+                session.archived = false;
+                session.lifecycle_revision += 1;
+            }
             let (turn_id, message_id) = if busy {
                 (
                     session
@@ -185,6 +199,10 @@ impl WakuBackend {
             let saved_session = session.clone();
             state.mark_session_dirty(target);
             if let Err(error) = self.task_store.save(&mut state) {
+                if let Some(before) = continuation_before {
+                    *state.sessions.iter_mut().find(|s|s.id == target).unwrap() = before;
+                    return Err(error.into());
+                }
                 self.saving_failed.store(true, Ordering::Release);
                 self.failed_sessions.lock().insert(target);
                 state
@@ -197,6 +215,7 @@ impl WakuBackend {
                 events.stop_failed_work();
                 return Err(error.into());
             }
+            drop(workspace_guard);
             (saved_session, project_path, delivery, message_id)
         };
         if let Some(message_id) = message_id {

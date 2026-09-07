@@ -960,12 +960,9 @@ function errorMessage(cause: unknown): string {
 
 /** Keep streamed content and import daemon-owned checkpoints and lifecycle records. */
 function withDaemonCheckpoints(latest: AgentSession, saved: AgentSession): AgentSession {
-  const archived = Boolean(latest.archived || saved.archived);
-  const completions = [...(latest.completions ?? [])];
-  for (const completion of saved.completions ?? []) {
-    if (!completions.some((existing) => existing.id === completion.id)) completions.push(completion);
-  }
-  let changed = archived !== Boolean(latest.archived) || completions.length !== (latest.completions?.length ?? 0);
+  const lifecycle = (saved.lifecycle_revision ?? 0) >= (latest.lifecycle_revision ?? 0) ? saved : latest;
+  const { archived, completions, continuations, lifecycle_revision } = lifecycle;
+  let changed = lifecycle !== latest;
   const turns = latest.turns.map((turn) => {
     const stored = saved.turns.find((candidate) => candidate.turn_count === turn.turn_count);
     if (
@@ -977,5 +974,5 @@ function withDaemonCheckpoints(latest: AgentSession, saved: AgentSession): Agent
     changed = true;
     return { ...turn, checkpoint: stored.checkpoint };
   });
-  return changed ? { ...latest, turns, archived, completions } : latest;
+  return changed ? { ...latest, turns, archived, completions, continuations, lifecycle_revision } : latest;
 }

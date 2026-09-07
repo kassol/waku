@@ -552,6 +552,7 @@ test('archived completion survives an older history snapshot without changing so
   const old = idleSession()
   const archived = structuredClone(old)
   archived.archived = true
+  archived.lifecycle_revision = 1
   archived.completions = [{ id: 'completion', manager_session_id: 'manager', receipt: { session_id: old.id, turn_id: null, snapshot: 'v1:source' },
     disposition: 'terminate', summary: { goal: 'Task', result: 'Stopped', decisions: null, verification: null, unresolved: 'Needs a replacement', resource_retention: 'Retained' }, summary_message_id: 'summary', created_at: 1 }]
   const preserved = apply(archived, 'historySnapshot', old)
@@ -560,4 +561,24 @@ test('archived completion survives an older history snapshot without changing so
   expect(preserved.messages).toEqual(old.messages)
   expect(preserved.turns).toEqual(old.turns)
   expect(preserved.transcript_blocks).toEqual(old.transcript_blocks)
+})
+
+
+test('explicit continuation accepts newer lifecycle metadata and rejects an old archived snapshot', () => {
+  const archived = idleSession()
+  archived.archived = true
+  archived.lifecycle_revision = 1
+  const resumed = structuredClone(archived)
+  resumed.archived = false
+  resumed.lifecycle_revision = 2
+  resumed.continuations = [{ id: 'continue', source_completion_id: 'completion', manager_session_id: 'manager', authority_message_id: 'new-user', instruction: 'Continue the task', result_session_id: resumed.id, state: 'accepted', reason: null, created_at: 2 }]
+  const current = apply(archived, 'historySnapshot', resumed)
+  expect(current.archived).toBe(false)
+  expect(current.lifecycle_revision).toBe(2)
+  const preserved = apply(current, 'historySnapshot', archived)
+  expect(preserved.archived).toBe(false)
+  expect(preserved.continuations).toEqual(resumed.continuations)
+  const received = apply(preserved, 'inputDeliveryOutcome', { id: 'continue', state: 'received', confirmation: 'transport', reason: null })
+  expect(received.continuations?.[0]?.state).toBe('received')
+  expect(received.lifecycle_revision).toBe(3)
 })

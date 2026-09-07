@@ -65,8 +65,10 @@ export function reduceRuntimeEvent(
       context_window: current.context_window,
       agent_preset: current.agent_preset,
       queued_messages: clone(current.queued_messages ?? []),
-      archived: (current.completions?.length ?? 0) > (snapshot.completions?.length ?? 0) ? current.archived : snapshot.archived,
-      completions: (current.completions?.length ?? 0) > (snapshot.completions?.length ?? 0) ? clone(current.completions) : snapshot.completions,
+      archived: (current.lifecycle_revision ?? 0) > (snapshot.lifecycle_revision ?? 0) ? current.archived : snapshot.archived,
+      completions: (current.lifecycle_revision ?? 0) > (snapshot.lifecycle_revision ?? 0) ? clone(current.completions ?? []) : snapshot.completions,
+      continuations: (current.lifecycle_revision ?? 0) > (snapshot.lifecycle_revision ?? 0) ? clone(current.continuations ?? []) : snapshot.continuations,
+      lifecycle_revision: Math.max(current.lifecycle_revision ?? 0, snapshot.lifecycle_revision ?? 0),
       managed_workspace: current.managed_workspace &&
         (!snapshot.managed_workspace || snapshot.managed_workspace.revision < current.managed_workspace.revision)
         ? clone(current.managed_workspace) : snapshot.managed_workspace,
@@ -138,6 +140,12 @@ export function reduceRuntimeEvent(
     }
     case 'inputDeliveryOutcome': {
       const outcome = payload as unknown as Pick<InputDelivery, 'id' | 'state' | 'confirmation' | 'reason'>
+      const continuation = session.continuations?.find(c => c.id === outcome.id && ['accepted', 'uncertain'].includes(c.state))
+      if (continuation && (continuation.state !== outcome.state || continuation.reason !== outcome.reason)) {
+        continuation.state = outcome.state
+        continuation.reason = outcome.reason
+        session.lifecycle_revision = (session.lifecycle_revision ?? 0) + 1
+      }
       const nativeRequest = session.decision_requests?.find(r => r.id === outcome.id && r.native)
       if (nativeRequest?.native && ['accepted', 'uncertain'].includes(nativeRequest.native.outcome?.state ?? '')) {
         nativeRequest.native.outcome = outcome

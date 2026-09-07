@@ -1211,3 +1211,16 @@ task_workspace.completion_replace: "已记录替代决定"
 task_workspace.completion_terminate: "已记录终止决定"
 
 task_workspace.completion_version: "成果版本：%{value}"
+
+continuation.open: 继续任务…
+continuation.title: 继续 · %{title}
+continuation.instruction: 说明需要继续完成或修改的内容…
+continuation.submit: 提交继续指令
+continuation.query: 查询投递状态
+continuation.result: 打开继续执行的任务
+continuation.checking: 正在确认继续状态…
+continuation.unconfirmed: 投递尚未确认。请查询本次操作的保存状态。
+continuation.explanation: 查看历史保持只读。提交此指令后才请求继续执行，并保留原成果。
+continuation.received: 继续指令已送达传输层
+continuation.queued: 继续指令已排队
+continuation.retry: 新建操作重试
