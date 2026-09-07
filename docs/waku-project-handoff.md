@@ -4,7 +4,7 @@
 
 ## 新的已确认设计方向
 
-2026-09-07，用户确认子会话作为临时执行单元，生命周期结束后归档隐藏，主会话保留摘要和追溯入口；问题由管家在已有授权内代决，超出授权统一回主会话询问。见 [ADR 0005](adr/0005-transient-child-sessions-and-manager-decisions.md)。[Issue #23](https://github.com/kassol/waku/issues/23) 及 [#24–#30](waku-steward-child-lifecycle-tickets.md) 已实现，公共 MCP／daemon、真实 harness、签名 Debug 后台交互及组合验收通过。Rust 全量 1046 通过、31 忽略、0 失败；见[生命周期验收记录](waku-steward-child-lifecycle-acceptance.md)。升级不自动处理历史子会话。用户随后授权更新安装；日用 Steward 现为 `ccc7c24` 的优化签名包，4 个会话、149 条消息及配置完整保留，安装与退出阻塞记录见同一验收文档。
+2026-09-07，用户确认子会话作为临时执行单元，生命周期结束后归档隐藏，主会话保留摘要和追溯入口；问题由管家在已有授权内代决，超出授权统一回主会话询问。见 [ADR 0005](adr/0005-transient-child-sessions-and-manager-decisions.md)。[Issue #23](https://github.com/kassol/waku/issues/23) 及 [#24–#30](waku-steward-child-lifecycle-tickets.md) 已实现，公共 MCP／daemon、真实 harness、签名 Debug 后台交互及组合验收通过。Rust 全量 1046 通过、31 忽略、0 失败；见[生命周期验收记录](waku-steward-child-lifecycle-acceptance.md)。升级不自动处理历史子会话。用户随后授权更新安装；日用 Steward 现为 `c966ecd` 的优化签名包（已修复探测超时阻塞退出），4 个会话、149 条消息及配置完整保留，安装与退出阻塞记录见同一验收文档。
 
 ## 当前扩展与交付边界
 

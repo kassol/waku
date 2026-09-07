@@ -180,24 +180,34 @@ while not root.joinpath('release').exists() and time.monotonic() < deadline:
         )
         .unwrap(),
     );
-    let erased: Arc<dyn Backend> = backend.clone();
-    let sink = EventSink::for_test(&erased, Uuid::nil(), Uuid::nil());
-    let probing = backend.clone();
-    let probe_sink = sink.clone();
-    let probe = std::thread::spawn(move || {
-        probing.handle(
-            Request {
-                request_id: Uuid::new_v4(),
-                session_id: Uuid::nil(),
-                runtime_id: Uuid::nil(),
-                command: Command::ProbeProvider {
-                    provider: ProviderKind::Cursor,
-                    binary_override: Some(binary.to_string_lossy().into_owned()),
-                    discover_models: true,
-                    probe_version: false,
-                },
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let server = std::thread::spawn(move || {
+        crate::serve(
+            listener,
+            "probe-test".into(),
+            backend,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            crate::ServerOptions {
+                allow_shutdown: true,
+                ..Default::default()
             },
-            probe_sink,
+        )
+        .unwrap()
+    });
+    let probing = waku_client::DaemonClient::connect(&address, "probe-test".into()).unwrap();
+    let closing = waku_client::DaemonClient::connect(&address, "probe-test".into()).unwrap();
+    let control = waku_client::DaemonClient::connect(&address, "probe-test".into()).unwrap();
+    let probe = std::thread::spawn(move || {
+        probing.request(
+            Uuid::nil(),
+            Uuid::nil(),
+            Command::ProbeProvider {
+                provider: ProviderKind::Cursor,
+                binary_override: Some(binary.to_string_lossy().into_owned()),
+                discover_models: true,
+                probe_version: false,
+            },
         )
     });
     let started = std::time::Instant::now();
@@ -205,18 +215,9 @@ while not root.joinpath('release').exists() and time.monotonic() < deadline:
         std::thread::sleep(Duration::from_millis(10));
     }
     let saw_start = root.join("started").exists();
-    let closing = backend.clone();
     let (done, completed) = crossbeam_channel::bounded(1);
     let shutdown = std::thread::spawn(move || {
-        let _ = done.send(closing.handle(
-            Request {
-                request_id: Uuid::new_v4(),
-                session_id: Uuid::nil(),
-                runtime_id: Uuid::nil(),
-                command: Command::PrepareShutdown,
-            },
-            sink,
-        ));
+        let _ = done.send(closing.request(Uuid::nil(), Uuid::nil(), Command::PrepareShutdown));
     });
     let within_deadline = completed.recv_timeout(Duration::from_secs(8)).ok();
     std::fs::write(root.join("release"), "").unwrap();
@@ -225,8 +226,8 @@ while not root.joinpath('release').exists() and time.monotonic() < deadline:
         within_deadline.unwrap_or_else(|| completed.recv_timeout(Duration::from_secs(10)).unwrap());
     shutdown.join().unwrap();
     assert!(probe.join().unwrap().is_ok());
-    drop(erased);
-    drop(backend);
+    control.shutdown();
+    server.join().unwrap();
     std::fs::remove_dir_all(root).unwrap();
     assert!(
         saw_start,
