@@ -1712,3 +1712,102 @@ mod steward_tests;
 
 #[path = "task_workspace_socket_tests.rs"]
 mod task_workspace_socket_tests;
+#[test]
+fn concurrent_creation_keeps_manager_unarchived_until_descendants_are_completed() {
+    with_creation_daemon_seed(
+        |storage_root, project_path| {
+            let project = Project::from_path(project_path.to_owned());
+            let mut root = AgentSession::new(project.id, ProviderKind::Codex);
+            root.begin_turn("Delegate the managed work");
+            root.finish_active_turn(crate::model::TurnStatus::Completed);
+            let mut manager = AgentSession::new(project.id, ProviderKind::Codex);
+            manager.parent_session_id = Some(root.id);
+            manager.begin_turn("Prepare result");
+            manager.finish_active_turn(crate::model::TurnStatus::Completed);
+            let store = StateStore::daemon(storage_root.join("app.db"));
+            let mut state = store.load().unwrap();
+            state.projects.push(project);
+            state.sessions.extend([root.clone(), manager.clone()]);
+            state.mark_session_dirty(root.id);
+            state.mark_session_dirty(manager.id);
+            store.save(&mut state).unwrap();
+            (root, manager)
+        },
+        |client, observer, _storage_root, project_path, _address, (root, manager)| {
+            let complete = |owner: Uuid, target: Uuid| {
+                let results = client
+                    .request(
+                        owner,
+                        Uuid::nil(),
+                        Command::StewardQuery {
+                            query: waku_protocol::StewardQuery::Results {
+                                session_ids: vec![target],
+                                handled: vec![],
+                                max_chars: None,
+                            },
+                        },
+                    )
+                    .unwrap();
+                let receipt =
+                    serde_json::to_value(results).unwrap()["results"][0]["receipt"].clone();
+                client.request(owner,Uuid::nil(),serde_json::from_value(json!({"type":"stewardLifecycle","operation":{"type":"complete","session_id":target,"receipt":receipt,"disposition":"accepted","summary":{"goal":"Fixture","result":"Verified","verification":"Inspected controlled result","decisions":null,"unresolved":null,"resource_retention":null}}})).unwrap())
+            };
+            let manager_id = manager.id;
+            let held = std::thread::spawn(move || {
+                observer.request(manager_id,Uuid::nil(),serde_json::from_value(json!({"type":"createSession","provider":"codex","prompt":"hold fixture turn","workspace":"local","idempotencyKey":"held-archive"})).unwrap())
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            while !project_path.join("creation-waiting").exists() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let rejected = complete(root.id, manager.id).unwrap_err();
+            assert!(
+                rejected.to_string().contains("unfinished child creation"),
+                "{rejected}"
+            );
+            let ResponsePayload::SessionCreated {session:independent,..}=client.request(manager.id,Uuid::nil(),serde_json::from_value(json!({"type":"createSession","provider":"codex","prompt":"write fixture result","idempotencyKey":"independent-archive"})).unwrap()).unwrap() else {panic!("independent creation")};
+            assert!(!held.is_finished());
+            std::fs::write(project_path.join("creation-release"), "continue").unwrap();
+            let ResponsePayload::SessionCreated { session: first, .. } =
+                held.join().unwrap().unwrap()
+            else {
+                panic!("held creation")
+            };
+            for id in [first.id, independent.id] {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let ResponsePayload::Session {
+                        session: Some(session),
+                    } = client
+                        .request(id, Uuid::nil(), Command::HydrateSession { session_id: id })
+                        .unwrap()
+                    else {
+                        panic!("child history")
+                    };
+                    if session
+                        .turns
+                        .last()
+                        .is_some_and(|t| t.status == crate::model::TurnStatus::Completed)
+                    {
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            assert!(
+                complete(root.id, manager.id).is_err(),
+                "completed turns still require explicit descendant acceptance"
+            );
+            complete(manager.id, first.id).unwrap();
+            complete(manager.id, independent.id).unwrap();
+            let ResponsePayload::LifecycleCompleted { session, .. } =
+                complete(root.id, manager.id).unwrap()
+            else {
+                panic!("manager completion")
+            };
+            assert!(session.archived);
+        },
+    );
+}

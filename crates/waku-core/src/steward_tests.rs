@@ -166,7 +166,19 @@ fn mcp_stdio_creates_real_child_and_rejects_spoofed_arguments() {
             .collect();
         assert_eq!(replies.len(), 6);
         assert_eq!(replies[5]["error"]["code"], -32600);
-        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 11);
+        let mut tool_names = replies[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        tool_names.sort_unstable();
+        assert_eq!(tool_names, vec![
+            "waku_cancel", "waku_complete", "waku_continue", "waku_continue_status",
+            "waku_decision", "waku_list_sessions", "waku_prompt", "waku_prompt_status",
+            "waku_result", "waku_results", "waku_spawn_session", "waku_status",
+            "waku_wait", "waku_workspace",
+        ]);
         assert_eq!(replies[2]["error"]["code"], -32602);
         assert_eq!(replies[3]["result"]["isError"], true);
         assert_eq!(replies[4]["result"]["isError"], false);

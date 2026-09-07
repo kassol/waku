@@ -93,7 +93,10 @@ impl WakuBackend {
         });
         let _creation_lock = creation_lock.as_ref().map(|lock| lock.lock());
         events.ensure_steward_active()?;
-        let _manager = events.reserve_steward_target(parent_id)?;
+        // Continuation holds its user-authority boundary; independent ordinary
+        // creations only serialize their durable claim with lifecycle completion.
+        let _manager = idempotency_key.as_ref().filter(|key| key.starts_with("continuation:")).map(|_|events.reserve_steward_target(parent_id)).transpose()?;
+        let claim_gate = self.workspace_start_gate.lock();
         self.ensure_session_writable(parent_id)?;
         // Revalidate after waiting for this key, including retries of a cached outcome.
         let (mut parent, project) = {
@@ -126,7 +129,6 @@ impl WakuBackend {
         };
         if let Some(key) = &idempotency_key && let Some(id) = key.strip_prefix("continuation:") {
             let id = Uuid::parse_str(id)?;
-            let _workspace = self.workspace_start_gate.lock();
             let mut state = self.task_state.lock();
             let source = state.sessions.iter_mut().find(|s|s.continuations.iter().any(|c|c.id == id)).ok_or_else(||anyhow!("Continuation intent unavailable"))?;
             self.task_store.hydrate(source)?;
@@ -172,6 +174,7 @@ impl WakuBackend {
             self.saving_failed.store(true, Ordering::Release);
             error
         })?;
+        drop(claim_gate);
         if !claimed {
             if record.project_id != project.id {
                 bail!("the previous creation belongs to a different steward project");

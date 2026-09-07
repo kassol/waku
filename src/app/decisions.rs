@@ -1218,8 +1218,7 @@ pub(super) fn merge_saved_message(
         })
         .map(|index| index + 1);
     let position = next
-        .or(previous_turn_end)
-        .or_else(|| previous.map(|index| index + 1))
+        .or_else(|| previous.map(|index| index + 1).max(previous_turn_end))
         .unwrap_or(local.messages.len());
     for block in &mut local.transcript_blocks {
         if block.after_message > position
@@ -1330,6 +1329,31 @@ mod tests {
         assert_eq!(local.messages[2].id, answer_id);
         assert_eq!(local.messages[3].content, "New instruction");
         assert_eq!(local.messages[4].content, "New streaming response");
+    }
+
+    #[test]
+    fn decision_hydration_keeps_consecutive_summaries_after_unthreaded_user() {
+        let mut local = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        local.begin_turn("Original task");
+        let mut hydrated = local.clone();
+        local.push_message(MessageRole::Assistant, "Finished response");
+        hydrated.push_message(MessageRole::Assistant, "Finished response");
+        local.finish_active_turn(TurnStatus::Completed);
+        hydrated.finish_active_turn(TurnStatus::Completed);
+        let summary = Message::new(MessageRole::Assistant, "Original completion");
+        let instruction = Message::new(MessageRole::User, "Continue verification");
+        assert_eq!(instruction.turn_id, None);
+        for message in [summary, instruction] {
+            local.messages.push(message.clone());
+            hydrated.messages.push(message);
+        }
+        let next_summary = Message::new(MessageRole::Assistant, "Continued completion");
+        let id = next_summary.id;
+        hydrated.messages.push(next_summary);
+        assert!(merge_saved_message(&mut local, &hydrated, id, MessageRole::Assistant, None));
+        assert_eq!(local.messages.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(),
+            vec!["Original task", "Finished response", "Original completion", "Continue verification", "Continued completion"]);
+        assert!(!merge_saved_message(&mut local, &hydrated, id, MessageRole::Assistant, None));
     }
 
     #[test]

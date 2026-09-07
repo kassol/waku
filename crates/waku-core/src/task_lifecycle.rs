@@ -303,11 +303,15 @@ impl WakuBackend {
         state: &mut PersistedState,
         child_id: Uuid,
     ) -> anyhow::Result<()> {
+        let creations = self.task_store.unfinished_creations()?;
         let mut pending = vec![child_id];
         let mut seen = HashSet::new();
         while let Some(id) = pending.pop() {
             if !seen.insert(id) {
                 bail!("Task relationship contains a cycle")
+            }
+            if creations.iter().any(|record| record.manager_session_id == id) {
+                bail!("Task still owns an unfinished child creation");
             }
             let session = state
                 .sessions

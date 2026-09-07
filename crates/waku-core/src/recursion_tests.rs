@@ -240,7 +240,7 @@ fn cross_provider_permissions_reject_unmapped_modes_in_both_directions() {
 }
 
 #[test]
-fn claude_child_waits_for_user_without_steward_answering() {
+fn claude_child_keeps_native_request_pending_without_explicit_decision() {
     with_creation_daemon(|client, _, root, project_path, address| {
         let (parent, _, config, runtime) = start_steward(&client, root, project_path);
         let token = config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"]
@@ -270,7 +270,7 @@ fn claude_child_waits_for_user_without_steward_answering() {
                     json!({"session_ids":[child]}),
                 );
                 if status["sessions"][0]["status"] == "waiting" {
-                    assert_eq!(status["sessions"][0]["waiting_for"], json!([reason]));
+                    assert_eq!(status["sessions"][0]["waiting_for"], json!(["managerDecision", reason]));
                     assert_eq!(status["sessions"][0]["turn"]["status"], "running");
                     break;
                 }
@@ -286,6 +286,21 @@ fn claude_child_waits_for_user_without_steward_answering() {
                 json!({"session_id":child}),
             );
             assert_eq!(result["session"]["turn"]["status"], "running");
+            let ResponsePayload::Session { session: Some(pending) } = client
+                .request(Uuid::nil(), Uuid::nil(), Command::HydrateSession { session_id: child })
+                .unwrap()
+            else { panic!("pending child unavailable") };
+            let expected_id = if reason == "permission" { "approval" } else { "answer" };
+            if reason == "permission" {
+                assert_eq!(pending.pending_permission.as_ref().unwrap().request_id, expected_id);
+            } else {
+                assert_eq!(pending.pending_user_input.as_ref().unwrap().request_id, expected_id);
+            }
+            let native = pending.decision_requests.iter()
+                .find_map(|request| request.native.as_ref()).unwrap();
+            assert_eq!(native.request.request_id(), expected_id);
+            assert!(native.response.is_none());
+            assert!(native.outcome.is_none());
             let command = if reason == "permission" {
                 Command::Respond {
                     request_id: "approval".into(),
@@ -324,7 +339,31 @@ fn claude_child_waits_for_user_without_steward_answering() {
                     .unwrap(),
             )
             .unwrap();
-            client.request(child, child_runtime, command).unwrap();
+            assert!(client.request(child, child_runtime, command).is_err());
+            let ResponsePayload::StewardDecisions { requests } = client.request(parent.id, runtime, Command::StewardDecision { operation: crate::model::StewardDecisionOperation::List { session_id: Some(child) } }).unwrap() else { panic!("native decision") };
+            let response = if reason == "permission" {
+                crate::model::NativeDecisionResponse::Permission { option_id: "allow".into() }
+            } else {
+                crate::model::NativeDecisionResponse::UserInput { answers: vec![crate::model::UserInputAnswer { question_id:"Continue?".into(),answers:vec!["Yes".into()] }] }
+            };
+            let ResponsePayload::StewardDecisions { requests: escalated } = client.request(
+                parent.id,
+                runtime,
+                Command::StewardDecision {
+                    operation: crate::model::StewardDecisionOperation::Escalate {
+                        session_id: child,
+                        request_id: requests[0].id,
+                        reason: "Fixture requires an explicit user decision".into(),
+                        options: vec![crate::model::DecisionOption {
+                            label: "Continue".into(),
+                            impact: "Resume the pending fixture operation".into(),
+                        }],
+                        impact: "Resume the pending fixture operation".into(),
+                    },
+                },
+            ).unwrap() else { panic!("native escalation") };
+            assert_eq!(escalated[0].state, crate::model::DecisionState::WaitingUser);
+            client.request(parent.id,runtime,Command::AnswerNativeDecision {child_session_id:child,request_id:requests[0].id,response}).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
                 let result = mcp_tool(

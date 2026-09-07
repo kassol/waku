@@ -1224,3 +1224,6 @@ continuation.explanation: 查看历史保持只读。提交此指令后才请求
 continuation.received: 继续指令已送达传输层
 continuation.queued: 继续指令已排队
 continuation.retry: 新建操作重试
+
+errors.unsafe_quit: "Waku 无法安全退出：%{error}。未保存的历史仍有丢失风险。修复保存故障后请重试退出。"
+session.safe_exit_pending: "正在停止任务并保存历史，完成后退出…"

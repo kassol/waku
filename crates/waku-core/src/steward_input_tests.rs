@@ -2021,3 +2021,6 @@ fn lifecycle_socket_managed_noncode_and_latest_code_evidence_are_distinct() {
 
 #[path = "task_continuation_tests.rs"]
 mod task_continuation_tests;
+
+#[path = "collaboration_lifecycle_tests.rs"]
+mod collaboration_lifecycle_tests;
