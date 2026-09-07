@@ -15,6 +15,7 @@ impl WakuBackend {
         events.ensure_steward_active()?;
         self.refresh_decisions()?;
         match operation {
+            StewardDecisionOperation::DecideNative { session_id, request_id, response, authority_message_id } => self.decide_native(caller, session_id, request_id, response, authority_message_id, events),
             StewardDecisionOperation::Escalate {
                 session_id,
                 request_id,
@@ -115,6 +116,7 @@ impl WakuBackend {
                     escalation: None,
                     upstream_request_id: None,
                     user_answer: None,
+                    native: None,
                 };
                 state
                     .sessions
@@ -194,6 +196,7 @@ impl WakuBackend {
                         .iter()
                         .find(|r| r.id == request_id)
                         .ok_or_else(|| anyhow!("Decision request unavailable"))?;
+                    if existing.native.is_some() { bail!("Native requests require a typed native response"); }
                     if existing.escalation.is_some() {
                         bail!("Escalated requests require the user's answer in the main session");
                     }
@@ -279,6 +282,10 @@ impl WakuBackend {
             let Some(request) = child.decision_requests.iter().find(|r| r.id == request_id) else {
                 return Ok(());
             };
+            if request.native.is_some() {
+                drop(state);
+                return self.deliver_native_decision(child_id, request_id, events);
+            }
             // Release the submitting turn first; a decision never steers the still-running question.
             if request.state != DecisionState::PendingReceipt
                 || child.active_turn_id().is_some()
@@ -465,7 +472,7 @@ impl WakuBackend {
                 let valid = if let Some(parent) = parent {
                     self.task_store.hydrate(parent)?;
                     parent.project_id == child.project_id
-                        && child.parent_session_id == Some(parent.id)
+                        && (child.parent_session_id == Some(parent.id) || (child.parent_session_id.is_none() && child.id == parent.id && request.native.is_some()))
                         && parent.cancellation_requested_turn_id.is_none()
                         && !parent.turns.last().is_some_and(|t| {
                             matches!(t.status, TurnStatus::Interrupted | TurnStatus::Failed)
@@ -632,6 +639,16 @@ pub(super) fn decision_projection(
         result.state,
         DecisionState::Resolved | DecisionState::Failed | DecisionState::Invalidated
     ) {
+        return result;
+    }
+    if request.native.is_some() {
+        // Forwarded records carry leaf-native context but do not own its live request.
+        let owns_native = request.native.as_ref().is_some_and(|native| child.id == native.session_id);
+        if owns_native && (super::steward_native::validate_native_live(child, request).is_err()
+            || request.native.as_ref().is_some_and(|native| child.runtime_event_cursor.is_none_or(|cursor|cursor.runtime_id != native.runtime_id))) {
+            result.state = DecisionState::Invalidated;
+            result.reason = Some("Original native request is no longer active".into());
+        }
         return result;
     }
     if let Some(delivery) = child.input_deliveries.iter().find(|d| d.id == request.id) {

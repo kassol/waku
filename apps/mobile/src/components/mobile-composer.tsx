@@ -372,13 +372,16 @@ export function MobileComposer({
 
   return (
     <View style={[styles.shell, { paddingBottom: Math.max(insets.bottom, 10) }]}>
-      {permission && !userInput && (
+      {session.parent_session_id && (permission || userInput) && (
+        <RequestPanel borderColor={theme.warning}><Text style={{ color: theme.text }}>The manager is handling this request. Review it in the desktop main session.</Text></RequestPanel>
+      )}
+      {!session.parent_session_id && permission && !userInput && (
         <PermissionPanel
           permission={permission}
           onRespond={(optionId) => runtime.respond(session.id, permission.requestId, optionId)}
         />
       )}
-      {userInput && (
+      {!session.parent_session_id && userInput && (
         <UserInputPanel
           input={userInput}
           onSubmit={(answers) => runtime.respondUserInput(session.id, userInput.requestId, answers)}
@@ -597,6 +600,7 @@ function PermissionPanel({
   const theme = useTheme();
   const [responding, setResponding] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => { setResponding(null); setError(null); }, [permission.requestId]);
   return (
     <RequestPanel borderColor={theme.warning}>
       <View style={styles.requestHeading}>
@@ -629,7 +633,6 @@ function PermissionPanel({
               void Haptics.selectionAsync();
               void onRespond(option.id).catch((cause) => {
                 setError(cause instanceof Error ? cause.message : String(cause));
-                setResponding(null);
               });
             }}
             style={({ pressed }) => [
@@ -719,7 +722,6 @@ function UserInputPanel({
       }));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
-      setSubmitting(false);
     }
   }
 

@@ -45,14 +45,7 @@ enum CommandMessage {
     Prompt(String),
     Steer(String),
     Cancel,
-    Respond {
-        request_id: String,
-        option_id: String,
-    },
-    RespondUserInput {
-        request_id: String,
-        answers: Vec<UserInputAnswer>,
-    },
+    NativeResponse { request_id: String, token: uuid::Uuid, message: Value, delivery_id: Option<uuid::Uuid> },
     Rollback {
         turns: usize,
         response: Sender<Result<(), String>>,
@@ -130,6 +123,7 @@ impl BackgroundRpcState {
 }
 
 pub struct CodexDriver {
+    native_requests: super::NativeRequests,
     active_turn: Arc<Mutex<Option<String>>>,
     shutdown_requested: Arc<AtomicBool>,
     commands: Sender<CommandMessage>,
@@ -312,6 +306,9 @@ impl CodexDriver {
             pending: None,
         }));
 
+        let native_requests = super::NativeRequests::default();
+        let writer_native_requests = native_requests.clone();
+        let reader_native_requests = native_requests.clone();
         let pending_deliveries = Arc::new(Mutex::new(HashMap::new()));
         let writer_pending_deliveries = pending_deliveries.clone();
         let pending_prompts = Arc::new(Mutex::new(HashSet::new()));
@@ -436,6 +433,13 @@ impl CodexDriver {
                 let mut next_request_id = 10_u64;
                 while let Ok(command) = command_rx.recv() {
                     let (command, delivery_id, delivery_turn) = match command {
+                        CommandMessage::NativeResponse { request_id, token, message, delivery_id } => {
+                            if let Err(error) = super::write_native_response(&mut stdin, &writer_native_requests, &request_id, token, &message, delivery_id, &writer_events) {
+                                let _ = writer_events.send(DriverEvent::Error(format!("Codex native response transport: {error}")));
+                                break;
+                            }
+                            continue;
+                        }
                         CommandMessage::Deliver { prompt, id, steer, expected_turn } => (if steer { CommandMessage::Steer(prompt) } else { CommandMessage::Prompt(prompt) }, Some(id), expected_turn),
                         command => (command, None, None),
                     };
@@ -563,31 +567,7 @@ impl CodexDriver {
                                 "params": {"threadId": thread_id, "turnId": turn_id}
                             })
                         }
-                        CommandMessage::Respond {
-                            request_id,
-                            option_id,
-                        } => {
-                            let id = parse_rpc_id(&request_id);
-                            json!({
-                                "id": id,
-                                "result": {"decision": option_id}
-                            })
-                        }
-                        CommandMessage::RespondUserInput {
-                            request_id,
-                            answers,
-                        } => {
-                            let answers = answers
-                                .into_iter()
-                                .map(|answer| {
-                                    (answer.question_id, json!({"answers": answer.answers}))
-                                })
-                                .collect::<serde_json::Map<_, _>>();
-                            json!({
-                                "id": parse_rpc_id(&request_id),
-                                "result": {"answers": answers}
-                            })
-                        }
+                        CommandMessage::NativeResponse { .. } => unreachable!(),
                         CommandMessage::Rollback { turns, response } => {
                             let Some(thread_id) = wait_for_thread_id(&writer_thread_id) else {
                                 let _ = response
@@ -814,6 +794,7 @@ impl CodexDriver {
             .name("waku-codex-reader".into())
             .spawn(move || {
                 let mut stream_state = CodexStreamState {
+                    native_requests: reader_native_requests.clone(),
                     pending_prompts,
                     pending_deliveries,
                     ..CodexStreamState::default()
@@ -892,6 +873,7 @@ impl CodexDriver {
                         }
                     }
                 }
+                reader_native_requests.lock().clear();
             })?;
 
         let last_visible_stderr = Arc::new(Mutex::new(None::<String>));
@@ -966,6 +948,7 @@ impl CodexDriver {
             })?;
 
         Ok(Self {
+            native_requests,
             active_turn: turn_id,
             shutdown_requested,
             commands,
@@ -1159,18 +1142,16 @@ impl DriverControl for CodexDriver {
             .send(CommandMessage::StopBackgroundWork { key, control_id });
     }
 
+    fn respond_tracked(&self, request_id: String, response: super::NativeResponse, delivery_id: uuid::Uuid) -> anyhow::Result<()> {
+        self.send_native_response(request_id, response, Some(delivery_id))
+    }
+
     fn respond(&self, request_id: String, option_id: String) {
-        let _ = self.commands.send(CommandMessage::Respond {
-            request_id,
-            option_id,
-        });
+        let _ = self.send_native_response(request_id, super::NativeResponse::Permission { option_id }, None);
     }
 
     fn respond_user_input(&self, request_id: String, answers: Vec<UserInputAnswer>) {
-        let _ = self.commands.send(CommandMessage::RespondUserInput {
-            request_id,
-            answers,
-        });
+        let _ = self.send_native_response(request_id, super::NativeResponse::UserInput { answers }, None);
     }
 
     fn goal(&self, operation: GoalOperation) {
@@ -1480,6 +1461,7 @@ const CODEX_CITATION_SEPARATOR: char = '\u{e202}';
 
 #[derive(Default)]
 struct CodexStreamState {
+    native_requests: super::NativeRequests,
     pending_prompts: Arc<Mutex<HashSet<u64>>>,
     pending_deliveries: Arc<Mutex<HashMap<u64, (uuid::Uuid, bool)>>>,
     citations: HashMap<String, String>,
@@ -1970,6 +1952,26 @@ fn handle_codex_message(
         .or_else(|| params.get("conversationId"))
         .or_else(|| params.pointer("/thread/id"))
         .and_then(Value::as_str);
+    if method == "serverRequest/resolved" {
+        if let Some(id) = params.get("requestId").filter(|id| id.is_string() || id.is_number()).map(rpc_id_string) {
+            let mut requests = stream_state.native_requests.lock();
+            if requests.get(&id).is_some_and(|request| {
+                request.thread_id.as_deref() == message_thread_id
+            }) {
+                requests.remove(&id);
+                let _ = events.send(DriverEvent::NativeRequestClosed { request_id: id });
+            }
+        }
+        return;
+    }
+    if matches!(method, "turn/started" | "turn/completed") {
+        let thread = message_thread_id.map(str::to_owned).or_else(|| thread_id.lock().clone());
+        let turn = params.pointer("/turn/id").and_then(Value::as_str);
+        stream_state.native_requests.lock().retain(|_, request| {
+            request.thread_id != thread || (method == "turn/completed"
+                && request.turn_id.is_some() && request.turn_id.as_deref() != turn)
+        });
+    }
     if value.get("id").is_none()
         && let Some(message_thread_id) = message_thread_id
         && thread_id.lock().as_deref() != Some(message_thread_id)
@@ -2170,14 +2172,29 @@ fn handle_codex_message(
         "item/tool/requestUserInput" if value.get("id").is_some() => {
             let questions = codex_user_input_questions(&params);
             if !questions.is_empty() {
+                let wire_id = value.get("id").unwrap();
+                let request_id = rpc_id_string(wire_id);
+                stream_state.native_requests.lock().entry(request_id.clone()).or_insert_with(|| super::NativeRequest::new(
+                    wire_id.clone(), params.clone(), Some(questions.clone()),
+                    message_thread_id.map(str::to_owned).or_else(|| thread_id.lock().clone()),
+                    params.get("turnId").and_then(Value::as_str).map(str::to_owned).or_else(|| {
+                        if message_thread_id.is_none_or(|id| thread_id.lock().as_deref() == Some(id)) { turn_id.lock().clone() } else { None }
+                    })));
                 let _ = events.send(DriverEvent::UserInputRequested {
-                    request_id: rpc_id_string(value.get("id").unwrap()),
+                    request_id,
                     questions,
                 });
             }
         }
         method if value.get("id").is_some() && method.contains("requestApproval") => {
-            let request_id = rpc_id_string(value.get("id").unwrap());
+            let wire_id = value.get("id").unwrap();
+            let request_id = rpc_id_string(wire_id);
+            stream_state.native_requests.lock().entry(request_id.clone()).or_insert_with(|| super::NativeRequest::new(
+                wire_id.clone(), params.clone(), None,
+                message_thread_id.map(str::to_owned).or_else(|| thread_id.lock().clone()),
+                params.get("turnId").and_then(Value::as_str).map(str::to_owned).or_else(|| {
+                        if message_thread_id.is_none_or(|id| thread_id.lock().as_deref() == Some(id)) { turn_id.lock().clone() } else { None }
+                    })));
             let (title, detail) = approval_copy(method, &params);
             let _ = events.send(DriverEvent::Permission {
                 request_id,
@@ -2199,7 +2216,8 @@ fn handle_codex_message(
                         label: tr!("common.deny"),
                         allow: false,
                     },
-                ],
+                ].into_iter().filter(|option| params.get("availableDecisions").is_none_or(|values|
+                    values.as_array().is_some_and(|values| values.iter().any(|value| value.as_str() == Some(option.id.as_str()))))).collect(),
             });
         }
         _ => {}
@@ -2632,17 +2650,8 @@ fn approval_copy(method: &str, params: &Value) -> (String, String) {
 }
 
 fn rpc_id_string(value: &Value) -> String {
-    value
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| value.to_string())
-}
-
-fn parse_rpc_id(value: &str) -> Value {
-    value
-        .parse::<u64>()
-        .map(Value::from)
-        .unwrap_or_else(|_| Value::String(value.to_owned()))
+    // Keep JSON string IDs distinct from numeric IDs, including numeric-looking strings.
+    value.to_string()
 }
 
 fn split_camel_case(value: &str) -> String {
@@ -2693,6 +2702,7 @@ mod tests {
     use super::*;
 
     struct GoalHarness {
+        native_requests: super::super::NativeRequests,
         thread_id: Mutex<Option<String>>,
         turn_id: Mutex<Option<String>>,
         turn_ids: Mutex<Vec<String>>,
@@ -2712,6 +2722,7 @@ mod tests {
             let (events, received) = crate::driver::test_event_channel();
             let (commands, command_rx) = unbounded();
             Self {
+                native_requests: super::super::NativeRequests::default(),
                 thread_id: Mutex::new(Some("thread-1".to_owned())),
                 turn_id: Mutex::new(None),
                 turn_ids: Mutex::new(Vec::new()),
@@ -2728,7 +2739,7 @@ mod tests {
         }
 
         fn handle(&self, value: Value) {
-            let mut stream_state = CodexStreamState::default();
+            let mut stream_state = CodexStreamState { native_requests: self.native_requests.clone(), ..CodexStreamState::default() };
             handle_codex_message(
                 value,
                 &self.thread_id,
@@ -3076,6 +3087,7 @@ mod tests {
     fn model_changes_reach_the_running_thread_but_mode_changes_ask_for_a_restart() {
         let (commands, command_rx) = unbounded();
         let driver = CodexDriver {
+            native_requests: crate::driver::NativeRequests::default(),
             active_turn: Arc::new(Mutex::new(None)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             commands,
@@ -3928,4 +3940,99 @@ mod tests {
         assert!(codex_plan_usage(Some(&json!({"planType": "plus"}))).is_none());
         assert!(codex_plan_usage(None).is_none());
     }
+    #[test]
+    fn native_response_codex_preserves_rpc_id_type_and_invalidates_finished_turns() {
+        let harness = GoalHarness::new();
+        harness.handle(json!({"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"t"}}}));
+        let _ = harness.received.recv().unwrap();
+        for wire_id in [json!(17), json!("17")] {
+            harness.handle(json!({"id":wire_id,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"t","availableDecisions":["accept","decline"]}}));
+        }
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let DriverEvent::Permission { request_id, options, .. } = harness.received.recv().unwrap() else { panic!("approval request"); };
+            assert_eq!(options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), vec!["accept","decline"]);
+            ids.push(request_id);
+        }
+        assert_ne!(ids[0], ids[1]);
+        for (id, expected) in ids.iter().zip([json!(17),json!("17")]) {
+            let response = super::super::NativeResponse::Permission { option_id:"accept".into() };
+            let request = super::super::native_request(&harness.native_requests, id, &response).unwrap();
+            assert!(codex_native_response(&request, super::super::NativeResponse::Permission { option_id:"acceptForSession".into() }).is_err());
+            let message = codex_native_response(&request, response).unwrap();
+            let mut bytes = Vec::new();
+            super::super::write_native_response(&mut bytes, &harness.native_requests, id, request.token, &message, Some(uuid::Uuid::new_v4()), &harness.events).unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["id"], expected);
+            assert!(matches!(harness.received.recv().unwrap(), DriverEvent::InputDeliveryOutcome(outcome) if outcome.confirmation == Some(crate::model::InputConfirmation::Transport)));
+        }
+        harness.handle(json!({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"t","status":"completed"}}}));
+        assert!(harness.native_requests.lock().is_empty());
+    }
+
+    #[test]
+    fn native_response_codex_resolved_request_preserves_other_rpc_id_types() {
+        let harness = GoalHarness::new();
+        for wire_id in [json!(17), json!("17")] {
+            harness.handle(json!({"id":wire_id,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"t"}}));
+            assert!(matches!(harness.received.recv().unwrap(), DriverEvent::Permission { .. }));
+        }
+        let request = harness.native_requests.lock().get("17").unwrap().clone();
+        harness.handle(json!({"method":"serverRequest/resolved","params":{"threadId":"other","requestId":17}}));
+        assert!(harness.native_requests.lock().contains_key("17"));
+        harness.handle(json!({"method":"serverRequest/resolved","params":{"threadId":"thread-1","requestId":17}}));
+        assert!(harness.native_requests.lock().contains_key("\"17\""));
+        assert!(matches!(harness.received.recv().unwrap(), DriverEvent::NativeRequestClosed { request_id } if request_id == "17"));
+        let mut bytes = Vec::new();
+        super::super::write_native_response(&mut bytes, &harness.native_requests, "17", request.token, &json!({}), Some(uuid::Uuid::new_v4()), &harness.events).unwrap();
+        assert!(bytes.is_empty());
+        assert!(matches!(harness.received.recv().unwrap(), DriverEvent::InputDeliveryOutcome(outcome) if outcome.state == crate::model::InputDeliveryState::Failed && outcome.confirmation.is_none()));
+    }
+
+    #[test]
+    fn native_response_codex_requires_every_question_without_multiselect_loss() {
+        let harness = GoalHarness::new();
+        harness.handle(json!({"id":"question","method":"item/tool/requestUserInput","params":{"threadId":"thread-1","questions":[{"id":"q1","question":"Format?"},{"id":"q2","question":"Where?"}]}}));
+        let DriverEvent::UserInputRequested { request_id, .. } = harness.received.recv().unwrap() else { panic!("questions"); };
+        let mut answers = vec![UserInputAnswer { question_id:"q1".into(), answers:vec!["JSON".into()] }, UserInputAnswer { question_id:"q2".into(), answers:vec!["Local".into()] }];
+        assert!(super::super::native_request(&harness.native_requests, &request_id, &super::super::NativeResponse::UserInput { answers:answers[..1].to_vec() }).is_err());
+        answers[0].answers.push("CSV".into());
+        assert!(super::super::native_request(&harness.native_requests, &request_id, &super::super::NativeResponse::UserInput { answers:answers.clone() }).is_err());
+        answers[0].answers.pop();
+        let response = super::super::NativeResponse::UserInput { answers };
+        let request = super::super::native_request(&harness.native_requests, &request_id, &response).unwrap();
+        let message = codex_native_response(&request, response).unwrap();
+        assert_eq!(message["id"], "question");
+        assert_eq!(message["result"]["answers"], json!({"q1":{"answers":["JSON"]},"q2":{"answers":["Local"]}}));
+    }
+
+}
+
+impl CodexDriver {
+    fn send_native_response(&self, request_id: String, response: super::NativeResponse, delivery_id: Option<uuid::Uuid>) -> anyhow::Result<()> {
+        let request = super::native_request(&self.native_requests, &request_id, &response)?;
+        let message = codex_native_response(&request, response)?;
+        self.commands.send(CommandMessage::NativeResponse { request_id, token: request.token, message, delivery_id })
+            .map_err(|_| anyhow!("Codex response transport is closed"))
+    }
+}
+
+fn codex_native_response(request: &super::NativeRequest, response: super::NativeResponse) -> anyhow::Result<Value> {
+    let result = match response {
+        super::NativeResponse::Permission { option_id } => {
+            anyhow::ensure!(matches!(option_id.as_str(), "accept" | "acceptForSession" | "decline"), "unknown Codex permission option");
+            if let Some(options) = request.input.get("availableDecisions") {
+                anyhow::ensure!(options.as_array().is_some_and(|options| options.iter().any(|option| option.as_str() == Some(&option_id))), "Codex did not offer this permission option");
+            }
+            json!({"decision":option_id})
+        }
+        super::NativeResponse::UserInput { answers } => {
+            anyhow::ensure!(answers.iter().all(|answer| request.input.get("questions").and_then(Value::as_array)
+                .is_some_and(|questions| questions.iter().any(|question| question.get("id").and_then(Value::as_str) == Some(answer.question_id.as_str())))),
+                "Codex question has no matching native ID");
+            let answers = answers.into_iter().map(|answer| (answer.question_id, json!({"answers":answer.answers})))
+                .collect::<serde_json::Map<_, _>>();
+            json!({"answers":answers})
+        }
+    };
+    Ok(json!({"id":request.wire_id,"result":result}))
 }

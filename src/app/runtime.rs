@@ -689,6 +689,7 @@ impl Waku {
             self.task_switcher.remove(*session_id);
         }
         self.state.projects = snapshot.projects;
+        self.sync_decision_catalog(cx);
 
         let attach = self
             .state
@@ -2624,6 +2625,7 @@ impl Waku {
                 park_announced: false,
                 stream_remeasure_pending: false,
                 pending_permission,
+                native_responses: HashSet::new(),
                 pending_user_input,
                 pending_computer_approval: None,
                 computer_use_previews: Vec::new(),
@@ -3321,6 +3323,7 @@ impl Waku {
         let mut persisted_state_changed = false;
         let mut force_save = false;
         let mut selected_changed = false;
+        let mut decisions_changed = false;
         for session_id in session_ids {
             let Some(mut runtime) = self.runtimes.remove(&session_id) else {
                 continue;
@@ -3379,6 +3382,7 @@ impl Waku {
                 } else {
                     runtime_changed = true;
                 }
+                decisions_changed |= super::decisions::event_changes_decisions(&event);
                 keep_runtime &= self.handle_driver_event(session_id, &mut runtime, event, true, cx);
                 if !keep_runtime {
                     break;
@@ -3397,6 +3401,9 @@ impl Waku {
             }
         }
 
+        if decisions_changed {
+            self.sync_decision_catalog(cx);
+        }
         if !self.pending_queue_drains.is_empty() {
             let drains = std::mem::take(&mut self.pending_queue_drains);
             for session_id in drains {

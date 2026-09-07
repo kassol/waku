@@ -1243,8 +1243,8 @@ impl Waku {
                     "other",
                     |option| if option.allow { "allow" } else { "deny" },
                 );
+            if !runtime.native_responses.insert(request_id.clone()) { return; }
             runtime.driver.respond(request_id, option_id);
-            runtime.pending_permission = None;
             Some(decision)
         } else {
             None
@@ -1256,9 +1256,6 @@ impl Waku {
                     kind: "provider",
                     decision,
                 });
-        }
-        if let Some(session) = self.selected_session_mut() {
-            session.status = SessionStatus::Working;
         }
         cx.notify();
     }
@@ -1416,18 +1413,15 @@ impl Waku {
             let Some(runtime) = self.runtimes.get_mut(&session_id) else {
                 return;
             };
-            let Some(pending) = runtime.pending_user_input.take() else {
+            let Some(pending) = runtime.pending_user_input.as_ref() else {
                 return;
             };
+            if !runtime.native_responses.insert(pending.request_id.clone()) { return; }
             let answers = pending.answers();
             runtime
                 .driver
-                .respond_user_input(pending.request_id, answers);
-            if let Some(session) = self.state.session_mut(session_id) {
-                session.status = SessionStatus::Working;
-            }
-            self.user_input_answer
-                .update(cx, |input, cx| input.clear(cx));
+                .respond_user_input(pending.request_id.clone(), answers);
+
         } else {
             self.sync_user_input_answer(cx);
         }

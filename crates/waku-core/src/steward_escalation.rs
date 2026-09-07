@@ -144,9 +144,18 @@ impl WakuBackend {
         answer: String,
         events: &EventSink,
     ) -> anyhow::Result<ResponsePayload> {
+        self.answer_decision_with_native(child_id, request_id, answer, None, events)
+    }
+
+    pub(super) fn answer_decision_with_native(&self, child_id: Uuid, request_id: Uuid, answer: String, response: Option<crate::model::NativeDecisionResponse>, events: &EventSink) -> anyhow::Result<ResponsePayload> {
         if events.scoped_project.is_some() {
             bail!("Only the user can answer escalated decisions");
         }
+        let answer = if let Some(response) = &response {
+            let state = self.task_state.lock();
+            let request = state.sessions.iter().flat_map(|s|&s.decision_requests).find(|r|r.id==request_id).ok_or_else(||anyhow!("Native decision unavailable"))?;
+            super::steward_native::native_response_summary(request,response)?
+        } else { answer };
         if answer.trim().is_empty() || answer.len() > 20_000 {
             bail!("Answer must contain 1..20000 bytes");
         }
@@ -186,7 +195,7 @@ impl WakuBackend {
                 bail!("Decision request is no longer active");
             }
             if let Some(saved) = &request.user_answer {
-                if saved != &answer {
+                if saved != &answer || request.native.as_ref().and_then(|n|n.response.as_ref()) != response.as_ref() {
                     bail!("Request already has a different user answer");
                 }
                 drop(state);
@@ -203,6 +212,13 @@ impl WakuBackend {
                 bail!("Request has not reached the user in the main session");
             }
             let chain = self.decision_descendants(&mut state, child_id, request_id)?;
+            for (_, request) in &chain {
+                match (&request.native, &response) {
+                    (Some(_), Some(response)) => super::steward_native::validate_native_response(request, response)?,
+                    (None, None) => {},
+                    _ => bail!("Native requests require a typed native answer"),
+                }
+            }
             for (id, request) in &chain {
                 let session = state.sessions.iter().find(|s| s.id == *id).unwrap();
                 if !matches!(
@@ -224,6 +240,7 @@ impl WakuBackend {
                     .iter_mut()
                     .find(|r| r.id == request.id)
                     .unwrap();
+                if let Some(native) = &mut saved.native { native.response = response.clone(); }
                 saved.user_answer = Some(answer.clone());
                 saved.decision = Some(answer.clone());
                 saved.authority_message_id = Some(authority);
@@ -428,6 +445,25 @@ impl WakuBackend {
             })
             .cloned()
             .collect::<Vec<_>>();
+        // Relay the leaf's confirmed receipt without invoking intermediate runtimes.
+        let receipts = state.sessions.iter().flat_map(|s| &s.decision_requests)
+            .filter_map(|r| r.native.as_ref().and_then(|n| n.outcome.as_ref()).map(|o| (r.upstream_request_id, o.clone()))).collect::<Vec<_>>();
+        for (mut upstream, outcome) in receipts {
+            let mut seen = HashSet::new();
+            while let Some(id) = upstream {
+                if !seen.insert(id) { break; }
+                let Some(session) = state.sessions.iter_mut().find(|s|s.decision_requests.iter().any(|r|r.id==id)) else { break };
+                let request = session.decision_requests.iter_mut().find(|r|r.id==id).unwrap();
+                upstream = request.upstream_request_id;
+                if let Some(native) = &mut request.native {
+                    if native.outcome.as_ref() != Some(&outcome) {
+                        native.outcome = Some(outcome.clone());
+                        request.reason = outcome.reason.clone();
+                        let session_id=session.id; state.mark_session_dirty(session_id); self.save_steward_wait(state,session_id)?;
+                    }
+                }
+            }
+        }
         while let Some(terminal) = terminals.pop() {
             if terminal.state == DecisionState::Invalidated {
                 let resumed_turn = state

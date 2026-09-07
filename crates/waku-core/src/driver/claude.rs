@@ -52,11 +52,7 @@ enum CommandMessage {
         request_id: String,
         option_id: String,
     },
-    RespondUserInput {
-        request_id: String,
-        input: Value,
-        answers: Vec<UserInputAnswer>,
-    },
+    NativeResponse { request_id: String, token: Uuid, message: Value, delivery_id: Option<Uuid> },
     Options(SessionOptions),
     StopBackgroundWork {
         key: BackgroundWorkKey,
@@ -89,7 +85,7 @@ pub struct ClaudeDriver {
     turn_epoch: Arc<std::sync::atomic::AtomicU64>,
     turn_active: Arc<Mutex<bool>>,
     commands: Sender<CommandMessage>,
-    pending_user_inputs: Arc<Mutex<HashMap<String, Value>>>,
+    native_requests: super::NativeRequests,
     mode: RuntimeMode,
 }
 
@@ -262,21 +258,22 @@ impl ClaudeDriver {
         let cancellation_requested = Arc::new(AtomicBool::new(false));
         let reader_cancellation_requested = cancellation_requested.clone();
         let pending_task_stops = Arc::new(Mutex::new(HashMap::<String, BackgroundWorkKey>::new()));
-        let pending_user_inputs = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
+        let native_requests = super::NativeRequests::default();
 
         let reader_events = events.clone();
         let reader_commands = commands.clone();
         let reader_turn = turn_active.clone();
         let reader_session = session_id.clone();
         let reader_pending_task_stops = pending_task_stops.clone();
-        let reader_pending_user_inputs = pending_user_inputs.clone();
+        let reader_native_requests = native_requests.clone();
         let reader_thread = thread::Builder::new()
             .name("waku-claude-reader".into())
             .spawn(move || {
                 let mut state = ClaudeStreamState {
                     cancellation_requested: reader_cancellation_requested,
                     pending_task_stops: reader_pending_task_stops,
-                    pending_user_inputs: reader_pending_user_inputs,
+                    native_requests: reader_native_requests.clone(),
+                    native_epoch: reader_epoch.clone(),
                     ..ClaudeStreamState::default()
                 };
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -299,11 +296,13 @@ impl ClaudeDriver {
                         &mut state,
                     );
                 }
+                reader_native_requests.lock().clear();
             })?;
 
         let writer_events = events.clone();
         let writer_turn = turn_active.clone();
         let writer_pending_task_stops = pending_task_stops;
+        let writer_native_requests = native_requests.clone();
         let writer_title_refresh = super::title_refresh::NativeTitleRefresh::default();
         let title_session_id = session_id;
         thread::Builder::new()
@@ -314,6 +313,13 @@ impl ClaudeDriver {
                 let mut current_model = launch_model;
                 while let Ok(message) = command_rx.recv() {
                     let (message, delivery_id, delivery_epoch) = match message {
+                        CommandMessage::NativeResponse { request_id, token, message, delivery_id } => {
+                            if let Err(error) = super::write_native_response(&mut stdin, &writer_native_requests, &request_id, token, &message, delivery_id, &writer_events) {
+                                let _ = writer_events.send(DriverEvent::Error(format!("Claude native response transport: {error}")));
+                                break;
+                            }
+                            continue;
+                        }
                         CommandMessage::Deliver { prompt, id, steer, expected_epoch } => (if steer { CommandMessage::Steer(prompt) } else { CommandMessage::Prompt(prompt) }, Some(id), expected_epoch),
                         message => (message, None, 0),
                     };
@@ -321,6 +327,7 @@ impl ClaudeDriver {
                     let written = match message {
                         CommandMessage::Prompt(text) => {
                             cancellation_requested.store(false, Ordering::Release);
+                            writer_native_requests.lock().clear();
                             writer_epoch.fetch_add(1, Ordering::AcqRel);
                             *writer_turn.lock() = true;
                             start_claude_title_refresh(
@@ -402,6 +409,10 @@ impl ClaudeDriver {
                             request_id,
                             option_id,
                         } => {
+                            if !matches!(option_id.as_str(), "allow" | "deny") {
+                                let _ = writer_events.send(DriverEvent::Error("Unknown Claude permission option".into()));
+                                continue;
+                            }
                             let decision = if option_id == "deny" {
                                 json!({
                                     "behavior": "deny",
@@ -422,52 +433,7 @@ impl ClaudeDriver {
                                 }),
                             )
                         }
-                        CommandMessage::RespondUserInput {
-                            request_id,
-                            input,
-                            answers,
-                        } => {
-                            let mut answer_values = serde_json::Map::new();
-                            for answer in answers {
-                                let multi_select = input
-                                    .get("questions")
-                                    .and_then(Value::as_array)
-                                    .into_iter()
-                                    .flatten()
-                                    .find(|question| {
-                                        question.get("question").and_then(Value::as_str)
-                                            == Some(answer.question_id.as_str())
-                                    })
-                                    .and_then(|question| question.get("multiSelect"))
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false);
-                                let value = if multi_select {
-                                    json!(answer.answers)
-                                } else {
-                                    Value::String(
-                                        answer.answers.into_iter().next().unwrap_or_default(),
-                                    )
-                                };
-                                answer_values.insert(answer.question_id, value);
-                            }
-                            write_line(
-                                &mut stdin,
-                                &json!({
-                                    "type": "control_response",
-                                    "response": {
-                                        "subtype": "success",
-                                        "request_id": request_id,
-                                        "response": {
-                                            "behavior": "allow",
-                                            "updatedInput": {
-                                                "questions": input.get("questions").cloned().unwrap_or(Value::Array(Vec::new())),
-                                                "answers": answer_values
-                                            }
-                                        }
-                                    }
-                                }),
-                            )
-                        }
+                        CommandMessage::NativeResponse { .. } => unreachable!(),
                         CommandMessage::Options(options) => {
                             // The window rides on the model id, so switching it
                             // is the same `set_model` round trip as switching
@@ -573,7 +539,7 @@ impl ClaudeDriver {
             turn_epoch,
             turn_active,
             commands,
-            pending_user_inputs,
+            native_requests,
             mode,
         })
     }
@@ -609,22 +575,16 @@ impl DriverControl for ClaudeDriver {
             .send(CommandMessage::StopBackgroundWork { key, control_id });
     }
 
+    fn respond_tracked(&self, request_id: String, response: super::NativeResponse, delivery_id: Uuid) -> anyhow::Result<()> {
+        self.send_native_response(request_id, response, Some(delivery_id))
+    }
+
     fn respond(&self, request_id: String, option_id: String) {
-        let _ = self.commands.send(CommandMessage::Respond {
-            request_id,
-            option_id,
-        });
+        let _ = self.send_native_response(request_id, super::NativeResponse::Permission { option_id }, None);
     }
 
     fn respond_user_input(&self, request_id: String, answers: Vec<UserInputAnswer>) {
-        let Some(input) = self.pending_user_inputs.lock().remove(&request_id) else {
-            return;
-        };
-        let _ = self.commands.send(CommandMessage::RespondUserInput {
-            request_id,
-            input,
-            answers,
-        });
+        let _ = self.send_native_response(request_id, super::NativeResponse::UserInput { answers }, None);
     }
 
     fn apply_options(&self, options: SessionOptions) -> bool {
@@ -727,7 +687,8 @@ struct ClaudeStreamState {
     /// Stop handles for native Bash output files currently being tailed.
     task_output_tails: ClaudeTaskOutputTails,
     pending_task_stops: Arc<Mutex<HashMap<String, BackgroundWorkKey>>>,
-    pending_user_inputs: Arc<Mutex<HashMap<String, Value>>>,
+    native_requests: super::NativeRequests,
+    native_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Model of the latest main-thread assistant message, so the settled
     /// turn's `modelUsage` map can be read for that model's context window
     /// rather than a subagent's.
@@ -1393,7 +1354,17 @@ fn handle_message(
     auto_approve: bool,
     state: &mut ClaudeStreamState,
 ) {
+    if value.get("type").and_then(Value::as_str) == Some("result") {
+        state.native_requests.lock().clear();
+    }
     match value.get("type").and_then(Value::as_str) {
+        Some("control_cancel_request") => {
+            if let Some(id) = value.get("request_id").and_then(Value::as_str) {
+                if state.native_requests.lock().remove(id).is_some() {
+                    let _ = events.send(DriverEvent::NativeRequestClosed { request_id: id.to_owned() });
+                }
+            }
+        }
         Some("system") => {
             // The init handshake carries the CLI's own command registry —
             // built-ins, custom commands, plugins and skills alike.
@@ -1418,6 +1389,11 @@ fn handle_message(
             if value.pointer("/request/subtype").and_then(Value::as_str) == Some("can_use_tool") {
                 begin_unprompted_turn(turn_active, state, events);
                 if !request_user_input(value, events, state) {
+                    if !auto_approve && let Some(id) = value.get("request_id").and_then(Value::as_str) {
+                        state.native_requests.lock().entry(id.to_owned()).or_insert_with(|| super::NativeRequest::new(
+                            json!(id), value.pointer("/request/input").cloned().unwrap_or(Value::Null), None,
+                            Some(session_id.to_owned()), Some(state.native_epoch.load(Ordering::Acquire).to_string())));
+                    }
                     request_permission(value, events, commands, auto_approve);
                 }
             }
@@ -1776,8 +1752,8 @@ fn request_user_input(
                 })
                 .collect();
             Some(UserInputQuestion {
-                // Claude's SDK resolves answers by the complete question text.
-                id: text.to_owned(),
+                // Claude's SDK resolves answers by the exact original question text.
+                id: question.get("question").and_then(Value::as_str).unwrap().to_owned(),
                 header: question
                     .get("header")
                     .and_then(Value::as_str)
@@ -1797,9 +1773,11 @@ fn request_user_input(
         return true;
     }
     state
-        .pending_user_inputs
+        .native_requests
         .lock()
-        .insert(request_id.to_owned(), input);
+        .entry(request_id.to_owned()).or_insert_with(|| super::NativeRequest::new(
+            json!(request_id), input, Some(questions.clone()), None,
+            Some(state.native_epoch.load(Ordering::Acquire).to_string())));
     let _ = events.send(DriverEvent::UserInputRequested {
         request_id: request_id.to_owned(),
         questions,
@@ -1831,18 +1809,40 @@ fn request_permission(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .unwrap_or_else(|| tr!("permission.a_tool"));
-    // The agent says why it is asking; that reason is what the answer rests on.
-    let detail = request
-        .get("description")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| {
-            request
-                .get("blocked_path")
-                .and_then(Value::as_str)
-                .map(|path| tr!("permission.blocked_path", path = path))
-        })
-        .unwrap_or_else(|| tr!("permission.agent_wants_to_run", tool = tool.as_str()));
+    let input = request.get("input").unwrap_or(&Value::Null);
+    let mut details = Vec::new();
+    if let Some(reason) = request.get("description")
+        .or_else(|| input.get("description"))
+        .and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+    {
+        details.push(reason.to_owned());
+    }
+    // Show the operation itself: a model-authored description cannot identify
+    // the command or target the user is being asked to authorize.
+    let mut has_operation = false;
+    for field in ["command", "file_path", "path", "notebook_path", "url"] {
+        if let Some(value) = input.get(field).and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            let label = if field == "command" {
+                tr!("activity.command_detail")
+            } else {
+                tr!("permission.operation_target")
+            };
+            details.push(format!("{label}:\n{value}"));
+            has_operation = true;
+        }
+    }
+    if let Some(path) = request.get("blocked_path").and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        details.push(tr!("permission.blocked_path", path = path));
+        has_operation = true;
+    }
+    if !has_operation {
+        details.push(tr!("permission.operation_unknown"));
+    }
+    let detail = details.join("\n\n");
     let _ = events.send(DriverEvent::Permission {
         request_id: request_id.to_owned(),
         title: activity::input_title(request.get("input"))
@@ -2143,7 +2143,7 @@ mod tests {
             turn_active: Arc::new(Mutex::new(false)),
             turn_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             commands,
-            pending_user_inputs: Arc::new(Mutex::new(HashMap::new())),
+            native_requests: Arc::new(Mutex::new(HashMap::new())),
             mode: RuntimeMode::FullAccess,
         };
 
@@ -2651,7 +2651,10 @@ mod tests {
             panic!("Supervised mode must surface the request to the user");
         };
         assert_eq!(request_id, "fa01120e");
-        assert_eq!(detail, "Write probe file");
+        assert!(detail.contains("Write probe file"));
+        assert!(detail.contains(&format!("{}:\necho hi", tr!("activity.command_detail"))));
+        assert!(detail.contains("/tmp/probe.txt"));
+        assert!(!detail.contains("toolu_1"));
         assert_eq!(
             options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
             ["allow", "deny"]
@@ -2664,6 +2667,24 @@ mod tests {
         };
         assert_eq!(option_id, "allow");
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn native_permission_details_preserve_targets_without_control_metadata() {
+        let (events, received, commands, _, turn, mut state) = harness();
+        for input in [json!({"file_path":"/tmp/full target.txt", "path":"/tmp/other", "tool_use_id":"private-control"}), json!({})] {
+            handle_message(&json!({"type":"control_request","request_id":"target","request":{"subtype":"can_use_tool","tool_name":"Write","description":"Write report","input":input}}),
+                "s", &events, &commands, &turn, false, &mut state);
+            let DriverEvent::Permission { detail, .. } = received.recv().unwrap() else { panic!("permission expected") };
+            assert!(detail.contains("Write report"));
+            if input.get("file_path").is_some() {
+                assert!(detail.contains(&format!("{}:\n/tmp/full target.txt", tr!("permission.operation_target"))));
+                assert!(detail.contains(&format!("{}:\n/tmp/other", tr!("permission.operation_target"))));
+            } else {
+                assert!(detail.contains(&tr!("permission.operation_unknown")));
+            }
+            assert!(!detail.contains("private-control"));
+        }
     }
 
     #[test]
@@ -2702,7 +2723,7 @@ mod tests {
         assert_eq!(questions[0].id, "Where should this deploy?");
         assert_eq!(questions[0].options[0].label, "Preview");
         assert!(command_rx.try_recv().is_err());
-        assert!(state.pending_user_inputs.lock().contains_key("ask-1"));
+        assert!(state.native_requests.lock().contains_key("ask-1"));
     }
 
     #[test]
@@ -2959,6 +2980,64 @@ mod tests {
         // not the subagent's tokens, not the smaller subagent window.
         assert_eq!(usage, [(Some(120), None), (None, Some(1_000_000))]);
     }
+    #[test]
+    fn native_response_claude_validates_complete_questions_and_preserves_payload() {
+        let (events, received, commands, command_rx, turn, mut state) = harness();
+        let input = json!({"questions":[
+            {"question":"Formats?","multiSelect":true,"options":[{"label":"JSON"},{"label":"CSV"}]},
+            {"question":"Destination?","options":[{"label":"Local"}]}
+        ],"metadata":"retain"});
+        handle_message(&json!({"type":"control_request","request_id":"q","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":input}}),
+            "s", &events, &commands, &turn, false, &mut state);
+        assert!(matches!(received.recv().unwrap(), DriverEvent::UserInputRequested { request_id, .. } if request_id == "q"));
+        let driver = ClaudeDriver { turn_epoch: state.native_epoch.clone(), turn_active: Arc::new(Mutex::new(true)),
+            commands, native_requests: state.native_requests.clone(), mode: RuntimeMode::Ask };
+        let answers = vec![UserInputAnswer { question_id:"Formats?".into(), answers:vec!["JSON".into(),"CSV".into()] },
+            UserInputAnswer { question_id:"Destination?".into(), answers:vec!["Other directory".into()] }];
+        let id = Uuid::new_v4();
+        assert!(driver.respond_tracked("q".into(), super::super::NativeResponse::UserInput { answers:answers[..1].to_vec() }, id).is_err());
+        assert!(driver.respond_tracked("q".into(), super::super::NativeResponse::Permission { option_id:"allow".into() }, id).is_err());
+        driver.respond_tracked("q".into(), super::super::NativeResponse::UserInput { answers }, id).unwrap();
+        let CommandMessage::NativeResponse { request_id, token, message, delivery_id } = command_rx.recv().unwrap() else { panic!("native response command"); };
+        assert_eq!(message.pointer("/response/response/updatedInput/answers/Formats?"), Some(&json!(["JSON","CSV"])));
+        assert_eq!(message.pointer("/response/response/updatedInput/answers/Destination?"), Some(&json!("Other directory")));
+        assert_eq!(message.pointer("/response/response/updatedInput/metadata"), Some(&json!("retain")));
+        let mut bytes = Vec::new();
+        super::super::write_native_response(&mut bytes, &state.native_requests, &request_id, token, &message, delivery_id, &events).unwrap();
+        assert!(matches!(received.recv().unwrap(), DriverEvent::InputDeliveryOutcome(outcome) if outcome.confirmation == Some(crate::model::InputConfirmation::Transport)));
+        assert!(state.native_requests.lock().contains_key("q"));
+        handle_message(&json!({"type":"result"}), "s", &events, &driver.commands, &turn, false, &mut state);
+        assert!(driver.respond_tracked("q".into(), super::super::NativeResponse::UserInput { answers:vec![] }, Uuid::new_v4()).is_err());
+    }
+
+    #[test]
+    fn native_response_claude_cancelled_request_cannot_be_written() {
+        let (events, received, commands, _, turn, mut state) = harness();
+        handle_message(&json!({"type":"control_request","request_id":"p","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"true"}}}),
+            "s", &events, &commands, &turn, false, &mut state);
+        assert!(matches!(received.recv().unwrap(), DriverEvent::Permission { .. }));
+        let request = state.native_requests.lock().get("p").unwrap().clone();
+        handle_message(&json!({"type":"control_cancel_request","request_id":"p"}),
+            "s", &events, &commands, &turn, false, &mut state);
+        assert!(matches!(received.recv().unwrap(), DriverEvent::NativeRequestClosed { request_id } if request_id == "p"));
+        let mut bytes = Vec::new();
+        super::super::write_native_response(&mut bytes, &state.native_requests, "p", request.token, &json!({}), Some(Uuid::new_v4()), &events).unwrap();
+        assert!(bytes.is_empty());
+        assert!(matches!(received.recv().unwrap(), DriverEvent::InputDeliveryOutcome(outcome) if outcome.state == crate::model::InputDeliveryState::Failed && outcome.confirmation.is_none()));
+    }
+
+    #[test]
+    fn native_response_claude_unknown_permission_never_becomes_allow() {
+        let (events, received, commands, command_rx, turn, mut state) = harness();
+        handle_message(&json!({"type":"control_request","request_id":"p","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"true"}}}),
+            "s", &events, &commands, &turn, false, &mut state);
+        assert!(matches!(received.recv().unwrap(), DriverEvent::Permission { .. }));
+        let driver = ClaudeDriver { turn_epoch: state.native_epoch.clone(), turn_active: Arc::new(Mutex::new(true)),
+            commands, native_requests: state.native_requests.clone(), mode: RuntimeMode::Ask };
+        assert!(driver.respond_tracked("p".into(), super::super::NativeResponse::Permission { option_id:"typo".into() }, Uuid::new_v4()).is_err());
+        assert!(command_rx.try_recv().is_err());
+    }
+
 }
 
 #[cfg(test)]
@@ -3004,4 +3083,37 @@ fn tracked_steer_known_completed_turn_never_writes() {
     write_tracked_steer(&mut writer, "stale feedback", uuid::Uuid::new_v4(), 7, &epoch, &events).unwrap();
     assert!(writer.is_empty());
     assert!(matches!(receiver.try_recv().unwrap(), DriverEvent::InputDeliveryOutcome(crate::model::InputDeliveryOutcome { state: crate::model::InputDeliveryState::Failed, .. })));
+}
+
+impl ClaudeDriver {
+    fn send_native_response(&self, request_id: String, response: super::NativeResponse, delivery_id: Option<Uuid>) -> anyhow::Result<()> {
+        let request = super::native_request(&self.native_requests, &request_id, &response)?;
+        let message = claude_native_response(&request, response)?;
+        self.commands.send(CommandMessage::NativeResponse { request_id, token: request.token, message, delivery_id })
+            .map_err(|_| anyhow!("Claude response transport is closed"))
+    }
+}
+
+fn claude_native_response(request: &super::NativeRequest, response: super::NativeResponse) -> anyhow::Result<Value> {
+    let response = match response {
+        super::NativeResponse::Permission { option_id } => match option_id.as_str() {
+            "allow" => json!({"behavior":"allow"}),
+            "deny" => json!({"behavior":"deny","message":"The user denied this tool call."}),
+            _ => anyhow::bail!("unknown Claude permission option"),
+        },
+        super::NativeResponse::UserInput { answers } => {
+            let mut values = serde_json::Map::new();
+            for answer in answers {
+                let question = request.questions.as_ref().and_then(|questions| questions.iter().find(|q| q.id == answer.question_id))
+                    .ok_or_else(|| anyhow!("unknown Claude question ID"))?;
+                let value = if question.multi_select { json!(answer.answers) }
+                    else { json!(answer.answers[0]) };
+                values.insert(answer.question_id, value);
+            }
+            let mut input = request.input.clone();
+            input["answers"] = Value::Object(values);
+            json!({"behavior":"allow","updatedInput":input})
+        }
+    };
+    Ok(json!({"type":"control_response","response":{"subtype":"success","request_id":request.wire_id,"response":response}}))
 }

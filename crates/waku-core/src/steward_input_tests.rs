@@ -52,6 +52,15 @@ impl DriverControl for QueueDriver {
         self.calls.send((self.target, prompt)).unwrap();
         Ok(())
     }
+    fn respond_tracked(&self, request_id: String, response: crate::driver::NativeResponse, id: Uuid) -> anyhow::Result<()> {
+        let events=self.events.clone();let calls=self.calls.clone();let target=self.target;
+        std::thread::spawn(move || {
+            let state=if request_id=="uncertain-native" {InputDeliveryState::Uncertain} else {InputDeliveryState::Received};
+            events.send(event_to_wire(DriverEvent::InputDeliveryOutcome(InputDeliveryOutcome {id,state,confirmation:if state==InputDeliveryState::Received {Some(InputConfirmation::Transport)} else {None},reason:if state==InputDeliveryState::Uncertain {Some("confirmation lost".into())} else {None}})).unwrap()).unwrap();
+            calls.send((target,format!("native:{request_id}:{}",serde_json::to_string(&response).unwrap()))).unwrap();
+        });
+        Ok(())
+    }
     fn supports_steer(&self) -> bool {
         self.steer
     }
@@ -1411,8 +1420,12 @@ fn decision_wait_scenario(native_wait: bool) {
         }).unwrap()).unwrap();
     } else { server.finish(child.id); }
     let notification = server.calls.recv_timeout(Duration::from_secs(3)).unwrap().1;
-    assert!(notification.contains("automatic child-session notification"));
-    if native_wait { assert!(notification.contains("\"waiting_for_permission\":true")); }
+    if native_wait {
+        assert!(notification.contains("automatic decision notification"));
+        assert!(notification.contains("Need native permission"));
+        let ResponsePayload::Session { session:Some(saved) }=client.request(parent.id,parent_runtime,Command::HydrateSession {session_id:parent.id}).unwrap() else {panic!("session")};
+        assert!(saved.steward_wait.is_some(), "native question retains the final-result wait");
+    } else { assert!(notification.contains("automatic child-session notification")); }
     server.finish(parent.id);
     assert!(server.calls.recv_timeout(Duration::from_millis(150)).is_err());
     drop(client);
@@ -1715,4 +1728,170 @@ fn decision_nested_manager_reuses_only_confirmed_user_authority() {
     assert_eq!(serde_json::to_value(decided).unwrap()["requests"][0]["state"],"resolved");
     assert_eq!(server.calls.recv_timeout(Duration::from_secs(3)).unwrap().0,leaf.id);
     drop(client); drop(server); std::fs::remove_dir_all(root).unwrap();
+}
+
+
+#[test]
+fn native_decision_socket_approves_original_request_without_prompt_and_rejects_replay() {
+    native_decision_scenario(false);
+}
+#[test]
+fn native_decision_socket_uncertain_response_is_not_replayed_after_restart() {
+    native_decision_scenario(true);
+}
+fn native_decision_scenario(uncertain: bool) {
+    use crate::model::{NativeDecisionResponse,PermissionOption,StewardDecisionOperation,DecisionState};
+    let (root,parent,child)=seed_queue();
+    let server=QueueServer::open(&root);server.backend.paused.store(true,Ordering::Release);
+    let client=server.connect();let runtime=server.start(&client,&root,child.id);
+    client.request(child.id,runtime,Command::Prompt{prompt:"Run original work".into(),turn_id:None,message_id:None}).unwrap();
+    let original=if uncertain {"uncertain-native"} else {"permission-1"};
+    server.backend.sinks.lock().get(&child.id).unwrap().send(event_to_wire(DriverEvent::Permission{request_id:original.into(),title:"Write report".into(),detail:"Only the selected file".into(),options:vec![PermissionOption{id:"allow".into(),label:"Allow once".into(),allow:true},PermissionOption{id:"deny".into(),label:"Deny".into(),allow:false}]}).unwrap()).unwrap();
+    let list=||client.request(parent.id,Uuid::nil(),Command::StewardDecision{operation:StewardDecisionOperation::List{session_id:Some(child.id)}}).unwrap();
+    let ResponsePayload::StewardDecisions{requests}=list() else {panic!("decisions")};
+    let request=&requests[0];let id=request.id;let turn=request.turn_id;
+    assert!(request.native.is_some());
+    assert!(client.request(child.id,runtime,Command::Respond{request_id:original.into(),option_id:"allow".into()}).is_err());
+    let decide=|option:&str|Command::StewardDecision{operation:StewardDecisionOperation::DecideNative{session_id:child.id,request_id:id,response:NativeDecisionResponse::Permission{option_id:option.into()},authority_message_id:Some(parent.messages[0].id)}};
+    assert!(client.request(parent.id,Uuid::nil(),decide("invented")).is_err());
+    client.request(parent.id,Uuid::nil(),decide("allow")).unwrap();
+    assert!(server.calls.recv_timeout(Duration::from_secs(2)).unwrap().1.starts_with("native:"));
+    client.request(parent.id,Uuid::nil(),decide("allow")).unwrap();
+    assert!(client.request(parent.id,Uuid::nil(),decide("deny")).is_err());
+    assert!(server.calls.recv_timeout(Duration::from_millis(100)).is_err());
+    let ResponsePayload::Session{session:Some(saved)}=client.request(child.id,runtime,Command::HydrateSession{session_id:child.id}).unwrap() else {panic!("session")};
+    assert_eq!(saved.active_turn_id(),Some(turn));assert!(saved.input_deliveries.is_empty());
+    assert_eq!(saved.pending_permission.is_some(),uncertain);
+    assert_eq!(saved.decision_requests[0].state,if uncertain {DecisionState::PendingReceipt}else{DecisionState::Resolved});
+    drop(client);drop(server);
+    let server=QueueServer::open(&root);server.backend.paused.store(true,Ordering::Release);let client=server.connect();
+    let response=client.request(parent.id,Uuid::nil(),Command::StewardDecision{operation:StewardDecisionOperation::List{session_id:Some(child.id)}}).unwrap();
+    let ResponsePayload::StewardDecisions{requests}=response else {panic!("decisions")};
+    assert_eq!(requests[0].state,if uncertain {DecisionState::Invalidated}else{DecisionState::Resolved});
+    assert!(server.calls.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(client);drop(server);std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn native_decision_socket_keeps_multiple_requests_and_returns_typed_user_answer() {
+    use crate::model::{NativeDecisionResponse,PermissionOption,UserInputQuestion,UserInputAnswer,StewardDecisionOperation,DecisionOption};
+    let (root,parent,child)=seed_queue();let server=QueueServer::open(&root);server.backend.paused.store(true,Ordering::Release);
+    let client=server.connect();let runtime=server.start(&client,&root,child.id);
+    client.request(child.id,runtime,Command::Prompt{prompt:"Original work".into(),turn_id:None,message_id:None}).unwrap();
+    let sink=server.backend.sinks.lock().get(&child.id).unwrap().clone();
+    for id in ["first","second"] {sink.send(event_to_wire(DriverEvent::Permission{request_id:id.into(),title:id.into(),detail:"Bound operation".into(),options:vec![PermissionOption{id:"deny".into(),label:"Deny".into(),allow:false}]}).unwrap()).unwrap();}
+    sink.send(event_to_wire(DriverEvent::UserInputRequested{request_id:"questions".into(),questions:vec![UserInputQuestion{id:"format".into(),header:"Format".into(),question:"Which format?".into(),options:vec![],multi_select:false}]}).unwrap()).unwrap();
+    let list=|| {let ResponsePayload::StewardDecisions{requests}=client.request(parent.id,Uuid::nil(),Command::StewardDecision{operation:StewardDecisionOperation::List{session_id:Some(child.id)}}).unwrap() else{panic!("list")};requests};
+    let requests=list();assert_eq!(requests.len(),3);
+    client.request(parent.id,Uuid::nil(),Command::StewardDecision{operation:StewardDecisionOperation::DecideNative{session_id:child.id,request_id:requests[0].id,response:NativeDecisionResponse::Permission{option_id:"deny".into()},authority_message_id:Some(parent.messages[0].id)}}).unwrap();
+    assert!(server.calls.recv_timeout(Duration::from_secs(2)).unwrap().1.contains("first"));
+    sink.send(event_to_wire(DriverEvent::NativeRequestClosed{request_id:"second".into()}).unwrap()).unwrap();
+    let requests=list();assert_eq!(requests[1].state,crate::model::DecisionState::Invalidated);
+    let id=requests[2].id;
+    client.request(parent.id,Uuid::nil(),Command::StewardDecision{operation:StewardDecisionOperation::Escalate{session_id:child.id,request_id:id,reason:"User preference required".into(),options:vec![DecisionOption{label:"JSON".into(),impact:"Structured output".into()}],impact:"Output format".into()}}).unwrap();
+    let answer=|answers|Command::AnswerNativeDecision{child_session_id:child.id,request_id:id,response:NativeDecisionResponse::UserInput{answers}};
+    assert!(client.request(parent.id,Uuid::nil(),answer(vec![])).is_err());
+    client.request(parent.id,Uuid::nil(),answer(vec![UserInputAnswer{question_id:"format".into(),answers:vec!["JSON".into()]}])).unwrap();
+    assert!(server.calls.recv_timeout(Duration::from_secs(2)).unwrap().1.contains("questions"));
+    let requests=list();assert_eq!(requests[2].state,crate::model::DecisionState::Resolved);
+    assert_eq!(requests[2].user_answer.as_deref(),Some("Which format?：JSON"));
+    assert_eq!(requests[2].native.as_ref().unwrap().outcome.as_ref().unwrap().confirmation,Some(InputConfirmation::Transport));
+    drop(client);drop(server);std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn native_decision_socket_standalone_user_response_is_tracked_and_cancellation_rejects_old_request() {
+    use crate::model::PermissionOption;
+    let (root,parent,_)=seed_queue();let server=QueueServer::open(&root);server.backend.paused.store(true,Ordering::Release);
+    let client=server.connect();let runtime=server.start(&client,&root,parent.id);
+    client.request(parent.id,runtime,Command::Prompt{prompt:"Original work".into(),turn_id:None,message_id:None}).unwrap();
+    let sink=server.backend.sinks.lock().get(&parent.id).unwrap().clone();
+    let permission=|id:&str|event_to_wire(DriverEvent::Permission{request_id:id.into(),title:"Run".into(),detail:"Original task".into(),options:vec![PermissionOption{id:"allow".into(),label:"Allow".into(),allow:true}]}).unwrap();
+    sink.send(permission("live")).unwrap();
+    let ResponsePayload::StewardDecisions{requests}=client.request(parent.id,Uuid::nil(),Command::StewardDecision{operation:crate::model::StewardDecisionOperation::List{session_id:Some(parent.id)}}).unwrap() else {panic!("list")};
+    client.request(parent.id,Uuid::nil(),Command::AnswerNativeDecision{child_session_id:parent.id,request_id:requests[0].id,response:crate::model::NativeDecisionResponse::Permission{option_id:"allow".into()}}).unwrap();
+    assert!(server.calls.recv_timeout(Duration::from_secs(2)).unwrap().1.contains("live"));
+    sink.send(permission("old")).unwrap();client.request(parent.id,runtime,Command::Cancel).unwrap();
+    assert!(client.request(parent.id,runtime,Command::Respond{request_id:"old".into(),option_id:"allow".into()}).is_err());
+    assert!(server.calls.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(client);drop(server);std::fs::remove_dir_all(root).unwrap();
+}
+
+
+#[test]
+fn native_decision_socket_late_receipt_preserves_cancelled_state_and_runtime_replacement_expires_request() {
+    use crate::model::{PermissionOption,StewardDecisionOperation,NativeDecisionResponse,DecisionState};
+    let (root,parent,child)=seed_queue();let server=QueueServer::open(&root);server.backend.paused.store(true,Ordering::Release);
+    let client=server.connect();let runtime=server.start(&client,&root,child.id);
+    client.request(child.id,runtime,Command::Prompt{prompt:"Original work".into(),turn_id:None,message_id:None}).unwrap();
+    let sink=server.backend.sinks.lock().get(&child.id).unwrap().clone();
+    let permission=|id:&str|event_to_wire(DriverEvent::Permission{request_id:id.into(),title:"Run".into(),detail:"Original task".into(),options:vec![PermissionOption{id:"allow".into(),label:"Allow".into(),allow:true}]}).unwrap();
+    sink.send(permission("uncertain-native")).unwrap();
+    let list=|| {let ResponsePayload::StewardDecisions{requests}=client.request(parent.id,Uuid::nil(),Command::StewardDecision{operation:StewardDecisionOperation::List{session_id:Some(child.id)}}).unwrap() else {panic!("list")};requests};
+    let id=list()[0].id;
+    client.request(parent.id,Uuid::nil(),Command::StewardDecision{operation:StewardDecisionOperation::DecideNative{session_id:child.id,request_id:id,response:NativeDecisionResponse::Permission{option_id:"allow".into()},authority_message_id:Some(parent.messages[0].id)}}).unwrap();
+    server.calls.recv_timeout(Duration::from_secs(2)).unwrap();
+    let mut stale=list()[0].clone();
+    stale.native.as_mut().unwrap().outcome=Some(InputDeliveryOutcome{id,state:InputDeliveryState::Accepted,confirmation:None,reason:None});
+    sink.send(event_to_wire(DriverEvent::DecisionRequestChanged(stale.clone())).unwrap()).unwrap();
+    assert_eq!(list()[0].native.as_ref().unwrap().outcome.as_ref().unwrap().state,InputDeliveryState::Uncertain);
+    sink.send(event_to_wire(DriverEvent::NativeRequestClosed{request_id:"uncertain-native".into()}).unwrap()).unwrap();
+    sink.send(event_to_wire(DriverEvent::InputDeliveryOutcome(InputDeliveryOutcome{id,state:InputDeliveryState::Received,confirmation:Some(InputConfirmation::Transport),reason:None})).unwrap()).unwrap();
+    let requests=list();assert_eq!(requests[0].state,DecisionState::Invalidated);assert_eq!(requests[0].native.as_ref().unwrap().outcome.as_ref().unwrap().state,InputDeliveryState::Received);
+    sink.send(event_to_wire(DriverEvent::DecisionRequestChanged(stale)).unwrap()).unwrap();
+    let requests=list();assert_eq!(requests[0].state,DecisionState::Invalidated);assert_eq!(requests[0].native.as_ref().unwrap().outcome.as_ref().unwrap().state,InputDeliveryState::Received);
+    sink.send(permission("old-runtime")).unwrap();
+    let runtime2=server.start(&client,&root,child.id);assert_ne!(runtime,runtime2);
+    let requests=list();assert_eq!(requests[1].state,DecisionState::Invalidated);
+    drop(client);drop(server);std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn native_decision_socket_catalog_notifications_follow_capture_and_receipt_commit() {
+    use crate::model::{DecisionState, NativeDecisionResponse, PermissionOption};
+    let (root, parent, child) = seed_queue();
+    let server = QueueServer::open(&root);
+    server.backend.paused.store(true, Ordering::Release);
+    let client = server.connect();
+    let runtime = server.start(&client, &root, child.id);
+    client.request(child.id, runtime, Command::Prompt { prompt: "Original native work".into(), turn_id: None, message_id: None }).unwrap();
+    // This client has no child runtime subscription. Only catalog notifications
+    // can tell its main-session decision dialog to fetch the saved state.
+    let observer = server.connect();
+    let revisions = observer.subscribe_task_state();
+    let catalog = || {
+        let ResponsePayload::TaskState { sessions, .. } = observer.request(parent.id, Uuid::nil(), Command::LoadTaskState).unwrap() else { panic!("catalog expected") };
+        sessions.into_iter().find(|s| s.id == child.id).unwrap()
+    };
+    let sink = server.backend.sinks.lock().get(&child.id).unwrap().clone();
+    sink.send(event_to_wire(DriverEvent::Permission { request_id: "catalog-native".into(), title: "Write".into(), detail: "Temporary output".into(), options: vec![PermissionOption { id: "allow".into(), label: "Allow once".into(), allow: true }] }).unwrap()).unwrap();
+    revisions.recv_timeout(Duration::from_secs(3)).expect("committed native capture must notify catalog observers");
+    let captured = catalog();
+    assert_eq!(captured.decision_requests.len(), 1);
+    let id = captured.decision_requests[0].id;
+    assert_eq!(captured.decision_requests[0].state, DecisionState::WaitingManager);
+    let store = StateStore::daemon(root.join("state.db"));
+    let saved = store.load().unwrap();
+    assert_eq!(saved.sessions.iter().find(|s| s.id == child.id).unwrap().decision_requests, captured.decision_requests);
+    let mut accepted = captured.decision_requests[0].clone();
+    accepted.state = DecisionState::PendingReceipt;
+    let native = accepted.native.as_mut().unwrap();
+    native.response = Some(NativeDecisionResponse::Permission { option_id: "allow".into() });
+    native.outcome = Some(InputDeliveryOutcome { id, state: InputDeliveryState::Accepted, confirmation: None, reason: None });
+    sink.send(event_to_wire(DriverEvent::DecisionRequestChanged(accepted)).unwrap()).unwrap();
+    revisions.recv_timeout(Duration::from_secs(3)).expect("committed acceptance must notify catalog observers");
+    assert_eq!(catalog().decision_requests[0].state, DecisionState::PendingReceipt);
+    // Emit the receipt separately so an earlier acceptance notification cannot
+    // accidentally make this pass without a notification for the outcome.
+    sink.send(event_to_wire(DriverEvent::InputDeliveryOutcome(InputDeliveryOutcome { id, state: InputDeliveryState::Received, confirmation: Some(InputConfirmation::Transport), reason: None })).unwrap()).unwrap();
+    revisions.recv_timeout(Duration::from_secs(3)).expect("committed native receipt must notify catalog observers");
+    let current = catalog();
+    assert_eq!(current.decision_requests[0].state, DecisionState::Resolved);
+    let outcome = current.decision_requests[0].native.as_ref().unwrap().outcome.as_ref().unwrap();
+    assert_eq!(outcome.state, InputDeliveryState::Received);
+    assert_eq!(outcome.confirmation, Some(InputConfirmation::Transport));
+    let saved = store.load().unwrap();
+    assert_eq!(saved.sessions.iter().find(|s| s.id == child.id).unwrap().decision_requests, current.decision_requests);
+    drop(observer); drop(client); drop(server);
+    std::fs::remove_dir_all(root).unwrap();
 }

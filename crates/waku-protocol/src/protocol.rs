@@ -170,6 +170,7 @@ pub struct ChildSessionSummary {
 )]
 pub enum Command {
     /// Trusted user entry. Scoped MCP clients cannot answer their own escalations.
+    AnswerNativeDecision { child_session_id: Uuid, request_id: Uuid, response: crate::model::NativeDecisionResponse },
     AnswerDecision { child_session_id: Uuid, request_id: Uuid, answer: String },
     StewardDecision { operation: crate::model::StewardDecisionOperation },
     StewardWorkspace { operation: crate::model::StewardWorkspaceOperation },

@@ -1,6 +1,9 @@
 //! Decision records and explicit user answers. Daemon I/O stays off the UI thread.
 use super::*;
-use waku_protocol::model::{DecisionRequest, DecisionState, StewardDecisionOperation};
+use waku_protocol::model::{
+    DecisionRequest, DecisionState, NativeDecisionRequest, NativeDecisionResponse,
+    StewardDecisionOperation,
+};
 
 gpui::actions!(waku_decisions, [CloseDecisions, SendDecisionAnswer]);
 pub(super) fn init(cx: &mut App) {
@@ -21,6 +24,8 @@ pub(super) struct DecisionDialog {
     selected: Option<Uuid>,
     drafts: HashMap<Uuid, String>,
     attempts: HashMap<Uuid, String>,
+    native_inputs: HashMap<Uuid, PendingUserInput>,
+    native_answers: HashMap<Uuid, NativeDecisionResponse>,
     previous_focus: FocusHandle,
     next_focus: FocusHandle,
     answer_focus: FocusHandle,
@@ -45,8 +50,17 @@ impl DecisionDialog {
                     .iter()
                     .any(|request| request.id == id && request.state == DecisionState::WaitingUser)
             {
-                self.drafts
-                    .insert(id, self.input.read(cx).content().to_owned());
+                if let Some(pending) = self.native_inputs.get_mut(&id) {
+                    if let Some(question) = pending.current_question() {
+                        let key = question.id.clone();
+                        pending
+                            .custom_answers
+                            .insert(key, self.input.read(cx).content().to_owned());
+                    }
+                } else {
+                    self.drafts
+                        .insert(id, self.input.read(cx).content().to_owned());
+                }
             }
         }
     }
@@ -57,10 +71,28 @@ impl DecisionDialog {
             .and_then(|id| self.requests.iter().find(|r| r.id == id));
         let editable = !self.pending
             && request.is_some_and(|r| {
-                r.state == DecisionState::WaitingUser && !self.attempts.contains_key(&r.id)
+                r.state == DecisionState::WaitingUser
+                    && !self.attempts.contains_key(&r.id)
+                    && r.native.as_ref().is_none_or(|n| {
+                        matches!(n.request, NativeDecisionRequest::UserInput { .. })
+                            && n.response.is_none()
+                    })
             });
         let text = request
             .map(|r| {
+                if matches!(
+                    r.native.as_ref().map(|n| &n.request),
+                    Some(NativeDecisionRequest::Permission { .. })
+                ) {
+                    return String::new();
+                }
+                if let Some(pending) = self.native_inputs.get(&r.id) {
+                    return pending
+                        .current_question()
+                        .and_then(|q| pending.custom_answers.get(&q.id))
+                        .cloned()
+                        .unwrap_or_default();
+                }
                 r.user_answer
                     .as_ref()
                     .or_else(|| self.attempts.get(&r.id))
@@ -77,6 +109,60 @@ impl DecisionDialog {
 }
 
 impl Waku {
+    pub(super) fn sync_decision_catalog(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.decision_dialog.as_mut() else {
+            return;
+        };
+        let requests = decision_catalog_requests(&self.state.sessions, dialog.parent_id);
+        if requests != *dialog.requests {
+            dialog.save_draft(cx);
+            for request in &requests {
+                if request.user_answer.is_some()
+                    || request
+                        .native
+                        .as_ref()
+                        .is_some_and(|n| n.response.is_some())
+                {
+                    dialog.attempts.remove(&request.id);
+                }
+                if let Some(native) = &request.native {
+                    if let NativeDecisionRequest::UserInput {
+                        request_id,
+                        questions,
+                    } = &native.request
+                    {
+                        dialog.native_inputs.entry(request.id).or_insert_with(|| {
+                            PendingUserInput::new(request_id.clone(), questions.clone())
+                        });
+                    }
+                }
+            }
+            dialog.titles = Arc::new(
+                requests
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.child_session_id,
+                            self.state
+                                .sessions
+                                .iter()
+                                .find(|s| s.id == r.child_session_id)
+                                .map(|s| s.display_title().to_owned())
+                                .unwrap_or_else(|| r.child_session_id.to_string()),
+                        )
+                    })
+                    .collect(),
+            );
+            if !requests.iter().any(|r| Some(r.id) == dialog.selected) {
+                dialog.selected = requests.first().map(|r| r.id);
+            }
+            dialog.rows.reset(requests.len());
+            dialog.requests = Arc::new(requests);
+            dialog.sync_input(cx);
+            cx.notify();
+        }
+    }
+
     pub(super) fn render_decision_entry(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let session = self.selected_session()?;
         if session.decision_requests.is_empty()
@@ -108,7 +194,7 @@ impl Waku {
         )
     }
 
-    fn open_decisions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_decisions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.selected_session() else {
             return;
         };
@@ -168,6 +254,8 @@ impl Waku {
             selected: None,
             drafts: HashMap::new(),
             attempts: HashMap::new(),
+            native_inputs: HashMap::new(),
+            native_answers: HashMap::new(),
             previous_focus: cx.focus_handle().tab_stop(true),
             next_focus: cx.focus_handle().tab_stop(true),
             answer_focus: cx.focus_handle().tab_stop(true),
@@ -225,11 +313,40 @@ impl Waku {
         let Some(request) = dialog
             .selected
             .and_then(|id| dialog.requests.iter().find(|r| r.id == id))
-            .filter(|r| r.state == DecisionState::WaitingUser)
+            .filter(|r| {
+                r.state == DecisionState::WaitingUser
+                    && r.native
+                        .as_ref()
+                        .is_none_or(|native| native.response.is_none())
+            })
         else {
             return;
         };
         let id = request.id;
+        if request.native.is_some() {
+            if dialog.attempts.contains_key(&id) {
+                return;
+            }
+            dialog.save_draft(cx);
+            if let Some(pending) = dialog.native_inputs.get(&id) {
+                let answers = pending.answers();
+                if answers.iter().any(|answer| answer.answers.is_empty()) {
+                    return;
+                }
+                dialog
+                    .native_answers
+                    .insert(id, NativeDecisionResponse::UserInput { answers });
+            }
+            if !dialog.native_answers.contains_key(&id) {
+                return;
+            }
+            dialog
+                .attempts
+                .insert(id, tr!("decisions.answer_unconfirmed"));
+            window.focus(&dialog.input.read(cx).focus(), cx);
+            self.request_decisions(Some((id, String::new())), cx);
+            return;
+        }
         let answer = dialog
             .attempts
             .get(&id)
@@ -255,10 +372,21 @@ impl Waku {
             let Some(request) = dialog.requests.iter().find(|r| r.id == *id) else {
                 return;
             };
-            waku_client::Command::AnswerDecision {
-                child_session_id: request.child_session_id,
-                request_id: *id,
-                answer: text.clone(),
+            if request.native.is_some() {
+                let Some(response) = dialog.native_answers.get(id).cloned() else {
+                    return;
+                };
+                waku_client::Command::AnswerNativeDecision {
+                    child_session_id: request.child_session_id,
+                    request_id: *id,
+                    response,
+                }
+            } else {
+                waku_client::Command::AnswerDecision {
+                    child_session_id: request.child_session_id,
+                    request_id: *id,
+                    answer: text.clone(),
+                }
             }
         } else {
             waku_client::Command::StewardDecision {
@@ -315,7 +443,25 @@ impl Waku {
                             Vec::new()
                         };
                         for request in requests {
-                            if request.user_answer.is_some() {
+                            let request =
+                                preserve_live_decision_outcome(&this.state.sessions, request);
+                            if let Some(native) = &request.native {
+                                if let NativeDecisionRequest::UserInput {
+                                    request_id,
+                                    questions,
+                                } = &native.request
+                                {
+                                    dialog.native_inputs.entry(request.id).or_insert_with(|| {
+                                        PendingUserInput::new(request_id.clone(), questions.clone())
+                                    });
+                                }
+                            }
+                            if request.user_answer.is_some()
+                                || request
+                                    .native
+                                    .as_ref()
+                                    .is_some_and(|n| n.response.is_some())
+                            {
                                 dialog.drafts.remove(&request.id);
                                 dialog.attempts.remove(&request.id);
                             } else if answer.is_none()
@@ -388,6 +534,60 @@ impl Waku {
         cx.notify();
     }
 
+    fn select_native_option(&mut self, label: String, cx: &mut Context<Self>) {
+        let Some(dialog) = self.decision_dialog.as_mut() else {
+            return;
+        };
+        let Some(id) = dialog.selected else {
+            return;
+        };
+        if dialog.pending || dialog.attempts.contains_key(&id) {
+            return;
+        }
+        if let Some(pending) = dialog.native_inputs.get_mut(&id) {
+            let Some(question) = pending.current_question().cloned() else {
+                return;
+            };
+            pending.custom_answers.remove(&question.id);
+            let selected = pending.selections.entry(question.id).or_default();
+            if question.multi_select {
+                if selected.contains(&label) {
+                    selected.retain(|v| v != &label);
+                } else {
+                    selected.push(label);
+                }
+            } else {
+                *selected = vec![label];
+            }
+        } else {
+            dialog
+                .native_answers
+                .insert(id, NativeDecisionResponse::Permission { option_id: label });
+        }
+        dialog.sync_input(cx);
+        cx.notify();
+    }
+
+    fn move_native_question(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(dialog) = self.decision_dialog.as_mut() else {
+            return;
+        };
+        dialog.save_draft(cx);
+        if let Some(pending) = dialog
+            .selected
+            .and_then(|id| dialog.native_inputs.get_mut(&id))
+        {
+            if forward {
+                pending.question_index =
+                    (pending.question_index + 1).min(pending.questions.len().saturating_sub(1));
+            } else {
+                pending.question_index = pending.question_index.saturating_sub(1);
+            }
+        }
+        dialog.sync_input(cx);
+        cx.notify();
+    }
+
     pub(super) fn render_decisions(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let dialog = self.decision_dialog.as_ref().filter(|d| d.visible)?;
         let theme = Theme::current(cx);
@@ -451,12 +651,59 @@ impl Waku {
                         value = escalation.impact.clone()
                     ))
                 })
-                .when_some(request.user_answer.clone(), |row, value| {
-                    row.child(tr!("decisions.saved_answer", value = value))
-                })
-                .when_some(request.decision.clone(), |row, value| {
-                    row.child(tr!("decisions.decision", value = value))
-                })
+                .when_some(
+                    request
+                        .native
+                        .as_ref()
+                        .and_then(|native| native.outcome.as_ref()),
+                    |row, outcome| {
+                        let status = match outcome.state {
+                            waku_protocol::model::InputDeliveryState::Received => {
+                                if outcome.confirmation
+                                    == Some(waku_protocol::model::InputConfirmation::Provider)
+                                {
+                                    tr!("session.input_received_provider")
+                                } else {
+                                    tr!("session.input_received_transport")
+                                }
+                            }
+                            waku_protocol::model::InputDeliveryState::Accepted => {
+                                tr!("session.input_accepted")
+                            }
+                            waku_protocol::model::InputDeliveryState::Uncertain => {
+                                tr!("session.input_uncertain")
+                            }
+                            waku_protocol::model::InputDeliveryState::Failed => {
+                                tr!("session.input_failed")
+                            }
+                            waku_protocol::model::InputDeliveryState::Unsupported => {
+                                tr!("session.input_unsupported")
+                            }
+                            waku_protocol::model::InputDeliveryState::Queued => {
+                                tr!("session.input_queued")
+                            }
+                        };
+                        row.child(status)
+                    },
+                )
+                .when_some(
+                    request.native.as_ref().and_then(native_response_summary),
+                    |row, value| row.child(tr!("decisions.saved_answer", value = value)),
+                )
+                .when_some(
+                    request
+                        .user_answer
+                        .clone()
+                        .filter(|_| request.native.is_none()),
+                    |row, value| row.child(tr!("decisions.saved_answer", value = value)),
+                )
+                .when_some(
+                    request
+                        .decision
+                        .clone()
+                        .filter(|_| request.native.is_none()),
+                    |row, value| row.child(tr!("decisions.decision", value = value)),
+                )
                 .when_some(request.reason.clone(), |row, value| {
                     row.child(tr!("decisions.reason", value = value))
                 })
@@ -477,11 +724,125 @@ impl Waku {
             .selected
             .and_then(|id| dialog.requests.iter().find(|r| r.id == id));
         let can_answer = !dialog.pending
-            && selected_request.is_some_and(|r| r.state == DecisionState::WaitingUser);
+            && selected_request.is_some_and(|r| {
+                r.state == DecisionState::WaitingUser
+                    && (r.native.is_none()
+                        || (!dialog.attempts.contains_key(&r.id)
+                            && r.native.as_ref().is_none_or(|n| n.response.is_none())))
+            });
         let can_select = !dialog.pending && dialog.requests.len() > 1;
         let mut focus_order = vec![dialog.history_focus.clone()];
         if can_select {
             focus_order.extend([dialog.previous_focus.clone(), dialog.next_focus.clone()]);
+        }
+        let mut native_form = div().px(px(16.0)).flex().flex_col().gap(px(6.0));
+        if let Some(request) = selected_request.filter(|r| r.native.is_some()) {
+            let native = request.native.as_ref().unwrap();
+            let mut choices = Vec::new();
+            match &native.request {
+                NativeDecisionRequest::Permission { title, options, .. } => {
+                    native_form = native_form.child(title.clone());
+                    for option in options {
+                        let selected = matches!(dialog.native_answers.get(&request.id), Some(NativeDecisionResponse::Permission { option_id }) if option_id == &option.id);
+                        choices.push((option.id.clone(), option.label.clone(), selected));
+                    }
+                }
+                NativeDecisionRequest::UserInput { .. } => {
+                    if let Some(pending) = dialog.native_inputs.get(&request.id) {
+                        if let Some(question) = pending.current_question() {
+                            native_form = native_form.child(format!(
+                                "{} / {} · {}",
+                                pending.question_index + 1,
+                                pending.questions.len(),
+                                question.question
+                            ));
+                            for option in &question.options {
+                                let selected = pending
+                                    .selections
+                                    .get(&question.id)
+                                    .is_some_and(|values| values.contains(&option.label));
+                                let label = match &option.description {
+                                    Some(detail) => format!("{} — {}", option.label, detail),
+                                    None => option.label.clone(),
+                                };
+                                choices.push((option.label.clone(), label, selected));
+                            }
+                        }
+                        if pending.questions.len() > 1 {
+                            let mut navigation = div().flex().items_center().gap(px(8.0));
+                            for (forward, label) in [
+                                (false, tr!("decisions.previous")),
+                                (true, tr!("decisions.next")),
+                            ] {
+                                let focus = self.transcript_control_focus(
+                                    format!("native-question-{forward}"),
+                                    cx,
+                                );
+                                if can_answer {
+                                    focus_order.push(focus.clone());
+                                }
+                                navigation = navigation.child(
+                                    decision_answer_control(
+                                        if forward {
+                                            "native-question-next"
+                                        } else {
+                                            "native-question-previous"
+                                        },
+                                        label,
+                                        &focus,
+                                        can_answer,
+                                        theme,
+                                    )
+                                    .when(
+                                        can_answer,
+                                        |button| {
+                                            button.on_click(cx.listener(move |this, _, _, cx| {
+                                                this.move_native_question(forward, cx)
+                                            }))
+                                        },
+                                    ),
+                                );
+                            }
+                            native_form = native_form.child(navigation);
+                        }
+                    }
+                }
+            }
+            for (index, (value, label, selected)) in choices.into_iter().enumerate() {
+                let key = format!("native-option-{}-{index}", request.id);
+                let focus = self.transcript_control_focus(key.clone(), cx);
+                if can_answer {
+                    focus_order.push(focus.clone());
+                }
+                native_form = native_form.child(
+                    div()
+                        .id(SharedString::from(key))
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(if selected {
+                            theme.accent
+                        } else {
+                            theme.border_strong
+                        })
+                        .focus_visible(|s| s.border_color(theme.accent))
+                        .child(if selected {
+                            tr!("decisions.selected_option", value = label)
+                        } else {
+                            label
+                        })
+                        .when(can_answer, |button| {
+                            button
+                                .track_focus(&focus)
+                                .tab_stop(true)
+                                .tab_index(0)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_native_option(value.clone(), cx)
+                                }))
+                        }),
+                );
+            }
         }
         if selected_request.is_some() {
             focus_order.push(dialog.input.read(cx).focus());
@@ -520,6 +881,7 @@ impl Waku {
                         .child(dialog.title.clone()),
                 )
                 .child(history)
+                .child(native_form)
                 .when_some(selected_request, |card, request| {
                     card.child(
                         div()
@@ -593,7 +955,11 @@ impl Waku {
                                     } else if request.user_answer.is_some() {
                                         tr!("decisions.answer_saved")
                                     } else if request.state == DecisionState::WaitingUser {
-                                        tr!("decisions.answer_hint")
+                                        if request.native.is_some() {
+                                            tr!("decisions.native_answer_hint")
+                                        } else {
+                                            tr!("decisions.answer_hint")
+                                        }
                                     } else {
                                         tr!("decisions.answer_read_only")
                                     }),
@@ -706,6 +1072,90 @@ impl Waku {
     }
 }
 
+pub(super) fn event_changes_decisions(event: &DriverEvent) -> bool {
+    matches!(
+        event,
+        DriverEvent::DecisionRequestChanged(_)
+            | DriverEvent::InputDeliveryOutcome(_)
+            | DriverEvent::NativeRequestClosed { .. }
+            | DriverEvent::HistorySnapshot(_)
+    )
+}
+
+fn preserve_live_decision_outcome(
+    sessions: &[AgentSession],
+    incoming: DecisionRequest,
+) -> DecisionRequest {
+    sessions
+        .iter()
+        .find(|session| session.id == incoming.child_session_id)
+        .and_then(|session| {
+            session
+                .decision_requests
+                .iter()
+                .find(|r| r.id == incoming.id)
+        })
+        .filter(|r| {
+            matches!(
+                r.state,
+                DecisionState::Resolved | DecisionState::Failed | DecisionState::Invalidated
+            ) || (r
+                .native
+                .as_ref()
+                .and_then(|native| native.outcome.as_ref())
+                .is_some_and(|outcome| {
+                    outcome.state != waku_protocol::model::InputDeliveryState::Accepted
+                })
+                && incoming
+                    .native
+                    .as_ref()
+                    .and_then(|native| native.outcome.as_ref())
+                    .is_none_or(|outcome| {
+                        outcome.state == waku_protocol::model::InputDeliveryState::Accepted
+                    }))
+        })
+        .cloned()
+        .unwrap_or(incoming)
+}
+
+fn decision_catalog_requests(sessions: &[AgentSession], parent_id: Uuid) -> Vec<DecisionRequest> {
+    sessions
+        .iter()
+        .filter(|session| session.parent_session_id == Some(parent_id))
+        .flat_map(|session| session.decision_requests.iter().cloned())
+        .collect()
+}
+
+fn native_response_summary(native: &waku_protocol::model::NativeDecision) -> Option<String> {
+    match (&native.request, native.response.as_ref()?) {
+        (
+            NativeDecisionRequest::Permission { options, .. },
+            NativeDecisionResponse::Permission { option_id },
+        ) => options
+            .iter()
+            .find(|option| option.id == *option_id)
+            .map(|option| option.label.clone()),
+        (
+            NativeDecisionRequest::UserInput { questions, .. },
+            NativeDecisionResponse::UserInput { answers },
+        ) => Some(
+            questions
+                .iter()
+                .map(|question| {
+                    let answer = answers
+                        .iter()
+                        .find(|answer| answer.question_id == question.id)
+                        .map(|answer| answer.answers.join(", "))
+                        .unwrap_or_default();
+                    format!("{}: {answer}", question.question)
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
+}
+
 // Hydration can lag streaming. Import only the saved answer identities and leave
 // every existing message and runtime field untouched.
 fn merge_decision_answer_messages(
@@ -742,9 +1192,31 @@ fn merge_decision_answer_messages(
                     .iter()
                     .position(|existing| existing.id == message.id)
             });
+            // Assistant IDs are generated independently by the daemon and desktop.
+            // A shared turn boundary still identifies the preceding saved output.
+            let preceding_turn = hydrated.messages[..index]
+                .iter()
+                .rev()
+                .find_map(|message| message.turn_id);
+            let previous_turn_end = preceding_turn
+                .and_then(|turn| {
+                    local
+                        .messages
+                        .iter()
+                        .rposition(|message| message.turn_id == Some(turn))
+                })
+                .map(|index| index + 1);
             let position = next
+                .or(previous_turn_end)
                 .or_else(|| previous.map(|index| index + 1))
                 .unwrap_or(local.messages.len());
+            for block in &mut local.transcript_blocks {
+                if block.after_message > position
+                    || (block.after_message == position && block.turn_id != preceding_turn)
+                {
+                    block.after_message += 1;
+                }
+            }
             local
                 .messages
                 .insert(position, hydrated.messages[index].clone());
@@ -822,6 +1294,112 @@ mod tests {
             &[request]
         ));
         assert_eq!(local.messages.len(), 3);
+    }
+
+    #[test]
+    fn decision_answer_hydration_uses_shared_turn_when_assistant_ids_differ() {
+        let mut local = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let old_turn = local.begin_turn("Original task");
+        let mut hydrated = local.clone();
+        local.push_message(MessageRole::Assistant, "Finished response");
+        hydrated.push_message(MessageRole::Assistant, "Finished response");
+        local.finish_active_turn(TurnStatus::Completed);
+        hydrated.finish_active_turn(TurnStatus::Completed);
+        let answer_id = hydrated.push_message(MessageRole::User, "Approved");
+        local.begin_turn("New instruction");
+        local.push_message(MessageRole::Assistant, "New streaming response");
+        let request: DecisionRequest = serde_json::from_value(serde_json::json!({
+            "id":Uuid::new_v4(),"parent_session_id":local.id,"child_session_id":Uuid::new_v4(),"turn_id":old_turn,
+            "question":"Proceed?","context":"Scope","recommendation":"Proceed","blocked_work":"Output",
+            "state":"pendingReceipt","notified":false,"authority_message_id":answer_id,"user_answer":"Approved"
+        })).unwrap();
+        assert!(merge_decision_answer_messages(
+            &mut local,
+            &hydrated,
+            &[request]
+        ));
+        assert_eq!(local.messages[1].content, "Finished response");
+        assert_eq!(local.messages[2].id, answer_id);
+        assert_eq!(local.messages[3].content, "New instruction");
+        assert_eq!(local.messages[4].content, "New streaming response");
+    }
+
+    #[test]
+    fn decision_native_summary_preserves_each_question_without_json() {
+        let native: waku_protocol::model::NativeDecision = serde_json::from_value(serde_json::json!({
+            "session_id":Uuid::new_v4(),"runtime_id":Uuid::new_v4(),"request":{"type":"userInput","request_id":"provider-1","questions":[
+                {"id":"one","header":"First","question":"Format?","options":[],"multiSelect":false},
+                {"id":"two","header":"Second","question":"Destination?","options":[],"multiSelect":false}
+            ]},"response":{"type":"userInput","answers":[{"questionId":"one","answers":["JSON"]},{"questionId":"two","answers":["Report file"]}]},"outcome":null
+        })).unwrap();
+        assert_eq!(
+            native_response_summary(&native).unwrap(),
+            "Format?: JSON\nDestination?: Report file"
+        );
+    }
+
+    #[test]
+    fn decision_native_receipt_refreshes_open_snapshot_before_stale_answer_response() {
+        let parent_id = Uuid::new_v4();
+        let mut child = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        child.parent_session_id = Some(parent_id);
+        let turn_id = child.begin_turn("Work");
+        let id = Uuid::new_v4();
+        let request: DecisionRequest = serde_json::from_value(serde_json::json!({
+            "id":id,"parent_session_id":parent_id,"child_session_id":child.id,"turn_id":turn_id,
+            "question":"Proceed?","context":"Scope","recommendation":"Proceed","blocked_work":"Output",
+            "state":"pendingReceipt","notified":false,
+            "native":{"session_id":child.id,"runtime_id":Uuid::new_v4(),
+                "request":{"type":"permission","request_id":"native-1","title":"Proceed?","detail":"","options":[]},
+                "response":{"type":"permission","option_id":"allow"},
+                "outcome":{"id":id,"state":"accepted","confirmation":null,"reason":null}}
+        })).unwrap();
+        child.decision_requests.push(request.clone());
+        let mut sessions = vec![child];
+        let mut uncertain = request.clone();
+        uncertain
+            .native
+            .as_mut()
+            .unwrap()
+            .outcome
+            .as_mut()
+            .unwrap()
+            .state = waku_protocol::model::InputDeliveryState::Uncertain;
+        sessions[0].decision_requests[0] = uncertain;
+        assert_eq!(
+            preserve_live_decision_outcome(&sessions, request.clone())
+                .native
+                .unwrap()
+                .outcome
+                .unwrap()
+                .state,
+            waku_protocol::model::InputDeliveryState::Uncertain
+        );
+        sessions[0].decision_requests[0] = request.clone();
+        let mut open_snapshot = decision_catalog_requests(&sessions, parent_id);
+        assert_eq!(open_snapshot[0].state, DecisionState::PendingReceipt);
+        let event = DriverEvent::InputDeliveryOutcome(waku_protocol::model::InputDeliveryOutcome {
+            id,
+            state: waku_protocol::model::InputDeliveryState::Received,
+            confirmation: Some(waku_protocol::model::InputConfirmation::Transport),
+            reason: None,
+        });
+        let dirty = event_changes_decisions(&event);
+        waku_protocol::history::HistoryReducer::default().apply(&mut sessions[0], event);
+        if dirty {
+            open_snapshot = decision_catalog_requests(&sessions, parent_id);
+        }
+        assert_eq!(open_snapshot[0].state, DecisionState::Resolved);
+        assert_eq!(
+            preserve_live_decision_outcome(&sessions, request).state,
+            DecisionState::Resolved
+        );
+        assert!(!event_changes_decisions(&DriverEvent::TextDelta(
+            "progress".into()
+        )));
+        assert!(event_changes_decisions(&DriverEvent::NativeRequestClosed {
+            request_id: "native-1".into()
+        }));
     }
 
     struct AnswerEditorView {

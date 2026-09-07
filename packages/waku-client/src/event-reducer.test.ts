@@ -507,7 +507,7 @@ test('manager decision receipt and callback wait survive shared-client projectio
     instruction_message_id: 'instruction', instruction: 'Produce output', state: 'pendingReceipt' as const,
     decision: 'Use JSON', authority_message_id: 'instruction', reason: null, notified: true,
     escalation: { reason: 'Scope expansion', options: [{ label: 'JSON', impact: 'Add file' }], impact: 'Extra work' },
-    upstream_request_id: 'upper-request', user_answer: 'Use JSON' }
+    upstream_request_id: 'upper-request', user_answer: 'Use JSON', native: null }
   session.decision_requests = [request]
   session.input_deliveries = [{ id: 'decision', caller_session_id: 'parent', target_session_id: session.id,
     prompt: 'Use JSON', display_content: 'Manager decision', turn_id: turn, mode: 'prompt', state: 'uncertain',
@@ -521,4 +521,29 @@ test('manager decision receipt and callback wait survive shared-client projectio
   const wait = { id: 'results', parent_turn_id: turn, targets: [{ session_id: 'child', turn_id: 'child-turn' }] }
   const callback = apply(session, 'stewardWaitChanged', wait)
   expect(apply(callback, 'promptSubmitted', { message: 'Automatic decision notification', turnId: turn, messageId: 'callback' }).steward_wait).toEqual(wait)
+})
+
+test('native closure releases waiting and keeps a late receipt without reviving the request', () => {
+  let session = runningSession()
+  const turn = session.turns.at(-1)!.id
+  session = apply(session, 'permission', { requestId: 'native-wire', title: 'Run', detail: 'Original task', options: [{ id: 'allow', label: 'Allow', allow: true }] })
+  session = apply(session, 'decisionRequestChanged', {
+    id: 'native-decision', parent_session_id: 'parent', child_session_id: session.id, turn_id: turn,
+    question: 'Run?', context: 'Original task', recommendation: 'Review', blocked_work: 'Command',
+    instruction_message_id: 'instruction', instruction: 'Run task', state: 'pendingReceipt', decision: 'Allow',
+    authority_message_id: 'instruction', reason: null, notified: true, escalation: null, upstream_request_id: null, user_answer: null,
+    native: { session_id: session.id, runtime_id: 'runtime', request: { type: 'permission', request_id: 'native-wire', title: 'Run', detail: 'Original task', options: [{ id: 'allow', label: 'Allow', allow: true }] },
+      response: { type: 'permission', option_id: 'allow' }, outcome: { id: 'native-decision', state: 'accepted', confirmation: null, reason: null } },
+  })
+  const accepted = structuredClone(session.decision_requests![0]!)
+  session = apply(session, 'nativeRequestClosed', { requestId: 'native-wire' })
+  expect(session.pending_permission).toBeUndefined()
+  expect(session.status).toBe('working')
+  session = apply(session, 'inputDeliveryOutcome', { id: 'native-decision', state: 'received', confirmation: 'transport', reason: null })
+  expect(session.decision_requests?.[0]?.state).toBe('invalidated')
+  expect(session.decision_requests?.[0]?.native?.outcome?.state).toBe('received')
+  session = apply(session, 'decisionRequestChanged', accepted)
+  expect(session.decision_requests?.[0]?.state).toBe('invalidated')
+  expect(session.decision_requests?.[0]?.native?.outcome?.state).toBe('received')
+  expect(session.input_deliveries ?? []).toHaveLength(0)
 })

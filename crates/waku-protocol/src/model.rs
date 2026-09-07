@@ -985,6 +985,30 @@ pub struct DecisionEscalation {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum NativeDecisionRequest {
+    Permission { request_id: String, title: String, detail: String, options: Vec<PermissionOption> },
+    UserInput { request_id: String, questions: Vec<UserInputQuestion> },
+}
+impl NativeDecisionRequest {
+    pub fn request_id(&self) -> &str { match self { Self::Permission { request_id, .. } | Self::UserInput { request_id, .. } => request_id } }
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum NativeDecisionResponse {
+    Permission { option_id: String },
+    UserInput { answers: Vec<UserInputAnswer> },
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct NativeDecision {
+    pub session_id: Uuid,
+    pub runtime_id: Uuid,
+    pub request: NativeDecisionRequest,
+    pub response: Option<NativeDecisionResponse>,
+    pub outcome: Option<InputDeliveryOutcome>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct DecisionRequest {
     pub id: Uuid,
     pub parent_session_id: Uuid,
@@ -1007,11 +1031,14 @@ pub struct DecisionRequest {
     pub upstream_request_id: Option<Uuid>,
     #[serde(default)]
     pub user_answer: Option<String>,
+    #[serde(default)]
+    pub native: Option<NativeDecision>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum StewardDecisionOperation {
+    DecideNative { session_id: Uuid, request_id: Uuid, response: NativeDecisionResponse, authority_message_id: Option<Uuid> },
     Escalate { session_id: Uuid, request_id: Uuid, reason: String, options: Vec<DecisionOption>, impact: String },
     Request { request_id: Uuid, question: String, context: String, recommendation: String, blocked_work: String },
     List { session_id: Option<Uuid> },
@@ -2120,6 +2147,7 @@ impl ActivityKind {
 
 #[derive(Clone, Debug)]
 pub enum DriverEvent {
+    DecisionRequestChanged(DecisionRequest),
     InputDeliveryChanged(InputDelivery),
     InputDeliveryOutcome(InputDeliveryOutcome),
     StewardWaitChanged(Option<StewardWait>),
@@ -2163,6 +2191,7 @@ pub enum DriverEvent {
     CancelRequested,
     /// The provider confirmed that its current turn stopped.
     TurnInterrupted,
+    NativeRequestClosed { request_id: String },
     InteractionResponded {
         request_id: String,
     },
@@ -2410,7 +2439,7 @@ impl<'de> Deserialize<'de> for ReportedCommand {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionOption {
     pub id: String,

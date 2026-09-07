@@ -123,8 +123,35 @@ export function reduceRuntimeEvent(
       else if (session.input_deliveries[existing]!.state === 'queued') session.input_deliveries[existing] = delivery
       break
     }
+    case 'decisionRequestChanged': {
+      const request = payload as unknown as NonNullable<AgentSession['decision_requests']>[number]
+      const requests = session.decision_requests ??= []
+      const index = requests.findIndex(r => r.id === request.id)
+      if (index >= 0) {
+        const saved = requests[index]!
+        const outcome = saved.native?.outcome
+        if (!['resolved', 'failed', 'invalidated'].includes(saved.state) && (!outcome || outcome.state === 'accepted')) requests[index] = request
+      } else requests.push(request)
+      break
+    }
     case 'inputDeliveryOutcome': {
       const outcome = payload as unknown as Pick<InputDelivery, 'id' | 'state' | 'confirmation' | 'reason'>
+      const nativeRequest = session.decision_requests?.find(r => r.id === outcome.id && r.native)
+      if (nativeRequest?.native && ['accepted', 'uncertain'].includes(nativeRequest.native.outcome?.state ?? '')) {
+        nativeRequest.native.outcome = outcome
+        if (!['invalidated', 'failed', 'resolved'].includes(nativeRequest.state)) {
+        nativeRequest.state = outcome.state === 'received' ? 'resolved' : outcome.state === 'failed' ? 'failed' : 'pendingReceipt'
+        nativeRequest.reason = outcome.reason
+        if (outcome.state === 'received') {
+          const requestId = nativeRequest.native.request.request_id
+          if (session.pending_permission?.requestId === requestId) delete session.pending_permission
+          if (session.pending_user_input?.requestId === requestId) delete session.pending_user_input
+          if (activeTurn(session) && session.status === 'waiting' && !session.pending_permission && !session.pending_user_input) session.status = 'working'
+          result.permission = session.pending_permission ?? null
+          result.userInput = session.pending_user_input ?? null
+        }
+      }
+      }
       const delivery = session.input_deliveries?.find((entry) => entry.id === outcome.id)
       if (delivery && (delivery.state === 'accepted' || delivery.state === 'uncertain')) {
         delivery.state = outcome.state
@@ -171,6 +198,21 @@ export function reduceRuntimeEvent(
       result.permission = null
       result.userInput = null
       break
+    case 'nativeRequestClosed': {
+      const requestId = String(asRecord(payload)?.requestId)
+      for (const request of session.decision_requests ?? []) {
+        if (request.native?.request.request_id === requestId && !['invalidated', 'failed', 'resolved'].includes(request.state)) {
+          request.state = 'invalidated'
+          request.reason = 'Provider closed the original native request'
+        }
+      }
+      if (session.pending_permission?.requestId === requestId) delete session.pending_permission
+      if (session.pending_user_input?.requestId === requestId) delete session.pending_user_input
+      if (activeTurn(session) && session.status === 'waiting' && !session.pending_permission && !session.pending_user_input) session.status = 'working'
+      result.permission = session.pending_permission ?? null
+      result.userInput = session.pending_user_input ?? null
+      break
+    }
     case 'interactionResponded': {
       const requestId = asRecord(payload)?.request_id
       if (session.pending_permission?.requestId === requestId) delete session.pending_permission

@@ -9,6 +9,8 @@ mod codex;
 mod codex_lifecycle_tests;
 #[cfg(test)]
 mod native_input_tests;
+#[cfg(test)]
+mod native_response_tests;
 mod computer_use;
 mod deepseek;
 mod opencode;
@@ -121,6 +123,10 @@ impl DriverHandle {
         self.inner.stop_background_work(key, control_id);
     }
 
+    pub fn respond_tracked(&self, request_id: String, response: NativeResponse, delivery_id: uuid::Uuid) -> anyhow::Result<()> {
+        self.inner.respond_tracked(request_id, response, delivery_id)
+    }
+
     pub fn respond(&self, request_id: String, option_id: String) {
         self.inner.respond(request_id, option_id);
     }
@@ -172,6 +178,9 @@ pub trait DriverControl: Send + Sync {
     fn cancel_computer_use(&self) {}
     fn refresh_background_work(&self) {}
     fn stop_background_work(&self, _key: BackgroundWorkKey, _control_id: String) {}
+    fn respond_tracked(&self, _request_id: String, _response: NativeResponse, _delivery_id: uuid::Uuid) -> anyhow::Result<()> {
+        anyhow::bail!("provider does not support tracked native responses")
+    }
     fn respond(&self, request_id: String, option_id: String);
     fn respond_user_input(&self, _request_id: String, _answers: Vec<UserInputAnswer>) {}
     /// Providers without persisted goals ignore the request; the UI only
@@ -283,4 +292,91 @@ fn input_outcome(events: &impl DriverEventSink, id: Option<uuid::Uuid>, state: c
     if let Some(id) = id {
         let _ = events.send(DriverEvent::InputDeliveryOutcome(crate::model::InputDeliveryOutcome { id, state, confirmation, reason }));
     }
+}
+
+pub use crate::model::NativeDecisionResponse as NativeResponse;
+
+#[derive(Clone)]
+struct NativeRequest {
+    token: uuid::Uuid,
+    wire_id: serde_json::Value,
+    input: serde_json::Value,
+    questions: Option<Vec<crate::model::UserInputQuestion>>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    attempted: bool,
+}
+
+type NativeRequests = Arc<parking_lot::Mutex<std::collections::HashMap<String, NativeRequest>>>;
+
+impl NativeRequest {
+    fn new(wire_id: serde_json::Value, input: serde_json::Value,
+        questions: Option<Vec<crate::model::UserInputQuestion>>, thread_id: Option<String>, turn_id: Option<String>) -> Self {
+        Self { token: uuid::Uuid::new_v4(), wire_id, input, questions, thread_id, turn_id, attempted: false }
+    }
+}
+
+fn native_request(pending: &NativeRequests, request_id: &str, response: &NativeResponse) -> anyhow::Result<NativeRequest> {
+    let request = pending.lock().get(request_id).cloned()
+        .ok_or_else(|| anyhow::anyhow!("native request is no longer live"))?;
+    anyhow::ensure!(!request.attempted, "native response was already attempted; do not resend");
+    match (&request.questions, response) {
+        (None, NativeResponse::Permission { .. }) => {}
+        (Some(questions), NativeResponse::UserInput { answers }) => {
+            anyhow::ensure!(!questions.is_empty() && answers.len() == questions.len(), "all native questions require an answer");
+            anyhow::ensure!(request.input.get("questions").and_then(serde_json::Value::as_array).is_some_and(|raw| raw.len() == questions.len()), "native question payload is incomplete");
+            anyhow::ensure!(questions.iter().map(|q| &q.id).collect::<std::collections::HashSet<_>>().len() == questions.len(), "native question IDs are ambiguous");
+            let mut ids = std::collections::HashSet::new();
+            for answer in answers {
+                anyhow::ensure!(ids.insert(&answer.question_id), "duplicate question ID");
+                let question = questions.iter().find(|q| q.id == answer.question_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown native question ID"))?;
+                anyhow::ensure!(!answer.answers.is_empty() && answer.answers.iter().all(|a| !a.trim().is_empty()), "native answers must not be empty");
+                anyhow::ensure!(question.multi_select || answer.answers.len() == 1, "native question accepts one answer");
+                let unique = answer.answers.iter().collect::<std::collections::HashSet<_>>();
+                anyhow::ensure!(unique.len() == answer.answers.len(), "duplicate native answer");
+            }
+        }
+        _ => anyhow::bail!("native response type does not match the request"),
+    }
+    Ok(request)
+}
+
+/// Count bytes at the actual writer boundary, so a partial write cannot become a safe retry.
+fn write_native_response(writer: &mut impl std::io::Write, pending: &NativeRequests, request_id: &str,
+    token: uuid::Uuid, message: &serde_json::Value, delivery_id: Option<uuid::Uuid>, events: &impl DriverEventSink) -> std::io::Result<()> {
+    use crate::model::{InputConfirmation, InputDeliveryState};
+    let mut bytes = serde_json::to_vec(message)?;
+    bytes.push(b'\n');
+    {
+        let mut pending = pending.lock();
+        let live = pending.get_mut(request_id).filter(|r| r.token == token && !r.attempted);
+        let Some(live) = live else {
+            input_outcome(events, delivery_id, InputDeliveryState::Failed, None,
+                Some("Native request ended or its response was already attempted; nothing was written".into()));
+            return Ok(());
+        };
+        live.attempted = true;
+    }
+    let mut written = 0;
+    let result = (|| {
+        while written < bytes.len() {
+            match writer.write(&bytes[written..]) {
+                Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        writer.flush()
+    })();
+    let still_live = pending.lock().get(request_id).is_some_and(|r| r.token == token);
+    let received = result.is_ok() && still_live;
+    let state = if received { InputDeliveryState::Received }
+        else if written == 0 { InputDeliveryState::Failed } else { InputDeliveryState::Uncertain };
+    input_outcome(events, delivery_id, state,
+        received.then_some(InputConfirmation::Transport),
+        if !still_live { Some("Native request ended during response delivery; receipt is uncertain".into()) }
+        else { result.as_ref().err().map(ToString::to_string) });
+    result
 }

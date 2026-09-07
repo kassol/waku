@@ -156,8 +156,8 @@ impl Waku {
             }
             event @ (DriverEvent::RuntimeEventCursorAdvanced(_)
             | DriverEvent::HistoryPersistence { .. }
+            | DriverEvent::DecisionRequestChanged(_)
             | DriverEvent::InputDeliveryChanged(_)
-            | DriverEvent::InputDeliveryOutcome(_)
             | DriverEvent::StewardWaitChanged(_)
             | DriverEvent::AgentPresetSelected(_)
             | DriverEvent::AutoTitleUpdated(_)
@@ -186,6 +186,76 @@ impl Waku {
                 if let Some(previous_kinds) = previous_kinds.as_deref() {
                     self.splice_active_transcript_rows_after_visibility_change(previous_kinds);
                 }
+            }
+            DriverEvent::InputDeliveryOutcome(outcome) => {
+                let native_request = self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == session_id)
+                    .and_then(|session| {
+                        session
+                            .decision_requests
+                            .iter()
+                            .find(|request| request.id == outcome.id)
+                    })
+                    .and_then(|request| request.native.as_ref())
+                    .map(|native| match &native.request {
+                        waku_protocol::model::NativeDecisionRequest::Permission {
+                            request_id,
+                            ..
+                        }
+                        | waku_protocol::model::NativeDecisionRequest::UserInput {
+                            request_id,
+                            ..
+                        } => request_id.clone(),
+                    });
+                if outcome.state == waku_protocol::model::InputDeliveryState::Received {
+                    if let Some(id) = native_request {
+                        runtime.native_responses.remove(&id);
+                        if runtime
+                            .pending_permission
+                            .as_ref()
+                            .is_some_and(|p| p.request_id == id)
+                        {
+                            runtime.pending_permission = None;
+                        }
+                        if runtime
+                            .pending_user_input
+                            .as_ref()
+                            .is_some_and(|p| p.request_id == id)
+                        {
+                            runtime.pending_user_input = None;
+                        }
+                    }
+                }
+                self.apply_history_event(
+                    session_id,
+                    runtime,
+                    DriverEvent::InputDeliveryOutcome(outcome),
+                );
+            }
+            DriverEvent::NativeRequestClosed { request_id } => {
+                runtime.native_responses.remove(&request_id);
+                if runtime
+                    .pending_permission
+                    .as_ref()
+                    .is_some_and(|p| p.request_id == request_id)
+                {
+                    runtime.pending_permission = None;
+                }
+                if runtime
+                    .pending_user_input
+                    .as_ref()
+                    .is_some_and(|p| p.request_id == request_id)
+                {
+                    runtime.pending_user_input = None;
+                }
+                self.apply_history_event(
+                    session_id,
+                    runtime,
+                    DriverEvent::NativeRequestClosed { request_id },
+                );
             }
             DriverEvent::InteractionResponded { request_id } => {
                 if runtime

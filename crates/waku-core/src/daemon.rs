@@ -34,6 +34,8 @@ mod steward_input;
 mod steward_input_tests;
 #[path = "steward.rs"]
 mod steward;
+#[path = "steward_native.rs"]
+mod steward_native;
 #[path = "steward_escalation.rs"]
 mod steward_escalation;
 #[path = "steward_decision.rs"]
@@ -157,6 +159,12 @@ impl WakuBackend {
                 session.status = SessionStatus::Idle;
                 session.pending_permission = None;
                 session.pending_user_input = None;
+                for request in &mut session.decision_requests {
+                    if request.native.is_some() && !matches!(request.state, crate::model::DecisionState::Resolved | crate::model::DecisionState::Failed | crate::model::DecisionState::Invalidated) {
+                        request.state = crate::model::DecisionState::Invalidated;
+                        request.reason = Some("Original native process did not survive daemon restart".into());
+                    }
+                }
                 for message in &mut session.messages {
                     message.streaming = false;
                 }
@@ -442,6 +450,11 @@ impl Backend for WakuBackend {
                 continue;
             }
             self.track_cleanup_background(first.session_id, first.runtime_id, &decoded);
+            let native = match &decoded {
+                DriverEvent::Permission {request_id,title,detail,options} => Some(crate::model::NativeDecisionRequest::Permission {request_id:request_id.clone(),title:title.clone(),detail:detail.clone(),options:options.clone()}),
+                DriverEvent::UserInputRequested {request_id,questions} => Some(crate::model::NativeDecisionRequest::UserInput {request_id:request_id.clone(),questions:questions.clone()}),
+                _=>None,
+            };
             reducer.apply(session, decoded);
             let cursor = crate::model::RuntimeEventCursor {
                 runtime_id: event.runtime_id,
@@ -450,6 +463,7 @@ impl Backend for WakuBackend {
             };
             session.runtime_event_cursor = Some(cursor);
             pending.push(event.clone());
+            if let Some(native) = native { self.capture_native_request(&mut state,index,first.runtime_id,native)?; }
         }
         if pending.is_empty() {
             return Ok(true);
@@ -525,7 +539,10 @@ impl Backend for WakuBackend {
         let starts_work = matches!(
             request.command,
             Command::CreateSession { .. }
-                | Command::AnswerDecision { .. }
+                | Command::AnswerNativeDecision { .. }
+                | Command::Respond { .. }
+                | Command::RespondUserInput { .. }
+        | Command::AnswerDecision { .. }
                 | Command::StewardDecision { .. }
                 | Command::StewardWait { .. }
                 | Command::StewardWorkspace { .. }
@@ -700,6 +717,9 @@ impl WakuBackend {
         }
         match request.command {
             Command::StewardWorkspace { operation } => self.steward_workspace(session_id, operation, &events),
+            Command::AnswerNativeDecision { child_session_id, request_id, response } => self.answer_native(child_session_id, request_id, response, &events),
+            Command::Respond { request_id, option_id } => self.respond_native_direct(session_id, request.runtime_id, request_id, crate::model::NativeDecisionResponse::Permission { option_id }, &events),
+            Command::RespondUserInput { request_id, answers } => self.respond_native_direct(session_id, request.runtime_id, request_id, crate::model::NativeDecisionResponse::UserInput { answers }, &events),
             Command::AnswerDecision { child_session_id, request_id, answer } => self.answer_decision(child_session_id, request_id, answer, &events),
             Command::StewardDecision { operation } => self.steward_decision(session_id, operation, &events),
             Command::StewardWait { session_ids } => {
@@ -1486,12 +1506,6 @@ impl WakuBackend {
                 }
                 let history_result = match &command {
                     Command::Cancel => events.send(event_to_wire(DriverEvent::CancelRequested)?),
-                    Command::Respond { request_id, .. }
-                    | Command::RespondUserInput { request_id, .. } => {
-                        events.send(event_to_wire(DriverEvent::InteractionResponded {
-                            request_id: request_id.clone(),
-                        })?)
-                    }
                     _ => Ok(()),
                 };
                 handle_driver_command(&driver, command, history_result)
@@ -2536,6 +2550,7 @@ fn handle_driver_command(
         Command::StewardInputStatus { .. }
         | Command::StewardWorkspace { .. }
         | Command::StewardQuery { .. }
+        | Command::AnswerNativeDecision { .. }
         | Command::AnswerDecision { .. }
         | Command::StewardDecision { .. }
         | Command::StewardWait { .. }
@@ -2718,6 +2733,8 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
         DriverEvent::Error(error) => ("error", Value::String(error)),
         DriverEvent::CancelRequested => ("cancelRequested", Value::Null),
         DriverEvent::TurnInterrupted => ("turnInterrupted", Value::Null),
+        DriverEvent::DecisionRequestChanged(request) => ("decisionRequestChanged", serde_json::to_value(request)?),
+        DriverEvent::NativeRequestClosed { request_id } => ("nativeRequestClosed", json!({"requestId":request_id})),
         DriverEvent::InteractionResponded { request_id } => {
             ("interactionResponded", json!({ "request_id": request_id }))
         }
@@ -2820,6 +2837,8 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         "error" => DriverEvent::Error(serde_json::from_value(payload)?),
         "cancelRequested" => DriverEvent::CancelRequested,
         "turnInterrupted" => DriverEvent::TurnInterrupted,
+        "decisionRequestChanged" => DriverEvent::DecisionRequestChanged(serde_json::from_value(payload)?),
+        "nativeRequestClosed" => DriverEvent::NativeRequestClosed { request_id: serde_json::from_value(payload.get("requestId").cloned().unwrap_or(Value::Null))? },
         "interactionResponded" => DriverEvent::InteractionResponded {
             request_id: serde_json::from_value(
                 payload.get("request_id").cloned().unwrap_or(Value::Null),

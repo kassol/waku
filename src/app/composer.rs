@@ -101,6 +101,17 @@ impl Waku {
     // ── Permission ─────────────────────────────────────────────────────────
 
     pub(super) fn render_permission(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.selected_session().is_some_and(|s| s.parent_session_id.is_some())
+            && self.selected_runtime().is_some_and(|r| r.pending_permission.is_some() || r.pending_user_input.is_some()) {
+            let focus = self.transcript_control_focus("managed-native-decision", cx);
+            let theme = Theme::current(cx);
+            return Some(div().px(px(20.0)).py(px(10.0)).child(
+                div().id("managed-native-decision").track_focus(&focus).tab_index(0).tab_stop(true)
+                    .px(px(10.0)).py(px(8.0)).rounded(px(6.0)).border_1().border_color(theme.border_strong)
+                    .focus_visible(|s| s.border_color(theme.accent)).child(tr!("decisions.native_managed"))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_decisions(window, cx)))
+            ));
+        }
         if let Some(input) = self.selected_runtime()?.pending_user_input.clone() {
             return Some(self.render_user_input(input, cx));
         }
@@ -110,6 +121,7 @@ impl Waku {
         let permission = self.selected_runtime()?.pending_permission.as_ref()?;
         let theme = Theme::current(cx);
         let request_id = permission.request_id.clone();
+        let responding = self.selected_runtime().is_some_and(|r| r.native_responses.contains(&request_id));
         let mut buttons = div().flex().items_center().gap(px(8.0)).mt(px(10.0));
         for option in &permission.options {
             let request_id = request_id.clone();
@@ -151,9 +163,10 @@ impl Waku {
                     .active(|element| element.opacity(0.8))
                     .focus_visible(|element| element.border_1().border_color(theme.accent))
                     .child(SharedString::from(option.label.clone()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .when(responding, |button| button.opacity(0.5))
+                    .when(!responding, |button| button.on_click(cx.listener(move |this, _, _, cx| {
                         this.respond_permission(request_id.clone(), option_id.clone(), cx);
-                    })),
+                    }))),
             );
         }
         Some(
@@ -217,7 +230,8 @@ impl Waku {
             .custom_answers
             .get(&question.id)
             .is_some_and(|answer| !answer.trim().is_empty());
-        let can_continue = has_custom || !selected.is_empty();
+        let responding = self.selected_runtime().is_some_and(|r| r.native_responses.contains(&pending.request_id));
+        let can_continue = !responding && (has_custom || !selected.is_empty());
         let is_last = pending.question_index + 1 == pending.questions.len();
         let request_id = pending.request_id.clone();
         let question_index = pending.question_index;

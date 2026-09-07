@@ -898,6 +898,10 @@ permission.run_a_tool:
   en: Run a tool
 permission.run_a_tool_lower:
   en: run a tool
+permission.operation_unknown:
+  en: Operation details unavailable
+permission.operation_target:
+  en: Target
 permission.blocked_path:
   en: "Blocked path: %{path}"
 permission.agent_wants_to_run:
@@ -2385,3 +2389,16 @@ decisions.retry_answer:
 
 decisions.send_answer:
   en: "Send answer"
+
+decisions.native_managed:
+  en: "The manager is handling this request. Open main-session decisions."
+  zh-CN: "此请求已交由管家处理。打开主会话决策。"
+decisions.selected_option:
+  en: "Selected: %{value}"
+  zh-CN: "已选择：%{value}"
+
+decisions.native_desktop:
+  en: "The manager is handling this request. Review it in the desktop main session."
+
+decisions.native_answer_hint:
+  en: "Answer every question in this request before submitting. All answers are sent together."

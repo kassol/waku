@@ -613,6 +613,9 @@ export function Composer({
     else void submit()
   }
 
+  const [permissionResponse, setPermissionResponse] = useState<string | null>(null)
+  useEffect(() => { setPermissionResponse(null) }, [permission?.requestId])
+
   async function switchBranch(branch: string, create = false) {
     if (!client || !config || !branch || branchPending) return
     if (!create && workspace.kind === 'newWorktree') {
@@ -635,7 +638,10 @@ export function Composer({
   return (
     <div className="shrink-0 px-3 pb-2 sm:px-5">
       <div className="mx-auto w-full max-w-[720px]">
-        {permission && !userInput && (
+        {session.parent_session_id && (permission || userInput) && (
+          <section className="mb-2 rounded-xl border bg-card p-3 text-sm">{t('decisions.native_desktop')}</section>
+        )}
+        {!session.parent_session_id && permission && !userInput && (
           <section className="mb-2 rounded-xl border border-[color:var(--warning)]/30 bg-card p-3 shadow-lg">
             <div className="text-[13px] font-medium">{permission.title}</div>
             {permission.detail && (
@@ -647,12 +653,14 @@ export function Composer({
               {permission.options.map((option) => (
                 <Button
                   key={option.id}
+                  disabled={permissionResponse !== null}
                   size="sm"
                   variant={option.allow ? 'default' : 'outline'}
                   onClick={() => {
-                    void respond(session.id, permission.requestId, option.id).catch((error) =>
-                      toast.error(errorMessage(error)),
-                    )
+                    setPermissionResponse(option.id)
+                    void respond(session.id, permission.requestId, option.id).catch((error) => {
+                      toast.error(errorMessage(error))
+                    })
                   }}
                 >
                   {option.allow && <WakuIcon name="check" />}
@@ -663,7 +671,7 @@ export function Composer({
           </section>
         )}
 
-        {userInput && (
+        {!session.parent_session_id && userInput && (
           <UserInputPanel
             input={userInput}
             onSubmit={(answers) => respondUserInput(
@@ -1045,7 +1053,6 @@ function UserInputPanel({
       }))
     } catch (error) {
       toast.error(errorMessage(error))
-      setSubmitting(false)
     }
   }
 

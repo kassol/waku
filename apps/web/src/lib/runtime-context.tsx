@@ -1106,14 +1106,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         sessionId,
         runtime.runtimeId,
       )
-      setPermissions((current) => ({ ...current, [sessionId]: undefined }))
-      const key = config && daemonKeys.session(config.address, sessionId)
-      if (key) {
-        const session = queryClient.getQueryData<AgentSession>(key)
-        if (session) cacheSession({ ...session, status: 'working' })
-      }
     },
-    [client, config, queryClient, cacheSession],
+    [client],
   )
 
   const respondUserInput = useCallback(
@@ -1126,14 +1120,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         sessionId,
         runtime.runtimeId,
       )
-      setUserInputs((current) => ({ ...current, [sessionId]: undefined }))
-      const key = config && daemonKeys.session(config.address, sessionId)
-      if (key) {
-        const session = queryClient.getQueryData<AgentSession>(key)
-        if (session) cacheSession({ ...session, status: 'working' })
-      }
     },
-    [client, config, queryClient, cacheSession],
+    [client],
   )
 
   const refreshBackgroundWork = useCallback(

@@ -598,6 +598,14 @@ impl Hub {
                 journal.pop_front();
             }
         }
+        // Native requests are captured during persistence. Catalog observers may
+        // not subscribe to that runtime, so notify them only after the commit.
+        if committed && sequenced.iter().any(|event| matches!(event.event.kind.as_str(),
+            "permission" | "userInputRequested" | "inputDeliveryOutcome"
+                | "nativeRequestClosed" | "decisionRequestChanged"))
+        {
+            Self::broadcast_task_state_changed(&mut state, 0);
+        }
         let wake = committed && sequenced.iter().any(|event| matches!(event.event.kind.as_str(),
             "turnFinished" | "turnInterrupted" | "permission" | "userInputRequested"
                 | "error" | "processExited" | "stewardWaitChanged" | "inputDeliveryOutcome" | "interactionResponded"));
@@ -805,7 +813,7 @@ impl RequestDispatcher {
         outgoing: Sender<ServerMessage>,
         source_subscriber_id: u64,
     ) {
-        if !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. } | Command::AnswerDecision { .. })
+        if !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. } | Command::AnswerDecision { .. } | Command::AnswerNativeDecision { .. })
             && !self.hub.reserve_request(request.request_id, &outgoing)
         {
             return;
@@ -1269,7 +1277,7 @@ fn dispatch_steward(
         });
         return;
     }
-    let cacheable = !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. } | Command::AnswerDecision { .. });
+    let cacheable = !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. } | Command::AnswerDecision { .. } | Command::AnswerNativeDecision { .. });
     if cacheable && !hub.reserve_request_as(scope.principal, request.request_id, &outgoing) {
         return;
     }
@@ -1524,7 +1532,7 @@ fn handle_request_as(
     let principal = scope.as_ref().map_or(Uuid::nil(), |scope| scope.principal);
     let request_id = request.request_id;
     let notification = request_id.is_nil();
-    let cacheable = !notification && !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. } | Command::AnswerDecision { .. });
+    let cacheable = !notification && !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. } | Command::AnswerDecision { .. } | Command::AnswerNativeDecision { .. });
     let session_id = request.session_id;
     let runtime_id = request.runtime_id;
     let task_catalog_action = task_catalog_action(&request.command);
@@ -1547,6 +1555,8 @@ fn handle_request_as(
                 && !matches!(
                     &request.command,
                     Command::CreateSession { .. }
+                        | Command::Respond { .. }
+                        | Command::RespondUserInput { .. }
                         | Command::OpenTerminal { .. }
                         | Command::WriteTerminal { .. }
                         | Command::ResizeTerminal { .. }

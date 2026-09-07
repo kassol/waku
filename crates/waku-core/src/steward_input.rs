@@ -117,6 +117,7 @@ impl WakuBackend {
             // that save its delivery are held. A cancellation or new user instruction
             // between scheduling and submission must not restart obsolete work.
             if let Some(request) = session.decision_requests.iter().find(|r| r.id == id) {
+                if request.native.is_some() { bail!("Native decisions cannot be delivered as ordinary input"); }
                 if request.parent_session_id != caller
                     || super::steward_decision::decision_projection(&session, request).state != crate::model::DecisionState::PendingReceipt
                     || prompt != super::steward_decision::decision_prompt(request)

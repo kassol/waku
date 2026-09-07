@@ -860,6 +860,7 @@ struct SessionRuntime {
     park_announced: bool,
     stream_remeasure_pending: bool,
     pending_permission: Option<PendingPermission>,
+    native_responses: HashSet<String>,
     pending_user_input: Option<PendingUserInput>,
     pending_computer_approval: Option<PendingComputerApproval>,
     /// Back-to-front stack of window previews captured during the active turn.

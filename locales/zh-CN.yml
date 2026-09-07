@@ -439,6 +439,8 @@ permission.always_allow: 始终允许
 permission.a_tool: 某个工具
 permission.run_a_tool: 运行工具
 permission.run_a_tool_lower: 运行工具
+permission.operation_unknown: 缺少实际操作信息
+permission.operation_target: 目标
 permission.blocked_path: "路径已被阻止：%{path}"
 permission.agent_wants_to_run: 智能体想要运行 %{tool}
 permission.run_tool: 是否运行 %{tool}？
@@ -1170,3 +1172,10 @@ decisions.answer_read_only: "此问题当前无需用户答复，可刷新查看
 decisions.retry_answer: "重试原答复"
 
 decisions.send_answer: "提交答复"
+
+decisions.native_managed: 此请求已交由管家处理。打开主会话决策。
+decisions.selected_option: 已选择：%{value}
+
+decisions.native_desktop: 此请求已交由管家处理。请在桌面主会话查看并处理。
+
+decisions.native_answer_hint: "请填写本次请求的全部问题后提交。所有答案将一并发送。"

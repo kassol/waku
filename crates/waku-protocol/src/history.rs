@@ -53,6 +53,14 @@ impl HistoryReducer {
     pub fn apply(&mut self, session: &mut AgentSession, event: DriverEvent) -> HistoryEffects {
         let mut effects = HistoryEffects::default();
         match event {
+            DriverEvent::DecisionRequestChanged(request) => {
+                if let Some(saved) = session.decision_requests.iter_mut().find(|r| r.id == request.id) {
+                    // A delayed submission snapshot cannot undo terminal state or receipt evidence.
+                    if !matches!(saved.state, DecisionState::Resolved | DecisionState::Failed | DecisionState::Invalidated)
+                        && !saved.native.as_ref().and_then(|n|n.outcome.as_ref()).is_some_and(|o|o.state != InputDeliveryState::Accepted)
+                    { *saved = request; }
+                } else { session.decision_requests.push(request); }
+            }
             DriverEvent::InputDeliveryChanged(delivery) => {
                 if let Some(existing) = session.input_deliveries.iter_mut().find(|entry| entry.id == delivery.id) {
                     if existing.state == InputDeliveryState::Queued { *existing = delivery.clone(); }
@@ -62,6 +70,19 @@ impl HistoryReducer {
                 effects.invalidated_activity_diff = self.update_activity(session, input_delivery_activity(&delivery));
             }
             DriverEvent::InputDeliveryOutcome(outcome) => {
+                let mut received_native = None;
+                if let Some(request) = session.decision_requests.iter_mut().find(|r| r.id == outcome.id && r.native.is_some()) {
+                    let native = request.native.as_mut().unwrap();
+                    if native.outcome.as_ref().is_some_and(|o| matches!(o.state, InputDeliveryState::Accepted | InputDeliveryState::Uncertain)) {
+                        native.outcome = Some(outcome.clone());
+                        if !matches!(request.state, DecisionState::Resolved | DecisionState::Failed | DecisionState::Invalidated) {
+                            request.reason = outcome.reason.clone();
+                            request.state = match outcome.state { InputDeliveryState::Received => DecisionState::Resolved, InputDeliveryState::Failed => DecisionState::Failed, _ => DecisionState::PendingReceipt };
+                            if outcome.state == InputDeliveryState::Received { received_native = Some(native.request.request_id().to_owned()); }
+                        }
+                    }
+                }
+                if let Some(request_id) = received_native { self.apply(session, DriverEvent::InteractionResponded { request_id }); }
                 let mut changed = None;
                 if let Some(delivery) = session.input_deliveries.iter_mut().find(|d| d.id == outcome.id) {
                     if matches!(delivery.state, InputDeliveryState::Accepted | InputDeliveryState::Uncertain) {
@@ -207,6 +228,15 @@ impl HistoryReducer {
                     session.status = SessionStatus::Idle;
                     effects.finished_turn = session.finish_active_turn(TurnStatus::Interrupted);
                 }
+            }
+            DriverEvent::NativeRequestClosed { request_id } => {
+                for request in &mut session.decision_requests {
+                    if request.native.as_ref().is_some_and(|native| native.request.request_id() == request_id) && !matches!(request.state, DecisionState::Resolved | DecisionState::Failed | DecisionState::Invalidated) {
+                        request.state = DecisionState::Invalidated;
+                        request.reason = Some("Provider closed the original native request".into());
+                    }
+                }
+                self.apply(session, DriverEvent::InteractionResponded { request_id });
             }
             DriverEvent::InteractionResponded { request_id } => {
                 if session

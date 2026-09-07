@@ -704,27 +704,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     await client.request({ type: 'cancel' }, sessionId, runtime.runtimeId);
   }, [daemon.client]);
 
-  const markWorking = useCallback((sessionId: string) => {
-    const profileId = daemon.activeProfile?.id;
-    if (!profileId) return;
-    const key = daemonKeys.session(profileId, sessionId);
-    const session = queryClient.getQueryData<AgentSession>(key);
-    if (!session) return;
-    const updated = { ...session, status: 'working' as const };
-    cacheSession(updated);
-    void persistOrdered(updated).catch((cause) => {
-      setErrors((values) => ({ ...values, [sessionId]: errorMessage(cause) }));
-    });
-  }, [cacheSession, daemon.activeProfile?.id, persistOrdered, queryClient]);
-
   const respond = useCallback(async (sessionId: string, requestId: string, optionId: string) => {
     const client = daemon.client;
     const runtime = entries.current.get(sessionId);
     if (!client || !runtime) throw new Error('This task has no live agent runtime');
     await client.request({ type: 'respond', requestId, optionId }, sessionId, runtime.runtimeId);
-    setPermissions((values) => ({ ...values, [sessionId]: undefined }));
-    markWorking(sessionId);
-  }, [daemon.client, markWorking]);
+  }, [daemon.client]);
 
   const respondUserInput = useCallback(async (
     sessionId: string,
@@ -739,9 +724,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       sessionId,
       runtime.runtimeId,
     );
-    setUserInputs((values) => ({ ...values, [sessionId]: undefined }));
-    markWorking(sessionId);
-  }, [daemon.client, markWorking]);
+  }, [daemon.client]);
 
   /** Change model traits / access mode. Applied live via
    * applyOptions when a runtime exists; a runtime that can't take the change
