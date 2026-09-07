@@ -1,6 +1,6 @@
 # 子会话生命周期验收记录
 
-2026-09-07。[Issue #23](https://github.com/kassol/waku/issues/23) 与 [#24–#30](waku-steward-child-lifecycle-tickets.md) 的实现、公共接口、原生交互和组合验收已完成。开发仅推送到 `kassol/waku`。本轮验证独立签名 Debug，日用 Steward 的安装版本保持不变；升级不会自动整理既有子会话。
+2026-09-07。[Issue #23](https://github.com/kassol/waku/issues/23) 与 [#24–#30](waku-steward-child-lifecycle-tickets.md) 的实现、公共接口、原生交互和组合验收已完成。开发仅推送到 `kassol/waku`。实施阶段验证独立签名 Debug，随后按用户授权更新日用 Steward，见文末安装记录；升级不会自动整理既有子会话。
 
 ## 实现与检查范围
 
@@ -69,4 +69,13 @@
 
 Standards：独立复核通过，未发现未解决的确认问题；重点核对渲染路径、操作占用、原生真实写入回执和授权边界。
 
-Spec：独立复核通过，未发现未解决的确认问题；重点核对决策与结果相互作用、归档与继续、三端版本投影和创建/归档竞态。主线程独立复查关键调用链并验收真实界面。日用安装仍为此前协作版本；本轮交付源码和 Debug 验收结果。
+Spec：独立复核通过，未发现未解决的确认问题；重点核对决策与结果相互作用、归档与继续、三端版本投影和创建/归档竞态。主线程独立复查关键调用链并验收真实界面。实施验收阶段交付源码和 Debug 验收结果，随后日用更新见下节。
+
+
+## 日用安装（2026-09-07）
+
+用户授权更新后，以 `ccc7c2429b2d28a9cb6a1b0f4a4ad073756aae98` 执行 `CARGO_BUILD_JOBS=2 sh scripts/bundle.sh steward`，安装至 `/Applications/Waku Steward.app` 并后台重开。独立身份 `sh.waku.steward`、更新源移除及嵌套签名校验通过。可重复安装包：`~/Downloads/Waku-Steward-2026-09-07-ccc7c24.zip`。
+
+公开 daemon 连接及窗口恢复正常；4 个原有会话、149 条消息、轮次与历史分区完整保留，配置哈希不变。原版 Waku 的进程、App/daemon 哈希、39 个会话及 862 条消息保持不变。证据和旧版回退包保留在 `/tmp/waku-child-lifecycle-implementation/install-ccc7c24/`。
+
+安装时发现旧版退出被运行近 5 小时的 Cursor 模型探测阻塞：`discover_cursor_models` 经 `command_env::output` 无限等待，而请求持有 `work_gate` 读锁，关机等待写锁。仅终止确认属于旧 Steward daemon 的 `cursor-agent models` 探测后，重新执行菜单退出，App 与 daemon 正常退出并完成保存；没有强制结束 App。该探测缺少超时的问题在本次安装源码中仍存在，需单独修复。本次新包验证覆盖签名、启动及历史恢复，未重跑完整开发测试或重新触发模型探测。

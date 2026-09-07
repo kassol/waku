@@ -4,7 +4,7 @@
 
 ## 新的已确认设计方向
 
-2026-09-07，用户确认子会话作为临时执行单元，生命周期结束后归档隐藏，主会话保留摘要和追溯入口；问题由管家在已有授权内代决，超出授权统一回主会话询问。见 [ADR 0005](adr/0005-transient-child-sessions-and-manager-decisions.md)。[Issue #23](https://github.com/kassol/waku/issues/23) 及 [#24–#30](waku-steward-child-lifecycle-tickets.md) 已实现，公共 MCP／daemon、真实 harness、签名 Debug 后台交互及组合验收通过。Rust 全量 1046 通过、31 忽略、0 失败；见[生命周期验收记录](waku-steward-child-lifecycle-acceptance.md)。升级不自动处理历史子会话。本轮没有更新日用安装，下方已安装版本仍为此前协作版本。
+2026-09-07，用户确认子会话作为临时执行单元，生命周期结束后归档隐藏，主会话保留摘要和追溯入口；问题由管家在已有授权内代决，超出授权统一回主会话询问。见 [ADR 0005](adr/0005-transient-child-sessions-and-manager-decisions.md)。[Issue #23](https://github.com/kassol/waku/issues/23) 及 [#24–#30](waku-steward-child-lifecycle-tickets.md) 已实现，公共 MCP／daemon、真实 harness、签名 Debug 后台交互及组合验收通过。Rust 全量 1046 通过、31 忽略、0 失败；见[生命周期验收记录](waku-steward-child-lifecycle-acceptance.md)。升级不自动处理历史子会话。用户随后授权更新安装；日用 Steward 现为 `ccc7c24` 的优化签名包，4 个会话、149 条消息及配置完整保留，安装与退出阻塞记录见同一验收文档。
 
 ## 当前扩展与交付边界
 
@@ -12,7 +12,7 @@
 
 用户已批准新增 `waku_wait`，详见[管家等待与完成通知](waku-steward-wait.md)。一期六工具验收仍为历史基线。管家登记持久等待后结束当前轮；父轮成功结束且子轮次可处理时，由 daemon 的事件回调自动开启一次通知轮。即时交流查询保留等待。经可靠输入提交的用户 steer 在受理或待核实时暂停旧等待回调，接收确认后撤销同轮旧等待，明确失败允许旧等待继续；新计划按需登记新等待。普通新轮输入、取消及父轮失败或中断继续遵循原有撤销边界。
 
-用户已明确授权验收后推送、关闭任务并更新安装 `Waku Steward.app`，此前暂缓替换的边界已更新。Steward 已更新安装至 `/Applications/Waku Steward.app`，签名、后台启动、正常退出及重开验证通过；4 个既有会话、146 条消息和轮次完整保留。可重复安装包为 `~/Downloads/Waku-Steward-2026-09-07-orchestration.zip`。原版 `Waku.app` 继续保持隔离，不得替换或修改。以下历史构建、安装与验收记录不代表本次扩展的安装状态。
+此前协作版本安装记录：用户已明确授权验收后推送、关闭任务并更新安装 `Waku Steward.app`。当时 Steward 已更新安装至 `/Applications/Waku Steward.app`，签名、后台启动、正常退出及重开验证通过；4 个既有会话、146 条消息和轮次完整保留。可重复安装包为 `~/Downloads/Waku-Steward-2026-09-07-orchestration.zip`。原版 `Waku.app` 继续保持隔离，不得替换或修改。以下历史构建、安装与验收记录不代表本次扩展的安装状态。
 
 ## 已有资料（引用，不重做）
 
