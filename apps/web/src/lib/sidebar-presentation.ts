@@ -76,7 +76,7 @@ export function groupSessions(
   ]))
   const grouped = new Map<DateGroup, SessionItem[]>()
   const started = sessions
-    .filter(sessionHasStarted)
+    .filter((session) => !session.archived && sessionHasStarted(session))
     .sort((left, right) => sessionTimestamp(right) - sessionTimestamp(left))
   for (const session of started) {
     const id = dateGroup(sessionTimestamp(session), now)

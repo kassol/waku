@@ -316,6 +316,7 @@ export function MobileComposer({
   }, [requestSignature]);
 
   async function submit() {
+    if (session.archived) return;
     const prompt = draft.trim();
     const submittedAttachments = attachments;
     if (
@@ -369,6 +370,8 @@ export function MobileComposer({
       : busy
         ? 'Queue a follow-up…'
         : 'Message agent';
+
+  if (session.archived) return <View style={styles.shell}><Text style={{ color: theme.textSecondary }}>Archived task history is read-only.</Text></View>;
 
   return (
     <View style={[styles.shell, { paddingBottom: Math.max(insets.bottom, 10) }]}>

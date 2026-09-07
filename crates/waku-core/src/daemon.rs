@@ -57,6 +57,10 @@ mod creation;
 mod task_workspace;
 #[path = "task_integration.rs"]
 mod task_integration;
+#[path = "archive_workspace.rs"]
+mod archive_workspace;
+#[path = "task_lifecycle.rs"]
+mod task_lifecycle;
 #[path = "task_cleanup.rs"]
 mod task_cleanup;
 #[cfg(test)]
@@ -483,6 +487,12 @@ impl Backend for WakuBackend {
     }
 
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
+        self.guard_archived_command(&request)?;
+        if let Command::Workspace {operation} = &request.command {
+            let _workspace=self.workspace_start_gate.lock();
+            self.guard_archived_workspace(operation)?;
+            return self.handle_accepted(request,events);
+        }
         if let Command::StewardInputStatus { child_session_id, delivery_id } = &request.command {
             return self.steward_input_status(request.session_id, *child_session_id, *delivery_id, &events);
         }
@@ -543,7 +553,8 @@ impl Backend for WakuBackend {
                 | Command::Respond { .. }
                 | Command::RespondUserInput { .. }
         | Command::AnswerDecision { .. }
-                | Command::StewardDecision { .. }
+                | Command::StewardLifecycle { .. }
+        | Command::StewardDecision { .. }
                 | Command::StewardWait { .. }
                 | Command::StewardWorkspace { .. }
                 | Command::StewardPrompt { .. }
@@ -625,6 +636,8 @@ impl Backend for WakuBackend {
     ) -> anyhow::Result<()> {
         let _gate = self.work_gate.read();
         self.ensure_accepting_work()?;
+        let _workspace=self.workspace_start_gate.lock();
+        self.ensure_session_writable(session_id)?;
         validate_child_options(
             &self.task_store,
             &mut self.task_state.lock(),
@@ -716,6 +729,7 @@ impl WakuBackend {
             if cancelled_queue && !self.sessions.lock().contains_key(&session_id) { return Ok(ResponsePayload::Ack); }
         }
         match request.command {
+            Command::StewardLifecycle { operation } => self.complete_child(session_id, operation, &events),
             Command::StewardWorkspace { operation } => self.steward_workspace(session_id, operation, &events),
             Command::AnswerNativeDecision { child_session_id, request_id, response } => self.answer_native(child_session_id, request_id, response, &events),
             Command::Respond { request_id, option_id } => self.respond_native_direct(session_id, request.runtime_id, request_id, crate::model::NativeDecisionResponse::Permission { option_id }, &events),
@@ -737,6 +751,9 @@ impl WakuBackend {
                 self.create_session(session_id, command, events)
             }
             Command::AttachSession => {
+                if self.task_state.lock().sessions.iter().any(|s|s.id==session_id && s.archived) {
+                    return Ok(ResponsePayload::SessionRuntime {runtime_id:None,supports_steer:false});
+                }
                 let sessions = self.sessions.lock();
                 let Some((runtime_id, driver)) = sessions.get(&session_id) else {
                     return Ok(ResponsePayload::SessionRuntime {
@@ -933,11 +950,14 @@ impl WakuBackend {
                     .map(|session| session.id)
                     .collect::<Vec<_>>();
                 let answer_message_ids = state.sessions.iter().flat_map(|session| &session.decision_requests)
-                    .filter(|request| request.user_answer.is_some()).filter_map(|request| request.authority_message_id).collect::<HashSet<_>>();
+                    .filter(|request| request.user_answer.is_some()).filter_map(|request| request.authority_message_id)
+                    .chain(state.sessions.iter().flat_map(|s|s.completions.iter().map(|c|c.summary_message_id))).collect::<HashSet<_>>();
                 for mut session in sessions {
                     session.steward_wait = None;
                     session.input_deliveries.clear();
                     session.decision_requests.clear();
+                    session.archived = false;
+                    session.completions.clear();
                     session.managed_workspace = None;
                     if let Some(existing) = state
                         .sessions
@@ -947,6 +967,9 @@ impl WakuBackend {
                         // Startup catalogs are skeletons. Read the authoritative
                         // cursor before accepting any full client projection.
                         self.task_store.hydrate(existing)?;
+                        if existing.archived { continue; }
+                        session.archived = existing.archived;
+                        session.completions = existing.completions.clone();
                         session.parent_session_id = existing.parent_session_id;
                         session.steward_wait = existing.steward_wait.clone();
                         session.input_deliveries = existing.input_deliveries.clone();
@@ -1291,6 +1314,21 @@ impl WakuBackend {
                 })
             }
             Command::ForkProviderSession { request } => {
+                let _workspace = self.workspace_start_gate.lock();
+                let source = match &request {
+                    ProviderSessionForkRequest::Claude { session_id, .. } => Some((ProviderKind::Claude, session_id.as_str())),
+                    ProviderSessionForkRequest::Amp { thread_id, .. } => Some((ProviderKind::Amp, thread_id.as_str())),
+                    ProviderSessionForkRequest::OpenCode { session_id, .. } => Some((ProviderKind::OpenCode, session_id.as_str())),
+                    ProviderSessionForkRequest::Grok { session_id, .. } => Some((ProviderKind::Grok, session_id.as_str())),
+                    ProviderSessionForkRequest::Cursor { source, .. } => { self.ensure_session_writable(source.id)?; None },
+                };
+                if let Some((provider, native_id)) = source {
+                    let mut state = self.task_state.lock();
+                    for session in state.sessions.iter_mut().filter(|s| s.archived && s.provider == provider) {
+                        self.task_store.hydrate(session)?;
+                        if session.provider_native_id() == Some(native_id) { bail!("Archived provider history requires explicit continuation"); }
+                    }
+                }
                 Ok(ResponsePayload::ProviderSessionForked {
                     result: fork_provider_session(request)?,
                 })
@@ -1312,6 +1350,7 @@ impl WakuBackend {
             }),
             Command::OpenTerminal { cwd, cols, rows } => {
                 let _workspace_start = self.workspace_start_gate.lock();
+                self.ensure_session_writable(session_id)?;
                 let cwd = std::fs::canonicalize(cwd)?;
                 let workspace = task_workspace::canonical_workspace(&cwd)?;
                 ensure_shell_environment();
@@ -1368,6 +1407,7 @@ impl WakuBackend {
             }
             Command::Start { options } => {
                 let _workspace_start = self.workspace_start_gate.lock();
+                self.ensure_session_writable(session_id)?;
                 let cwd = std::fs::canonicalize(&options.cwd)?;
                 self.check_workspace_writer(session_id, &cwd)?;
                 let runtime_workspace = task_workspace::canonical_workspace(&cwd)?;
@@ -2111,6 +2151,7 @@ impl WakuBackend {
         let (wake, _wake_events) = smol::channel::bounded(1);
         let (event_sender, _event_receiver) = driver::event_channel(wake);
         let _workspace_start = self.workspace_start_gate.lock();
+        self.ensure_session_writable(source.id)?;
         let cwd = std::fs::canonicalize(cwd)?;
         self.check_workspace_writer(source.id, &cwd)?;
         let driver = driver::start_local(
@@ -2275,6 +2316,7 @@ impl WakuBackend {
         let (wake, _wake_events) = smol::channel::bounded(1);
         let (event_sender, _event_receiver) = driver::event_channel(wake);
         let _workspace_start = self.workspace_start_gate.lock();
+        self.ensure_session_writable(source.id)?;
         let cwd = std::fs::canonicalize(cwd)?;
         self.check_workspace_writer(source.id, &cwd)?;
         let driver = driver::start_local(
@@ -2552,6 +2594,7 @@ fn handle_driver_command(
         | Command::StewardQuery { .. }
         | Command::AnswerNativeDecision { .. }
         | Command::AnswerDecision { .. }
+        | Command::StewardLifecycle { .. }
         | Command::StewardDecision { .. }
         | Command::StewardWait { .. }
         | Command::StewardPrompt { .. }

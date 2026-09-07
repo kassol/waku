@@ -459,6 +459,7 @@ impl Waku {
         operation: BranchOperation,
         cx: &mut Context<Self>,
     ) {
+        if self.selected_session().is_some_and(|session| session.archived) { return; }
         if self.branch_operation_pending {
             return;
         }

@@ -48,6 +48,7 @@ impl WakuBackend {
         self.ensure_accepting_work()?;
         events.ensure_steward_active()?;
         let _operation = events.reserve_input_target(target, caller == target)?;
+        self.ensure_session_writable(target)?;
         self.ensure_accepting_work()?;
         let exited = self
             .forwarders

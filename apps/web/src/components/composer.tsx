@@ -449,6 +449,7 @@ export function Composer({
   }
 
   async function submit() {
+    if (session.archived) return
     if (submitting || (!prompt.trim() && attachments.length === 0)) return
     if (executeLocalComposerCommand()) return
     const submittedPrompt = prompt
@@ -634,6 +635,8 @@ export function Composer({
       setBranchPending(false)
     }
   }
+
+  if (session.archived) return <div className="shrink-0 px-5 py-3 text-sm text-muted-foreground">{t('task_workspace.archived_read_only')}</div>
 
   return (
     <div className="shrink-0 px-3 pb-2 sm:px-5">

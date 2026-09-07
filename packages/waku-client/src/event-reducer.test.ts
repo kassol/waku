@@ -547,3 +547,17 @@ test('native closure releases waiting and keeps a late receipt without reviving 
   expect(session.decision_requests?.[0]?.native?.outcome?.state).toBe('received')
   expect(session.input_deliveries ?? []).toHaveLength(0)
 })
+
+test('archived completion survives an older history snapshot without changing source history', () => {
+  const old = idleSession()
+  const archived = structuredClone(old)
+  archived.archived = true
+  archived.completions = [{ id: 'completion', manager_session_id: 'manager', receipt: { session_id: old.id, turn_id: null, snapshot: 'v1:source' },
+    disposition: 'terminate', summary: { goal: 'Task', result: 'Stopped', decisions: null, verification: null, unresolved: 'Needs a replacement', resource_retention: 'Retained' }, summary_message_id: 'summary', created_at: 1 }]
+  const preserved = apply(archived, 'historySnapshot', old)
+  expect(preserved.archived).toBe(true)
+  expect(preserved.completions).toEqual(archived.completions)
+  expect(preserved.messages).toEqual(old.messages)
+  expect(preserved.turns).toEqual(old.turns)
+  expect(preserved.transcript_blocks).toEqual(old.transcript_blocks)
+})

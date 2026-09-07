@@ -28,7 +28,108 @@ fn apply_session_hydration(sessions: &mut [AgentSession], hydrated: AgentSession
     true
 }
 
+fn completion_hydration_targets(
+    sessions: &[AgentSession],
+    parent: Uuid,
+    requested: &[Uuid],
+) -> (Vec<Uuid>, bool) {
+    let current = sessions
+        .iter()
+        .flat_map(|child| child.completions.iter())
+        .filter(|completion| completion.manager_session_id == parent)
+        .map(|completion| completion.summary_message_id)
+        .collect::<Vec<_>>();
+    let newly_known = current.iter().any(|id| !requested.contains(id));
+    (current, newly_known)
+}
+
 impl Waku {
+    pub(super) fn refresh_completion_history(&mut self, cx: &mut Context<Self>) {
+        self.completion_sources = self
+            .state
+            .sessions
+            .iter()
+            .flat_map(|child| {
+                child
+                    .completions
+                    .iter()
+                    .map(move |completion| (completion.summary_message_id, child.id))
+            })
+            .collect();
+        let mut missing: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        for child in &self.state.sessions {
+            for completion in &child.completions {
+                if self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == completion.manager_session_id)
+                    .is_some_and(|parent| {
+                        parent.detail_loaded
+                            && !parent
+                                .messages
+                                .iter()
+                                .any(|m| m.id == completion.summary_message_id)
+                    })
+                {
+                    missing
+                        .entry(completion.manager_session_id)
+                        .or_default()
+                        .push(completion.summary_message_id);
+                }
+            }
+        }
+        for (parent_id, ids) in missing {
+            if self.completion_hydrations.contains_key(&parent_id) {
+                continue;
+            }
+            let generation = Uuid::new_v4();
+            self.completion_hydrations.insert(parent_id, generation);
+            let daemon = self.daemon.clone();
+            let task = cx.background_executor().spawn(async move {
+                waku_client::persistence::hydrate_session(&daemon, parent_id)
+            });
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.completion_hydrations.get(&parent_id) != Some(&generation) {
+                        return;
+                    }
+                    this.completion_hydrations.remove(&parent_id);
+                    match result {
+                        Ok(Some(hydrated)) => {
+                            let (valid, catch_up) =
+                                completion_hydration_targets(&this.state.sessions, parent_id, &ids);
+                            let mut changed = false;
+                            if let Some(parent) = this.state.session_mut(parent_id) {
+                                for id in valid {
+                                    changed |= super::decisions::merge_saved_message(
+                                        parent,
+                                        &hydrated,
+                                        id,
+                                        MessageRole::Assistant,
+                                        None,
+                                    );
+                                }
+                            }
+                            if changed && this.state.selected_session == Some(parent_id) {
+                                this.reset_visible_state();
+                                this.reset_transcript_rows(this.transcript_row_count());
+                            }
+                            if catch_up {
+                                this.refresh_completion_history(cx);
+                            }
+                        }
+                        Err(error) => this.show_toast(error.to_string()),
+                        Ok(None) => {}
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
     pub(crate) fn open_task_from_notification(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
         self.select_session(session_id, cx);
     }
@@ -141,6 +242,7 @@ impl Waku {
                 match result {
                     Ok(session) => {
                         let available = apply_session_hydration(&mut waku.state.sessions, session);
+                        waku.refresh_completion_history(cx);
                         let pending = waku
                             .pending_session_activation
                             .filter(|pending| pending.session_id == session_id);
@@ -212,6 +314,17 @@ impl Waku {
         {
             self.session_navigation.remember_new_task(session_id);
         }
+        if self
+            .selected_session()
+            .is_some_and(|session| session.archived)
+        {
+            self.replace_active_right_panel_state(RightPanelSessionState::empty(false));
+            self.state.right_panel_visible = false;
+            self.reset_visible_state();
+            self.reset_transcript_rows(self.transcript_row_count());
+            cx.notify();
+            return;
+        }
         if session_changed {
             self.restore_selected_composer_draft(cx);
             self.sync_user_input_answer(cx);
@@ -269,7 +382,11 @@ impl Waku {
             .state
             .sessions
             .iter()
-            .find(|session| session.project_id == project_id && !session.has_started() && session.managed_workspace.is_none())
+            .find(|session| {
+                session.project_id == project_id
+                    && !session.has_started()
+                    && session.managed_workspace.is_none()
+            })
             .map(|session| session.id)
         {
             self.select_session(draft_id, cx);
@@ -291,7 +408,11 @@ impl Waku {
         let Some(session) = self.selected_session_mut() else {
             return;
         };
-        if session.has_started() || session.managed_workspace.is_some() || session.is_busy() || session.workspace == workspace {
+        if session.has_started()
+            || session.managed_workspace.is_some()
+            || session.is_busy()
+            || session.workspace == workspace
+        {
             return;
         }
         session.workspace = workspace;
@@ -1178,7 +1299,10 @@ impl Waku {
     }
 
     pub(super) fn cancel_turn(&mut self, cx: &mut Context<Self>) {
-        if self.selected_session().is_some_and(AgentSession::is_waiting_for_children) {
+        if self
+            .selected_session()
+            .is_some_and(AgentSession::is_waiting_for_children)
+        {
             self.cancel_steward_wait(cx);
             return;
         }
@@ -1243,7 +1367,9 @@ impl Waku {
                     "other",
                     |option| if option.allow { "allow" } else { "deny" },
                 );
-            if !runtime.native_responses.insert(request_id.clone()) { return; }
+            if !runtime.native_responses.insert(request_id.clone()) {
+                return;
+            }
             runtime.driver.respond(request_id, option_id);
             Some(decision)
         } else {
@@ -1416,12 +1542,13 @@ impl Waku {
             let Some(pending) = runtime.pending_user_input.as_ref() else {
                 return;
             };
-            if !runtime.native_responses.insert(pending.request_id.clone()) { return; }
+            if !runtime.native_responses.insert(pending.request_id.clone()) {
+                return;
+            }
             let answers = pending.answers();
             runtime
                 .driver
                 .respond_user_input(pending.request_id.clone(), answers);
-
         } else {
             self.sync_user_input_answer(cx);
         }
@@ -1614,6 +1741,57 @@ impl Waku {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_history_catches_up_new_ids_without_retrying_missing_saved_ids() {
+        let mut parent = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        parent.begin_turn("Main task");
+        parent.finish_active_turn(TurnStatus::Completed);
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut child = AgentSession::new(parent.project_id, ProviderKind::Codex);
+        child.parent_session_id = Some(parent.id);
+        let completion = |id| {
+            serde_json::from_value(serde_json::json!({
+                "id":Uuid::new_v4(),"manager_session_id":parent.id,
+                "receipt":{"session_id":child.id,"turn_id":null,"snapshot":"saved-version"},
+                "disposition":"accepted","summary":{"goal":"Goal","result":"Result"},
+                "summary_message_id":id,"created_at":1
+            }))
+            .unwrap()
+        };
+        child.completions = vec![completion(first), completion(second)];
+        let sessions = vec![parent.clone(), child];
+        let (ids, catch_up) = completion_hydration_targets(&sessions, parent.id, &[first]);
+        assert!(catch_up);
+        assert_eq!(ids, vec![first, second]);
+        assert!(!completion_hydration_targets(&sessions, parent.id, &ids).1);
+        let mut hydrated = parent.clone();
+        let mut summary = Message::new(MessageRole::Assistant, "Saved child summary");
+        summary.id = second;
+        hydrated.messages.push(summary);
+        parent.begin_turn("New user direction");
+        parent.push_message(MessageRole::Assistant, "New streamed output");
+        assert!(super::super::decisions::merge_saved_message(
+            &mut parent,
+            &hydrated,
+            second,
+            MessageRole::Assistant,
+            None
+        ));
+        assert_eq!(parent.messages[1].id, second);
+        assert_eq!(
+            parent.messages.last().unwrap().content,
+            "New streamed output"
+        );
+        assert!(!super::super::decisions::merge_saved_message(
+            &mut parent,
+            &hydrated,
+            second,
+            MessageRole::Assistant,
+            None
+        ));
+    }
 
     #[test]
     fn late_hydration_preserves_the_reply_and_saved_cursor_received_while_loading() {

@@ -996,6 +996,7 @@ impl Waku {
         message_index: usize,
     ) -> Option<UserMessageAction> {
         let session = self.selected_session()?;
+        if session.archived { return None; }
         let message = session.messages.get(message_index)?;
         if message.role != MessageRole::User
             || !matches!(session.status, SessionStatus::Idle | SessionStatus::Failed)
@@ -1107,6 +1108,7 @@ impl Waku {
         message_index: usize,
     ) -> Option<AssistantMessageAction> {
         let session = self.selected_session()?;
+        if session.archived { return None; }
         let message = session.messages.get(message_index)?;
         if message.role != MessageRole::Assistant
             || assistant_response_footer_index(session, message_index) != Some(message_index)
@@ -1348,7 +1350,11 @@ impl Waku {
                         // pane) keeps the tick from busting sibling islands.
                         motion::pulse_lease(window.current_view(), cx);
                     }
-                    rendered
+                    if let Some(source) = self.completion_sources.get(&message.id).copied() {
+                        let focus = self.transcript_control_focus(format!("completion-source-{}", message.id), cx);
+                        div().child(rendered).child(super::composer::task_detail_link(source, tr!("task_workspace.open_source_history"), &focus, theme)
+                            .on_click(cx.listener(move |this, _, _, cx| this.select_session(source, cx)))).into_any_element()
+                    } else { rendered }
                 })
                 .unwrap_or_else(|| div().into_any_element()),
             TranscriptRowKind::TurnBlock(block_index) => self

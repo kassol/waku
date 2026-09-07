@@ -308,7 +308,7 @@ impl Waku {
             .state
             .sessions
             .iter()
-            .filter(|session| session.has_started())
+            .filter(|session| !session.archived && session.has_started())
             .map(|session| session.id)
             .collect::<Vec<_>>();
         let ordered = ordered_task_ids(
@@ -417,7 +417,7 @@ impl Waku {
                 .state
                 .sessions
                 .iter()
-                .any(|session| session.id == selected && session.has_started())
+                .any(|session| session.id == selected && !session.archived && session.has_started())
         {
             let was_in_settings = self.settings_page.is_some();
             self.settings_page = None;

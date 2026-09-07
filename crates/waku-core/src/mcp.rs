@@ -200,6 +200,11 @@ pub fn run_stdio(
                         }},"required":["operation"],"additionalProperties":false,"$defs":{"evidence":{"type":"array","minItems":1,"items":{"type":"object","properties":{"commit":{"type":"string"},"checks":{"type":"string","minLength":1},"environment":{"type":"string","minLength":1},"reviewer":{"type":"string","minLength":1}},"required":["commit","checks","environment","reviewer"],"additionalProperties":false}}}}
                     },
                     {
+                        "name":"waku_complete",
+                        "description":"Explicitly take over a direct child's fixed result and archive its lifecycle after verification, or record retry, replacement or termination of failed work. Obtain receipt from waku_results. This saves a readable summary and retains full history atomically; active work, unsettled decisions, uncertain native attempts and unfinished descendants block completion. Archival does not force Git cleanup. Repeating the same receipt and summary is idempotent.",
+                        "inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"receipt":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"turn_id":{"type":["string","null"]},"snapshot":{"type":"string"}},"required":["session_id","turn_id","snapshot"],"additionalProperties":false},"disposition":{"enum":["accepted","retry","replace","terminate"]},"summary":{"type":"object","properties":{"goal":{"type":"string"},"result":{"type":"string"},"decisions":{"type":["string","null"]},"verification":{"type":["string","null"]},"unresolved":{"type":["string","null"]},"resource_retention":{"type":["string","null"]}},"required":["goal","result"],"additionalProperties":false}},"required":["session_id","receipt","disposition","summary"],"additionalProperties":false}
+                    },
+                    {
                         "name": "waku_decision",
                         "description": "Submit a direct-child decision request, list your requests or direct children's requests, or decide using an existing user instruction message ID. A request is a durable wait: finish your turn if no independent work remains; do not poll. Escalate missing authority with reason, options and impact through your direct manager. Only the user can answer escalated requests in the main session. For saved native requests use decideNative with the original option ID or complete typed answers and cited user authority. Keep the original process alive. User login and system permission steps still require the user. Stable request_id retries must retain identical content.",
                         "inputSchema": {"type":"object","properties":{"operation":{"oneOf":[
@@ -406,6 +411,12 @@ fn tool_command(name: &str, arguments: Value) -> Result<Command, String> {
         let args: WorkspaceArguments = serde_json::from_value(arguments)
             .map_err(|error| format!("Invalid tool arguments: {error}"))?;
         Ok(Command::StewardWorkspace { operation: args.operation })
+    } else if name == "waku_complete" {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Arguments {session_id:Uuid,receipt:waku_protocol::ChildResultReceipt,disposition:crate::model::CompletionDisposition,summary:crate::model::ChildCompletionSummary}
+        let args:Arguments=serde_json::from_value(arguments).map_err(|error|format!("Invalid tool arguments: {error}"))?;
+        Ok(Command::StewardLifecycle {operation:crate::model::StewardLifecycleOperation::Complete {session_id:args.session_id,receipt:args.receipt,disposition:args.disposition,summary:args.summary}})
     } else if name == "waku_decision" {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]

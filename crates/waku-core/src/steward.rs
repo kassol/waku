@@ -353,6 +353,7 @@ impl WakuBackend {
         events: &EventSink,
     ) -> anyhow::Result<()> {
         let child_id = child.id;
+        self.ensure_session_writable(child_id)?;
         let active = self.sessions.lock().get(&child_id).map(|(id, _)| *id);
         let runtime_id = active.unwrap_or_else(Uuid::new_v4);
         let child_events = if active.is_some() {
@@ -488,7 +489,7 @@ impl WakuBackend {
 
 /// Hash full result inputs, independently of display truncation. Late output, changed questions,
 /// failures or fixed-commit evidence must invalidate an older handled receipt.
-fn result_receipt(session: &AgentSession) -> anyhow::Result<waku_protocol::ChildResultReceipt> {
+pub(super) fn result_receipt(session: &AgentSession) -> anyhow::Result<waku_protocol::ChildResultReceipt> {
     use sha2::{Digest, Sha256};
     struct Writer(Sha256);
     impl std::io::Write for Writer {

@@ -7,9 +7,10 @@ use crate::model::{
     WorkspaceCleanup, WorkspaceCleanupStatus as Status,
 };
 
-fn session_can_release_workspace(session: &AgentSession) -> bool {
+pub(super) fn session_can_release_workspace(session: &AgentSession) -> bool {
     use crate::model::InputDeliveryState;
-    session.active_turn_id().is_none()
+    !super::task_lifecycle::has_unsettled_decisions(session)
+        && session.active_turn_id().is_none()
         && !session.is_busy()
         && session.pending_permission.is_none()
         && session.pending_user_input.is_none()

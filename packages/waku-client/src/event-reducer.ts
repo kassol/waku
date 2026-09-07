@@ -65,6 +65,8 @@ export function reduceRuntimeEvent(
       context_window: current.context_window,
       agent_preset: current.agent_preset,
       queued_messages: clone(current.queued_messages ?? []),
+      archived: (current.completions?.length ?? 0) > (snapshot.completions?.length ?? 0) ? current.archived : snapshot.archived,
+      completions: (current.completions?.length ?? 0) > (snapshot.completions?.length ?? 0) ? clone(current.completions) : snapshot.completions,
       managed_workspace: current.managed_workspace &&
         (!snapshot.managed_workspace || snapshot.managed_workspace.revision < current.managed_workspace.revision)
         ? clone(current.managed_workspace) : snapshot.managed_workspace,

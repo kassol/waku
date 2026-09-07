@@ -83,6 +83,7 @@ struct QueueBackend {
 }
 impl Backend for QueueBackend {
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
+        self.inner.guard_archived_command(&request)?;
         if matches!(request.command, Command::Start { .. }) {
             self.inner.sessions.lock().insert(
                 request.session_id,
@@ -1852,12 +1853,14 @@ fn native_decision_socket_catalog_notifications_follow_capture_and_receipt_commi
     let (root, parent, child) = seed_queue();
     let server = QueueServer::open(&root);
     server.backend.paused.store(true, Ordering::Release);
+    // The first connection owns subscriber zero, just like a fresh desktop.
+    let observer = server.connect();
+    observer.request(parent.id, Uuid::nil(), Command::LoadTaskState).unwrap();
     let client = server.connect();
     let runtime = server.start(&client, &root, child.id);
     client.request(child.id, runtime, Command::Prompt { prompt: "Original native work".into(), turn_id: None, message_id: None }).unwrap();
     // This client has no child runtime subscription. Only catalog notifications
     // can tell its main-session decision dialog to fetch the saved state.
-    let observer = server.connect();
     let revisions = observer.subscribe_task_state();
     let catalog = || {
         let ResponsePayload::TaskState { sessions, .. } = observer.request(parent.id, Uuid::nil(), Command::LoadTaskState).unwrap() else { panic!("catalog expected") };
@@ -1894,4 +1897,124 @@ fn native_decision_socket_catalog_notifications_follow_capture_and_receipt_commi
     assert_eq!(saved.sessions.iter().find(|s| s.id == child.id).unwrap().decision_requests, current.decision_requests);
     drop(observer); drop(client); drop(server);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lifecycle_socket_completion_archives_atomically_preserves_history_and_is_idempotent() {
+    let (root,parent,child)=seed_queue();let server=QueueServer::open(&root);server.backend.paused.store(true,Ordering::Release);let client=server.connect();
+    let ResponsePayload::Session{session:Some(before)}=client.request(child.id,Uuid::nil(),Command::HydrateSession{session_id:child.id}).unwrap() else {panic!("history")};
+    let results=client.request(parent.id,Uuid::nil(),Command::StewardQuery{query:waku_protocol::StewardQuery::Results{session_ids:vec![child.id],handled:vec![],max_chars:None}}).unwrap();
+    let receipt=serde_json::to_value(results).unwrap()["results"][0]["receipt"].clone();
+    let command=serde_json::from_value::<Command>(json!({"type":"stewardLifecycle","operation":{"type":"complete","session_id":child.id,"receipt":receipt,"disposition":"accepted","summary":{"goal":"Report","result":"Report accepted","decisions":null,"verification":"Reviewed fixture output","unresolved":null,"resource_retention":null}}})).unwrap();
+    // This is the server's first connection; daemon-originated changes must reach it.
+    let revisions = client.subscribe_task_state();
+    let first=client.request(parent.id,Uuid::nil(),command.clone()).unwrap();
+    revisions.recv_timeout(Duration::from_secs(3)).expect("committed completion must notify the first catalog client");
+    let ResponsePayload::TaskState { sessions, .. } = client.request(parent.id,Uuid::nil(),Command::LoadTaskState).unwrap() else { panic!("catalog") };
+    let archived = sessions.iter().find(|session| session.id == child.id).unwrap();
+    assert!(archived.archived);
+    assert_eq!(archived.completions.len(), 1);
+    let repeated=client.request(parent.id,Uuid::nil(),command).unwrap();
+    assert_eq!(serde_json::to_value(&first).unwrap()["completion"],serde_json::to_value(&repeated).unwrap()["completion"]);
+    let ResponsePayload::Session{session:Some(after)}=client.request(child.id,Uuid::nil(),Command::HydrateSession{session_id:child.id}).unwrap() else {panic!("history")};
+    assert_eq!(serde_json::to_value(&after).unwrap()["archived"],true);
+    assert_eq!(serde_json::to_value(&before.messages).unwrap(),serde_json::to_value(&after.messages).unwrap());
+    assert_eq!(serde_json::to_value(&before.transcript_blocks).unwrap(),serde_json::to_value(&after.transcript_blocks).unwrap());
+    assert_eq!(serde_json::to_value(&before.turns).unwrap(),serde_json::to_value(&after.turns).unwrap());
+    let ResponsePayload::Session{session:Some(manager)}=client.request(parent.id,Uuid::nil(),Command::HydrateSession{session_id:parent.id}).unwrap() else {panic!("manager")};
+    assert_eq!(manager.messages.iter().filter(|m|m.content.contains("Report accepted")).count(),1);
+    drop(client);drop(server);
+    let server=QueueServer::open(&root);let client=server.connect();
+    let ResponsePayload::Session{session:Some(reopened)}=client.request(child.id,Uuid::nil(),Command::HydrateSession{session_id:child.id}).unwrap() else {panic!("history")};
+    assert_eq!(serde_json::to_value(&reopened).unwrap()["archived"],true);
+    assert_eq!(serde_json::to_value(&reopened.messages).unwrap(),serde_json::to_value(&before.messages).unwrap());
+    drop(client);drop(server);std::fs::remove_dir_all(root).unwrap();
+}
+
+fn lifecycle_complete_command(client:&DaemonClient,parent:Uuid,child:Uuid,disposition:&str)->Command {
+    let results=client.request(parent,Uuid::nil(),Command::StewardQuery{query:waku_protocol::StewardQuery::Results{session_ids:vec![child],handled:vec![],max_chars:None}}).unwrap();
+    serde_json::from_value(json!({"type":"stewardLifecycle","operation":{"type":"complete","session_id":child,"receipt":serde_json::to_value(results).unwrap()["results"][0]["receipt"],"disposition":disposition,"summary":{"goal":"Fixture task","result":"Explicit completion","verification":"Inspected output","decisions":null,"unresolved":null,"resource_retention":null}}})).unwrap()
+}
+
+#[test]
+fn lifecycle_socket_save_failure_rolls_back_visibility_and_summary_then_retries() {
+    let (root,parent,child)=seed_queue();let server=QueueServer::open(&root);let client=server.connect();
+    let command=lifecycle_complete_command(&client,parent.id,child.id,"accepted");
+    let database=rusqlite::Connection::open(root.join("state.db")).unwrap();
+    database.execute_batch(&format!("CREATE TRIGGER reject_archive BEFORE UPDATE ON session_details WHEN NEW.session_id = '{}' BEGIN SELECT RAISE(ABORT,'fixture archive failure'); END;",child.id)).unwrap();
+    assert!(client.request(parent.id,Uuid::nil(),command.clone()).is_err());
+    let ResponsePayload::Session{session:Some(saved)}=client.request(child.id,Uuid::nil(),Command::HydrateSession{session_id:child.id}).unwrap() else{panic!("child")};
+    assert!(!saved.archived);assert!(saved.completions.is_empty());
+    let ResponsePayload::Session{session:Some(saved)}=client.request(parent.id,Uuid::nil(),Command::HydrateSession{session_id:parent.id}).unwrap() else{panic!("parent")};
+    assert_eq!(saved.messages.len(),parent.messages.len());
+    database.execute_batch("DROP TRIGGER reject_archive").unwrap();
+    client.request(parent.id,Uuid::nil(),command).unwrap();
+    drop(database);drop(client);drop(server);std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lifecycle_socket_stale_versions_failed_results_and_unfinished_descendants_block_acceptance() {
+    let (root,parent,child)=seed_queue();let server=QueueServer::open(&root);server.backend.paused.store(true,Ordering::Release);let client=server.connect();
+    let stale=lifecycle_complete_command(&client,parent.id,child.id,"accepted");
+    let runtime=server.start(&client,&root,child.id);
+    client.request(child.id,runtime,Command::Prompt{prompt:"Changed result".into(),turn_id:None,message_id:None}).unwrap();
+    server.finish(child.id);
+    assert!(client.request(parent.id,Uuid::nil(),stale).is_err());
+    client.request(child.id,runtime,Command::Prompt{prompt:"Failure case".into(),turn_id:None,message_id:None}).unwrap();
+    server.backend.sinks.lock().get(&child.id).unwrap().send(event_to_wire(DriverEvent::TurnFinished{success:false,summary:Some("Failed".into())}).unwrap()).unwrap();
+    assert!(client.request(parent.id,Uuid::nil(),lifecycle_complete_command(&client,parent.id,child.id,"accepted")).is_err());
+    let terminated=lifecycle_complete_command(&client,parent.id,child.id,"terminate");
+    assert!(client.request(child.id,runtime,terminated.clone()).is_err(),"child cannot complete itself");
+    client.request(parent.id,Uuid::nil(),terminated).unwrap();
+    assert!(client.request(parent.id,Uuid::nil(),Command::StewardPrompt{child_session_id:child.id,prompt:"Silent restart".into(),delivery_id:Some(Uuid::new_v4())}).is_err());
+    assert!(matches!(client.request(child.id,Uuid::nil(),Command::AttachSession).unwrap(),ResponsePayload::SessionRuntime{runtime_id:None,..}));
+    drop(client);drop(server);std::fs::remove_dir_all(root).unwrap();
+    let (root,parent,child)=seed_queue();
+    let store=StateStore::daemon(root.join("state.db"));let mut state=store.load().unwrap();let mut descendant=AgentSession::new(parent.project_id,ProviderKind::Codex);descendant.parent_session_id=Some(child.id);descendant.begin_turn("Descendant");descendant.finish_active_turn(crate::model::TurnStatus::Completed);state.mark_session_dirty(descendant.id);state.sessions.push(descendant);store.save(&mut state).unwrap();
+    let server=QueueServer::open(&root);let client=server.connect();
+    assert!(client.request(parent.id,Uuid::nil(),lifecycle_complete_command(&client,parent.id,child.id,"accepted")).is_err());
+    drop(client);drop(server);std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lifecycle_socket_invalidated_native_uncertainty_still_blocks_archival() {
+    use crate::model::{PermissionOption,StewardDecisionOperation,NativeDecisionResponse};
+    let (root,parent,child)=seed_queue();let server=QueueServer::open(&root);server.backend.paused.store(true,Ordering::Release);let client=server.connect();let runtime=server.start(&client,&root,child.id);
+    client.request(child.id,runtime,Command::Prompt{prompt:"Original work".into(),turn_id:None,message_id:None}).unwrap();
+    let sink=server.backend.sinks.lock().get(&child.id).unwrap().clone();
+    sink.send(event_to_wire(DriverEvent::Permission{request_id:"uncertain-native".into(),title:"Run".into(),detail:"Task".into(),options:vec![PermissionOption{id:"allow".into(),label:"Allow".into(),allow:true}]}).unwrap()).unwrap();
+    let ResponsePayload::StewardDecisions{requests}=client.request(parent.id,Uuid::nil(),Command::StewardDecision{operation:StewardDecisionOperation::List{session_id:Some(child.id)}}).unwrap() else{panic!("requests")};
+    client.request(parent.id,Uuid::nil(),Command::StewardDecision{operation:StewardDecisionOperation::DecideNative{session_id:child.id,request_id:requests[0].id,response:NativeDecisionResponse::Permission{option_id:"allow".into()},authority_message_id:Some(parent.messages[0].id)}}).unwrap();server.calls.recv_timeout(Duration::from_secs(2)).unwrap();
+    sink.send(event_to_wire(DriverEvent::NativeRequestClosed{request_id:"uncertain-native".into()}).unwrap()).unwrap();server.finish(child.id);
+    let ResponsePayload::Session{session:Some(saved)}=client.request(child.id,runtime,Command::HydrateSession{session_id:child.id}).unwrap() else{panic!("session")};
+    assert_eq!(saved.decision_requests[0].state,crate::model::DecisionState::Invalidated);
+    assert!(!super::task_cleanup::session_can_release_workspace(&saved));
+    assert!(client.request(parent.id,Uuid::nil(),lifecycle_complete_command(&client,parent.id,child.id,"terminate")).is_err());
+    drop(client);drop(server);std::fs::remove_dir_all(root).unwrap();
+}
+
+#[path = "archive_workspace_tests.rs"]
+mod archive_workspace_tests;
+
+#[test]
+fn lifecycle_socket_managed_noncode_and_latest_code_evidence_are_distinct() {
+    for case in ["noncode","latest-failed","latest-accepted"] {
+        let (root,parent,child)=seed_queue();
+        let store=StateStore::daemon(root.join("state.db"));let mut state=store.load().unwrap();let saved=state.sessions.iter_mut().find(|s|s.id==child.id).unwrap();store.hydrate(saved).unwrap();
+        let results=if case=="noncode" {json!([])} else {json!([
+            {"commit":"a","owner":child.id,"evidence":[],"expected_integration_commit":"base","integration_commit":"integrated-a"},
+            {"commit":"b","owner":child.id,"evidence":[],"expected_integration_commit":"integrated-a","integration_commit":if case=="latest-accepted" {Some("integrated-b")}else{None}}
+        ])};
+        saved.managed_workspace=Some(serde_json::from_value(json!({"task_id":child.id,"name":"Fixture","repository":root,"base_commit":"base","target_branch":"main","target_commit":"base","integration_branch":"fixture-integration","integration_commit":"base","branch":"fixture","path":root,"owned":true,"created":true,"ready":true,"error":null,"coordination":null,"results":results})).unwrap());
+        state.mark_session_dirty(child.id);store.save(&mut state).unwrap();
+        let server=QueueServer::open(&root);let client=server.connect();let complete=lifecycle_complete_command(&client,parent.id,child.id,"accepted");
+        let result=client.request(parent.id,Uuid::nil(),complete);
+        if case=="latest-failed" {
+            assert!(result.is_err(),"old accepted A must not validate current unintegrated B");
+            client.request(parent.id,Uuid::nil(),lifecycle_complete_command(&client,parent.id,child.id,"terminate")).unwrap();
+        } else {assert!(result.is_ok(),"{case}: {result:?}");}
+        let ResponsePayload::Session{session:Some(saved)}=client.request(child.id,Uuid::nil(),Command::HydrateSession{session_id:child.id}).unwrap() else{panic!("session")};
+        assert!(saved.archived);assert!(root.exists());assert!(saved.completions[0].summary.resource_retention.is_some());
+        drop(client);drop(server);std::fs::remove_dir_all(root).unwrap();
+    }
 }

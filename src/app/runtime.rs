@@ -134,6 +134,8 @@ pub(super) fn merge_remote_session_catalog(
             local.project_id = remote.project_id;
             local.parent_session_id = remote.parent_session_id;
             local.decision_requests = remote.decision_requests;
+            local.archived = remote.archived;
+            local.completions = remote.completions;
             if local.apply_managed_workspace(remote.managed_workspace)
                 && local.managed_workspace.is_some()
             {
@@ -690,6 +692,7 @@ impl Waku {
         }
         self.state.projects = snapshot.projects;
         self.sync_decision_catalog(cx);
+        self.refresh_completion_history(cx);
 
         let attach = self
             .state
@@ -750,6 +753,7 @@ impl Waku {
     }
 
     pub(super) fn start_runtime_attachment(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        if self.state.sessions.iter().find(|s| s.id == session_id).is_some_and(|s| s.archived) { return; }
         if self.runtimes.contains_key(&session_id)
             || self.submission_preparations.contains(&session_id)
             || self.goal_runtime_starts.contains(&session_id)
@@ -780,6 +784,7 @@ impl Waku {
         if !self.runtime_attach_pending.remove(&session_id) {
             return;
         }
+        if self.state.sessions.iter().find(|s| s.id == session_id).is_some_and(|s| s.archived) { return; }
         // Local preparation owns the current turn; a late attachment must not
         // replace the prompt accepted while its history request was in flight.
         if self.submission_preparations.contains(&session_id)
@@ -788,7 +793,7 @@ impl Waku {
             return;
         }
         match result {
-            Ok(Some((session, prepared))) => {
+            Ok(Some((mut session, prepared))) => {
                 self.runtime_attach_misses.remove(&session_id);
                 let Some(index) = self
                     .state
@@ -799,6 +804,9 @@ impl Waku {
                     return;
                 };
                 if !self.runtimes.contains_key(&session_id) {
+                    for completion in &self.state.sessions[index].completions {
+                        if !session.completions.iter().any(|item| item.id == completion.id) { session.completions.push(completion.clone()); }
+                    }
                     self.state.sessions[index] = session;
                     self.install_prepared_driver(session_id, prepared);
                     if self.state.selected_session == Some(session_id) {
@@ -1948,6 +1956,7 @@ impl Waku {
     }
 
     fn submit_message_edit_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
+        if self.selected_session().is_some_and(|s| s.archived) { return; }
         let Some(edit) = self.message_edit.clone() else {
             return;
         };
@@ -2438,6 +2447,7 @@ impl Waku {
     /// drain once the runtime installs. The session stays `Idle` throughout —
     /// no turn begins and nothing lands in the transcript.
     pub(super) fn start_goal_runtime(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        if self.state.sessions.iter().find(|s| s.id == session_id).is_some_and(|s| s.archived) { return; }
         if self.quit_in_progress {
             return;
         }
@@ -2653,6 +2663,7 @@ impl Waku {
         submission: ComposerSubmission,
         cx: &mut Context<Self>,
     ) {
+        if self.selected_session().is_some_and(|s| s.archived) { return; }
         if self.quit_in_progress {
             return;
         }
@@ -2686,6 +2697,7 @@ impl Waku {
         submission: ComposerSubmission,
         cx: &mut Context<Self>,
     ) {
+        if self.selected_session().is_some_and(|s| s.archived) { return; }
         let Some(session) = self.selected_session().cloned() else {
             return;
         };
@@ -2741,6 +2753,7 @@ impl Waku {
         mut submission: ComposerSubmission,
         cx: &mut Context<Self>,
     ) {
+        if self.state.sessions.iter().find(|s| s.id == session_id).is_some_and(|s| s.archived) { return; }
         submission.prompt = submission.prompt.trim().to_owned();
         if submission.prompt.is_empty() {
             return;
@@ -2879,6 +2892,7 @@ impl Waku {
         submission: ComposerSubmission,
         cx: &mut Context<Self>,
     ) {
+        if self.state.sessions.iter().find(|s| s.id == session_id).is_some_and(|s| s.archived) { return; }
         if self.quit_in_progress {
             return;
         }

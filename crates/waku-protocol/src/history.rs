@@ -125,6 +125,10 @@ impl HistoryReducer {
                 }
             }
             DriverEvent::HistorySnapshot(mut snapshot) => {
+                if session.completions.len() > snapshot.completions.len() {
+                    snapshot.archived = session.archived;
+                    snapshot.completions = session.completions.clone();
+                }
                 if history_snapshot_is_stale(session, &snapshot) {
                     return effects;
                 }

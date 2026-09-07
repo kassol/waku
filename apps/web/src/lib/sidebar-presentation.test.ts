@@ -12,6 +12,11 @@ import {
 } from './sidebar-presentation'
 
 describe('desktop sidebar presentation', () => {
+  test('hides archived tasks while retaining ordinary settled history', () => {
+    const groups = groupSessions([], [session({ id: 'archived', archived: true, messages: [{ id: 'old' } as never] }), session({ id: 'active', messages: [{ id: 'kept' } as never] })])
+    expect(groups.flatMap((group) => group.sessions.map((item) => item.session.id))).toEqual(['active'])
+  })
+
   test('uses a Monday-based current week instead of a rolling seven days', () => {
     const wednesday = new Date(2026, 7, 12, 12)
     expect(dateGroup(atLocalNoon(2026, 7, 12), wednesday)).toBe('today')

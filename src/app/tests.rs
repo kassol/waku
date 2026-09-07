@@ -157,6 +157,26 @@ fn task_catalog_keeps_newer_workspace_evidence_and_execution_location() {
 }
 
 #[test]
+fn task_catalog_preserves_history_while_receiving_archive_and_completion() {
+    let mut local = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+    local.push_message(MessageRole::Assistant, "Full preserved history");
+    let mut remote = local.list_projection();
+    remote.archived = true;
+    remote.completions.push(serde_json::from_value(serde_json::json!({
+        "id":Uuid::new_v4(),"manager_session_id":Uuid::new_v4(),
+        "receipt":{"session_id":local.id,"turn_id":null,"snapshot":"version"},
+        "disposition":"accepted","summary":{"goal":"Goal","result":"Result"},
+        "summary_message_id":Uuid::new_v4(),"created_at":1
+    })).unwrap());
+    let expected = remote.completions.clone();
+    let mut catalog = vec![local];
+    merge_remote_session_catalog(&mut catalog, vec![remote], |_| true);
+    assert!(catalog[0].archived);
+    assert_eq!(catalog[0].completions, expected);
+    assert_eq!(catalog[0].messages[0].content, "Full preserved history");
+}
+
+#[test]
 fn task_catalog_refreshes_decisions_while_a_runtime_is_attached() {
     let local = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
     let mut remote = local.list_projection();

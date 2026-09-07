@@ -492,6 +492,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   }, [cacheSession, daemon.activeProfile?.id, daemon.client, drainQueue, persistOrdered, queryClient, removeRuntime, schedulePersist]);
 
   const attachSession = useCallback((session: AgentSession): Promise<boolean> => {
+    if (session.archived) return Promise.resolve(false);
     const client = daemon.client;
     const profileId = daemon.activeProfile?.id;
     if (!client || !profileId || daemon.phase !== 'connected') return Promise.resolve(false);
@@ -525,6 +526,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     if (!client || !profileId || daemon.phase !== 'connected') {
       throw new Error('Waku daemon is disconnected');
     }
+    if (inputSession.archived) throw new Error('Archived task history is read-only.');
     const prompt = rawPrompt.trim();
     if (!prompt && attachments.length === 0) return inputSession;
     const providerPrompt = providerPromptOverride === undefined
@@ -534,6 +536,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     // still in flight; building the turn on that would persist a transcript
     // with only the new messages. Always start from the full session.
     let current = await loadFullSession(inputSession.id);
+    if (current.archived) throw new Error('Archived task history is read-only.');
     if (sessionBusy(current)) {
       const queued = queueSubmission(current, prompt, clock, attachments, providerPrompt);
       cacheSession(queued);
@@ -955,10 +958,14 @@ function errorMessage(cause: unknown): string {
   return cause instanceof Error && cause.message.trim() ? cause.message : String(cause);
 }
 
-/** The daemon captures ending checkpoints itself, so a reply's checkpoint for
- * a turn is the one part of it that can be newer than the local cache. */
+/** Keep streamed content and import daemon-owned checkpoints and lifecycle records. */
 function withDaemonCheckpoints(latest: AgentSession, saved: AgentSession): AgentSession {
-  let changed = false;
+  const archived = Boolean(latest.archived || saved.archived);
+  const completions = [...(latest.completions ?? [])];
+  for (const completion of saved.completions ?? []) {
+    if (!completions.some((existing) => existing.id === completion.id)) completions.push(completion);
+  }
+  let changed = archived !== Boolean(latest.archived) || completions.length !== (latest.completions?.length ?? 0);
   const turns = latest.turns.map((turn) => {
     const stored = saved.turns.find((candidate) => candidate.turn_count === turn.turn_count);
     if (
@@ -970,5 +977,5 @@ function withDaemonCheckpoints(latest: AgentSession, saved: AgentSession): Agent
     changed = true;
     return { ...turn, checkpoint: stored.checkpoint };
   });
-  return changed ? { ...latest, turns } : latest;
+  return changed ? { ...latest, turns, archived, completions } : latest;
 }

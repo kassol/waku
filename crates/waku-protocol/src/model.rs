@@ -1009,6 +1009,34 @@ pub struct NativeDecision {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum CompletionDisposition { Accepted, Retry, Replace, Terminate }
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct ChildCompletionSummary {
+    pub goal: String,
+    pub result: String,
+    pub decisions: Option<String>,
+    pub verification: Option<String>,
+    pub unresolved: Option<String>,
+    pub resource_retention: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct ChildCompletion {
+    pub id: Uuid,
+    pub manager_session_id: Uuid,
+    pub receipt: crate::protocol::ChildResultReceipt,
+    pub disposition: CompletionDisposition,
+    pub summary: ChildCompletionSummary,
+    pub summary_message_id: Uuid,
+    pub created_at: u64,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum StewardLifecycleOperation {
+    Complete { session_id: Uuid, receipt: crate::protocol::ChildResultReceipt, disposition: CompletionDisposition, summary: ChildCompletionSummary },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct DecisionRequest {
     pub id: Uuid,
     pub parent_session_id: Uuid,
@@ -1184,6 +1212,12 @@ pub struct AgentSession {
     pub input_deliveries: Vec<InputDelivery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decision_requests: Vec<DecisionRequest>,
+    #[serde(default)]
+    #[ts(optional, as = "Option<_>")]
+    pub archived: bool,
+    #[serde(default)]
+    #[ts(optional, as = "Option<_>")]
+    pub completions: Vec<ChildCompletion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_workspace: Option<ManagedWorkspace>,
     /// A title explicitly chosen by the user. [`Self::DEFAULT_TITLE`] means
@@ -1304,6 +1338,8 @@ impl AgentSession {
             steward_wait: None,
             input_deliveries: Vec::new(),
             decision_requests: Vec::new(),
+            archived: false,
+            completions: Vec::new(),
             managed_workspace: None,
             title: Self::DEFAULT_TITLE.to_owned(),
             auto_title: None,
@@ -1352,6 +1388,8 @@ impl AgentSession {
             steward_wait: self.steward_wait.clone(),
             input_deliveries: self.input_deliveries.clone(),
             decision_requests: self.decision_requests.clone(),
+            archived: self.archived,
+            completions: self.completions.clone(),
             managed_workspace: self.managed_workspace.clone(),
             title: self.title.clone(),
             auto_title: self.auto_title.clone(),

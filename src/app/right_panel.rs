@@ -1861,7 +1861,7 @@ impl Waku {
         }
     }
 
-    fn replace_active_right_panel_state(&mut self, state: RightPanelSessionState) {
+    pub(super) fn replace_active_right_panel_state(&mut self, state: RightPanelSessionState) {
         self.right_panel_visible = state.visible;
         self.right_panel_surfaces = state.surfaces;
         self.right_panel_active_surface = state.active_surface;
@@ -2338,6 +2338,7 @@ impl Waku {
     }
 
     pub(super) fn ensure_right_panel_terminals(&mut self, cx: &mut Context<Self>) {
+        if self.selected_session().is_some_and(|s| s.archived) { return; }
         let active_terminal_ids = self
             .right_panel_surfaces
             .iter()

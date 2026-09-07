@@ -1040,6 +1040,8 @@ pub struct Waku {
     /// Session details currently being fetched from the daemon. Sidebar rows
     /// stay usable while the selected transcript hydrates asynchronously.
     session_hydrations: HashSet<Uuid>,
+    completion_hydrations: HashMap<Uuid, Uuid>,
+    completion_sources: HashMap<Uuid, Uuid>,
     /// Selection is committed only after this target's transcript arrives, so
     /// the currently visible task stays intact during daemon latency.
     pending_session_activation: Option<PendingSessionActivation>,
@@ -2699,6 +2701,8 @@ impl Waku {
                 daemon,
                 daemon_hostname,
                 session_hydrations: HashSet::new(),
+                completion_hydrations: HashMap::new(),
+                completion_sources: HashMap::new(),
                 pending_session_activation: None,
                 analytics,
                 state,

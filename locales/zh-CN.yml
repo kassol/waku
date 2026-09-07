@@ -1179,3 +1179,35 @@ decisions.selected_option: 已选择：%{value}
 decisions.native_desktop: 此请求已交由管家处理。请在桌面主会话查看并处理。
 
 decisions.native_answer_hint: "请填写本次请求的全部问题后提交。所有答案将一并发送。"
+
+task_workspace.archived: "已归档"
+
+task_workspace.archived_read_only: "归档任务历史只读。"
+
+task_workspace.not_recorded: "未记录"
+
+task_workspace.completion_source: "来源历史：%{source} · 成果轮次：%{turn}"
+
+task_workspace.completion_goal: "目标：%{value}"
+
+task_workspace.completion_result: "结果：%{value}"
+
+task_workspace.completion_decisions: "关键决定：%{value}"
+
+task_workspace.completion_verification: "验证：%{value}"
+
+task_workspace.completion_unresolved: "未解决事项：%{value}"
+
+task_workspace.completion_resources: "资源保留原因：%{value}"
+
+task_workspace.open_source_history: "打开来源任务历史"
+
+task_workspace.completion_accepted: "成果已接管"
+
+task_workspace.completion_retry: "已记录重试决定"
+
+task_workspace.completion_replace: "已记录替代决定"
+
+task_workspace.completion_terminate: "已记录终止决定"
+
+task_workspace.completion_version: "成果版本：%{value}"

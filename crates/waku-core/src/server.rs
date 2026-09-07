@@ -128,7 +128,7 @@ impl EventSink {
     }
 
     pub(crate) fn input_state_changed(&self) {
-        self.hub.task_state_changed(0);
+        self.hub.task_state_changed(u64::MAX);
         self.hub.wake_stewards();
     }
 
@@ -604,7 +604,7 @@ impl Hub {
             "permission" | "userInputRequested" | "inputDeliveryOutcome"
                 | "nativeRequestClosed" | "decisionRequestChanged"))
         {
-            Self::broadcast_task_state_changed(&mut state, 0);
+            Self::broadcast_task_state_changed(&mut state, u64::MAX);
         }
         let wake = committed && sequenced.iter().any(|event| matches!(event.event.kind.as_str(),
             "turnFinished" | "turnInterrupted" | "permission" | "userInputRequested"
@@ -813,7 +813,7 @@ impl RequestDispatcher {
         outgoing: Sender<ServerMessage>,
         source_subscriber_id: u64,
     ) {
-        if !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. } | Command::AnswerDecision { .. } | Command::AnswerNativeDecision { .. })
+        if !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. } | Command::StewardLifecycle { .. } | Command::AnswerDecision { .. } | Command::AnswerNativeDecision { .. })
             && !self.hub.reserve_request(request.request_id, &outgoing)
         {
             return;
@@ -1258,7 +1258,7 @@ fn dispatch_steward(
                 | Command::StewardQuery { .. }
                 | Command::StewardPrompt { .. }
                 | Command::StewardCancel { .. }
-                | Command::StewardDecision { .. }
+                | Command::StewardDecision { .. } | Command::StewardLifecycle { .. }
                 | Command::StewardWait { .. }
                 | Command::StewardWorkspace { .. }
         )
@@ -1277,7 +1277,7 @@ fn dispatch_steward(
         });
         return;
     }
-    let cacheable = !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. } | Command::AnswerDecision { .. } | Command::AnswerNativeDecision { .. });
+    let cacheable = !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. } | Command::StewardLifecycle { .. } | Command::AnswerDecision { .. } | Command::AnswerNativeDecision { .. });
     if cacheable && !hub.reserve_request_as(scope.principal, request.request_id, &outgoing) {
         return;
     }
@@ -1532,7 +1532,7 @@ fn handle_request_as(
     let principal = scope.as_ref().map_or(Uuid::nil(), |scope| scope.principal);
     let request_id = request.request_id;
     let notification = request_id.is_nil();
-    let cacheable = !notification && !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. } | Command::AnswerDecision { .. } | Command::AnswerNativeDecision { .. });
+    let cacheable = !notification && !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. } | Command::StewardLifecycle { .. } | Command::AnswerDecision { .. } | Command::AnswerNativeDecision { .. });
     let session_id = request.session_id;
     let runtime_id = request.runtime_id;
     let task_catalog_action = task_catalog_action(&request.command);

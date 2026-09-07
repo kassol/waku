@@ -3,7 +3,7 @@ use super::*;
 use anyhow::Context as _;
 use base64::Engine as _;
 
-fn task_detail_link(id: Uuid, label: String, focus: &FocusHandle, theme: Theme) -> Stateful<Div> {
+pub(super) fn task_detail_link(id: Uuid, label: String, focus: &FocusHandle, theme: Theme) -> Stateful<Div> {
     div().id(SharedString::from(format!("task-detail-session-{id}"))).w_full().py(px(6.0))
         .track_focus(focus).tab_index(0).tab_stop(true)
         .focus_visible(|style| style.bg(theme.overlay).border_1().border_color(theme.accent))
@@ -11,7 +11,29 @@ fn task_detail_link(id: Uuid, label: String, focus: &FocusHandle, theme: Theme) 
         .text_size(sp(12.0)).text_color(theme.text).child(label)
 }
 
+fn completion_summary_rows(completion: &waku_protocol::model::ChildCompletion) -> Vec<String> {
+    let summary = &completion.summary;
+    let missing = || tr!("task_workspace.not_recorded");
+    let disposition = match completion.disposition {
+        waku_protocol::model::CompletionDisposition::Accepted => tr!("task_workspace.completion_accepted"),
+        waku_protocol::model::CompletionDisposition::Retry => tr!("task_workspace.completion_retry"),
+        waku_protocol::model::CompletionDisposition::Replace => tr!("task_workspace.completion_replace"),
+        waku_protocol::model::CompletionDisposition::Terminate => tr!("task_workspace.completion_terminate"),
+    };
+    vec![
+        disposition,
+        tr!("task_workspace.completion_version", value = &completion.receipt.snapshot),
+        tr!("task_workspace.completion_goal", value = &summary.goal),
+        tr!("task_workspace.completion_result", value = &summary.result),
+        tr!("task_workspace.completion_decisions", value = summary.decisions.clone().unwrap_or_else(missing)),
+        tr!("task_workspace.completion_verification", value = summary.verification.clone().unwrap_or_else(missing)),
+        tr!("task_workspace.completion_unresolved", value = summary.unresolved.clone().unwrap_or_else(missing)),
+        tr!("task_workspace.completion_resources", value = summary.resource_retention.clone().unwrap_or_else(missing)),
+    ]
+}
+
 fn task_detail_status(session: &AgentSession) -> String {
+    if session.archived { return tr!("task_workspace.archived"); }
     use waku_protocol::model::DecisionState;
     for (state, label) in [
         (DecisionState::WaitingUser, "decisions.waiting_user"),
@@ -2698,6 +2720,9 @@ impl Waku {
     pub(super) fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
         let session = self.selected_session();
+        if session.is_some_and(|session| session.archived) {
+            return div().px(px(20.0)).py(px(12.0)).text_color(theme.text_secondary).child(tr!("task_workspace.archived_read_only"));
+        }
         let preparing = session.is_some_and(|session| {
             self.submission_preparations.contains(&session.id)
                 || self.response_fork_preparations.contains_key(&session.id)
@@ -2929,7 +2954,7 @@ impl Waku {
 
     fn render_managed_task_details(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let selected = self.selected_session()?;
-        if selected.managed_workspace.is_none() && !self.state.sessions.iter()
+        if selected.managed_workspace.is_none() && selected.completions.is_empty() && !self.state.sessions.iter()
             .any(|session| session.parent_session_id == Some(selected.id)) {
             return None;
         }
@@ -2959,6 +2984,11 @@ impl Waku {
                     rows.push(format!("{} · {}", tr!("task_workspace.owner", title = session.display_title(), owner = session.id), status));
                     if let Some(parent) = session.parent_session_id {
                         rows.push(tr!("task_workspace.parent", parent = parent));
+                    }
+                    for completion in &session.completions {
+                        links.insert(rows.len(), session.id);
+                        rows.push(tr!("task_workspace.completion_source", source = completion.receipt.session_id, turn = completion.receipt.turn_id.map(|id| id.to_string()).unwrap_or_else(|| tr!("task_workspace.not_recorded"))));
+                        rows.extend(completion_summary_rows(completion));
                     }
                     let Some(task) = &session.managed_workspace else {
                         continue;
@@ -3524,6 +3554,9 @@ impl Waku {
 
     pub(super) fn render_workspace_footer(&mut self, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
+        if self.selected_session().is_some_and(|session| session.archived) {
+            return div().px(px(20.0)).py(px(8.0)).children(self.render_managed_task_details(cx));
+        }
         let selected_project_id = self.state.selected_project;
         let projectless_selected = self.selected_project().is_some_and(Project::is_projectless);
         let project_name = self
@@ -4409,6 +4442,22 @@ mod task_detail_navigation_tests {
                     .on_click(cx.listener(|this, _, _, _| this.opened += 1)))
         }
     }
+    #[test]
+    fn task_detail_archived_completion_marks_missing_summary_fields() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.archived = true;
+        assert_eq!(task_detail_status(&session), tr!("task_workspace.archived"));
+        let completion: waku_protocol::model::ChildCompletion = serde_json::from_value(serde_json::json!({
+            "id":Uuid::new_v4(),"manager_session_id":Uuid::new_v4(),
+            "receipt":{"session_id":session.id,"turn_id":null,"snapshot":"version"},
+            "disposition":"accepted","summary":{"goal":"Goal","result":"Result"},
+            "summary_message_id":Uuid::new_v4(),"created_at":1
+        })).unwrap();
+        let rows = completion_summary_rows(&completion);
+        assert!(rows.iter().any(|row| row.contains("Goal")));
+        assert_eq!(rows.iter().filter(|row| row.contains(&tr!("task_workspace.not_recorded"))).count(), 4);
+    }
+
     #[test]
     fn task_detail_keeps_finished_question_waiting_until_decision_receipt() {
         use waku_protocol::model::DecisionState;

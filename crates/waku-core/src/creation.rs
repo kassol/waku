@@ -93,6 +93,8 @@ impl WakuBackend {
         });
         let _creation_lock = creation_lock.as_ref().map(|lock| lock.lock());
         events.ensure_steward_active()?;
+        let _manager = events.reserve_steward_target(parent_id)?;
+        self.ensure_session_writable(parent_id)?;
         // Revalidate after waiting for this key, including retries of a cached outcome.
         let (mut parent, project) = {
             let mut state = self.task_state.lock();

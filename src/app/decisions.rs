@@ -1163,67 +1163,75 @@ fn merge_decision_answer_messages(
     hydrated: &AgentSession,
     requests: &[DecisionRequest],
 ) -> bool {
-    if local.id != hydrated.id {
-        return false;
-    }
     let mut changed = false;
     for request in requests {
-        let Some(answer) = &request.user_answer else {
-            continue;
-        };
-        let Some(id) = request.authority_message_id else {
-            continue;
-        };
-        if local.messages.iter().any(|message| message.id == id) {
-            continue;
-        }
-        if let Some(index) = hydrated.messages.iter().position(|message| {
-            message.id == id && message.role == MessageRole::User && message.content == *answer
-        }) {
-            let next = hydrated.messages[index + 1..].iter().find_map(|message| {
-                local
-                    .messages
-                    .iter()
-                    .position(|existing| existing.id == message.id)
-            });
-            let previous = hydrated.messages[..index].iter().rev().find_map(|message| {
-                local
-                    .messages
-                    .iter()
-                    .position(|existing| existing.id == message.id)
-            });
-            // Assistant IDs are generated independently by the daemon and desktop.
-            // A shared turn boundary still identifies the preceding saved output.
-            let preceding_turn = hydrated.messages[..index]
-                .iter()
-                .rev()
-                .find_map(|message| message.turn_id);
-            let previous_turn_end = preceding_turn
-                .and_then(|turn| {
-                    local
-                        .messages
-                        .iter()
-                        .rposition(|message| message.turn_id == Some(turn))
-                })
-                .map(|index| index + 1);
-            let position = next
-                .or(previous_turn_end)
-                .or_else(|| previous.map(|index| index + 1))
-                .unwrap_or(local.messages.len());
-            for block in &mut local.transcript_blocks {
-                if block.after_message > position
-                    || (block.after_message == position && block.turn_id != preceding_turn)
-                {
-                    block.after_message += 1;
-                }
-            }
-            local
-                .messages
-                .insert(position, hydrated.messages[index].clone());
-            changed = true;
+        if let (Some(id), Some(answer)) =
+            (request.authority_message_id, request.user_answer.as_ref())
+        {
+            changed |= merge_saved_message(local, hydrated, id, MessageRole::User, Some(answer));
         }
     }
     changed
+}
+
+pub(super) fn merge_saved_message(
+    local: &mut AgentSession,
+    hydrated: &AgentSession,
+    id: Uuid,
+    role: MessageRole,
+    content: Option<&str>,
+) -> bool {
+    if local.id != hydrated.id || local.messages.iter().any(|m| m.id == id) {
+        return false;
+    }
+    let Some(index) = hydrated.messages.iter().position(|message| {
+        message.id == id
+            && message.role == role
+            && content.is_none_or(|text| message.content == text)
+    }) else {
+        return false;
+    };
+    let next = hydrated.messages[index + 1..].iter().find_map(|message| {
+        local
+            .messages
+            .iter()
+            .position(|existing| existing.id == message.id)
+    });
+    let previous = hydrated.messages[..index].iter().rev().find_map(|message| {
+        local
+            .messages
+            .iter()
+            .position(|existing| existing.id == message.id)
+    });
+    // Assistant IDs are generated independently by the daemon and desktop.
+    // A shared turn boundary still identifies the preceding saved output.
+    let preceding_turn = hydrated.messages[..index]
+        .iter()
+        .rev()
+        .find_map(|message| message.turn_id);
+    let previous_turn_end = preceding_turn
+        .and_then(|turn| {
+            local
+                .messages
+                .iter()
+                .rposition(|message| message.turn_id == Some(turn))
+        })
+        .map(|index| index + 1);
+    let position = next
+        .or(previous_turn_end)
+        .or_else(|| previous.map(|index| index + 1))
+        .unwrap_or(local.messages.len());
+    for block in &mut local.transcript_blocks {
+        if block.after_message > position
+            || (block.after_message == position && block.turn_id != preceding_turn)
+        {
+            block.after_message += 1;
+        }
+    }
+    local
+        .messages
+        .insert(position, hydrated.messages[index].clone());
+    true
 }
 
 fn decision_answer_control(

@@ -581,6 +581,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
 
   const attachSession = useCallback<RuntimeContextValue['attachSession']>(
     (session) => {
+      if (session.archived) return Promise.resolve(false)
       if (!client || !config || phase !== 'connected') return Promise.resolve(false)
       if (entries.current.has(session.id)) return Promise.resolve(true)
       const pending = attachRequests.current.get(session.id)
@@ -638,6 +639,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       const currentSession = queryClient.getQueryData<AgentSession>(
         daemonKeys.session(config.address, inputSession.id),
       ) ?? inputSession
+      if (currentSession.archived) throw new Error(translate(localeRef.current, 'task_workspace.archived_read_only'))
       if (
         currentSession.status === 'connecting' ||
         currentSession.status === 'working' ||
@@ -1385,6 +1387,8 @@ function mergeSessionSummary(previous: AgentSession, next: AgentSession): AgentS
     ...previous,
     title: next.title,
     parent_session_id: next.parent_session_id,
+    archived: next.archived,
+    completions: next.completions,
     auto_title: next.auto_title,
     project_id: next.project_id,
     workspace: next.workspace,

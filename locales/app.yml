@@ -2402,3 +2402,51 @@ decisions.native_desktop:
 
 decisions.native_answer_hint:
   en: "Answer every question in this request before submitting. All answers are sent together."
+
+task_workspace.archived:
+  en: "Archived"
+
+task_workspace.archived_read_only:
+  en: "Archived task history is read-only."
+
+task_workspace.not_recorded:
+  en: "Not recorded"
+
+task_workspace.completion_source:
+  en: "Source history: %{source} · Result turn: %{turn}"
+
+task_workspace.completion_goal:
+  en: "Goal: %{value}"
+
+task_workspace.completion_result:
+  en: "Result: %{value}"
+
+task_workspace.completion_decisions:
+  en: "Key decisions: %{value}"
+
+task_workspace.completion_verification:
+  en: "Verification: %{value}"
+
+task_workspace.completion_unresolved:
+  en: "Unresolved: %{value}"
+
+task_workspace.completion_resources:
+  en: "Resource retention: %{value}"
+
+task_workspace.open_source_history:
+  en: "Open source task history"
+
+task_workspace.completion_accepted:
+  en: "Result accepted"
+
+task_workspace.completion_retry:
+  en: "Retry recorded"
+
+task_workspace.completion_replace:
+  en: "Replacement recorded"
+
+task_workspace.completion_terminate:
+  en: "Termination recorded"
+
+task_workspace.completion_version:
+  en: "Result version: %{value}"

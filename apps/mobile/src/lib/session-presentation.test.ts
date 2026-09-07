@@ -17,6 +17,11 @@ import {
 } from './session-presentation';
 
 describe('mobile session presentation', () => {
+  test('hides archived tasks while retaining settled history', () => {
+    const groups = groupSessions([], [session({ id: 'archived', archived: true }), session({ id: 'visible' })]);
+    expect(groups.flatMap((group) => group.data.map((item) => item.session.id))).toEqual(['visible']);
+  });
+
   test('uses provider title for untouched tasks', () => {
     expect(displaySessionTitle(session({ title: 'New task', auto_title: 'Fix login' }))).toBe(
       'Fix login',
