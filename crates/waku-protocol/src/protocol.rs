@@ -143,6 +143,7 @@ pub struct ChildTurnSummary {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum ChildWaitingReason {
+    ManagerDecision,
     Permission,
     UserInput,
 }
@@ -168,6 +169,7 @@ pub struct ChildSessionSummary {
     rename_all_fields = "camelCase"
 )]
 pub enum Command {
+    StewardDecision { operation: crate::model::StewardDecisionOperation },
     StewardWorkspace { operation: crate::model::StewardWorkspaceOperation },
     /// Authenticated user entry, unavailable to scoped steward MCP clients.
     Consult {
@@ -538,6 +540,7 @@ pub enum ResponseOutcome {
     rename_all_fields = "camelCase"
 )]
 pub enum ResponsePayload {
+    StewardDecisions { requests: Vec<crate::model::DecisionRequest> },
     TaskWorkspace { session: AgentSession },
     Consultation {
         consultation: Option<crate::consultation::Consultation>,

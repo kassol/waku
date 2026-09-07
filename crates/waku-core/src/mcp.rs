@@ -200,6 +200,15 @@ pub fn run_stdio(
                         }},"required":["operation"],"additionalProperties":false,"$defs":{"evidence":{"type":"array","minItems":1,"items":{"type":"object","properties":{"commit":{"type":"string"},"checks":{"type":"string","minLength":1},"environment":{"type":"string","minLength":1},"reviewer":{"type":"string","minLength":1}},"required":["commit","checks","environment","reviewer"],"additionalProperties":false}}}}
                     },
                     {
+                        "name": "waku_decision",
+                        "description": "Submit a direct-child decision request, list your requests or direct children's requests, or decide using an existing user instruction message ID. A request is a durable wait: finish your turn if no independent work remains; do not poll. Missing authority leaves waitingUser and never delivers. Decisions do not approve native permissions. Stable request_id retries must retain identical content.",
+                        "inputSchema": {"type":"object","properties":{"operation":{"oneOf":[
+                            {"type":"object","properties":{"type":{"const":"request"},"request_id":{"type":"string","format":"uuid"},"question":{"type":"string"},"context":{"type":"string"},"recommendation":{"type":"string"},"blocked_work":{"type":"string"}},"required":["type","request_id","question","context","recommendation","blocked_work"],"additionalProperties":false},
+                            {"type":"object","properties":{"type":{"const":"list"},"session_id":{"type":"string","format":"uuid"}},"required":["type"],"additionalProperties":false},
+                            {"type":"object","properties":{"type":{"const":"decide"},"session_id":{"type":"string","format":"uuid"},"request_id":{"type":"string","format":"uuid"},"decision":{"type":"string"},"authority_message_id":{"type":"string","format":"uuid"}},"required":["type","session_id","request_id","decision"],"additionalProperties":false}
+                        ]}},"required":["operation"],"additionalProperties":false}
+                    },
+                    {
                         "name": "waku_wait",
                         "description": "Persist a one-shot wait for the current turns of direct children. If waiting=true, finish your current turn now and stop polling; Waku automatically starts a follow-up turn when any watched child finishes, fails, is interrupted, or needs user input. If waiting=false, a child is already actionable: read its result now. New user input or cancellation revokes the wait. Repeating the same targets in this turn is safe.",
                         "inputSchema": {"type":"object","properties":{"session_ids":{"type":"array","items":{"type":"string","format":"uuid"},"minItems":1,"maxItems":128}},"required":["session_ids"],"additionalProperties":false}
@@ -306,6 +315,7 @@ pub fn run_stdio(
                             let (text,failed) = match outcome {
                                 ResponseOutcome::Ok { payload:ResponsePayload::SessionCreated {session,workspace_path,branch,..} } => (json!({"session_id":session.id,"workspace_path":workspace_path,"branch":branch}).to_string(),false),
                                 ResponseOutcome::Ok { payload: failure @ ResponsePayload::SessionCreationFailed { .. } } => (serde_json::to_string(&failure)?, true),
+                                ResponseOutcome::Ok { payload:ResponsePayload::StewardDecisions { requests } } => (json!({"requests": requests}).to_string(), false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildResults {results} } => (json!({"results":results}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildSessions {sessions} } => (json!({"sessions":sessions}).to_string(),false),
                                 ResponseOutcome::Ok { payload:ResponsePayload::ChildStatus {sessions,timed_out} } => (json!({"sessions":sessions,"timed_out":timed_out}).to_string(),false),
@@ -394,6 +404,12 @@ fn tool_command(name: &str, arguments: Value) -> Result<Command, String> {
         let args: WorkspaceArguments = serde_json::from_value(arguments)
             .map_err(|error| format!("Invalid tool arguments: {error}"))?;
         Ok(Command::StewardWorkspace { operation: args.operation })
+    } else if name == "waku_decision" {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Arguments { operation: crate::model::StewardDecisionOperation }
+        let args: Arguments = serde_json::from_value(arguments).map_err(|e| format!("Invalid tool arguments: {e}"))?;
+        Ok(Command::StewardDecision { operation: args.operation })
     } else if name == "waku_wait" {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]

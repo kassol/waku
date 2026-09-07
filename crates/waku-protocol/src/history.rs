@@ -82,6 +82,14 @@ impl HistoryReducer {
                     }
                 }
                 if let Some(delivery) = changed {
+                    if let Some(request) = session.decision_requests.iter_mut().find(|r| r.id == delivery.id && !matches!(r.state, DecisionState::Invalidated | DecisionState::Failed | DecisionState::Resolved)) {
+                        request.state = match delivery.state {
+                            InputDeliveryState::Received => DecisionState::Resolved,
+                            InputDeliveryState::Failed => DecisionState::Failed,
+                            _ => DecisionState::PendingReceipt,
+                        };
+                        request.reason = delivery.reason.clone();
+                    }
                     effects.invalidated_activity_diff = self.update_activity(session, input_delivery_activity(&delivery));
                 }
             }
@@ -142,6 +150,7 @@ impl HistoryReducer {
                 session.last_reply_at = session.last_reply_at.max(snapshot.last_reply_at);
                 session.detail_loaded = true;
                 session.input_deliveries = snapshot.input_deliveries.clone();
+                session.decision_requests = snapshot.decision_requests.clone();
                 session.apply_managed_workspace(snapshot.managed_workspace.take());
                 apply_rewound_history(session, *snapshot);
                 self.last_driver_error = session.last_driver_error.clone();
@@ -168,11 +177,12 @@ impl HistoryReducer {
                 };
             }
             DriverEvent::PromptSubmitted {
+                display_content,
                 message,
                 turn_id,
                 message_id,
             } => {
-                session.adopt_submitted_prompt(&message, turn_id, message_id);
+                session.adopt_submitted_prompt(&message, turn_id, message_id, display_content);
                 self.last_driver_error = None;
                 session.last_driver_error = None;
             }
@@ -767,6 +777,7 @@ mod tests {
             history.apply(&mut session, crate::event_from_wire(wire).unwrap());
             if mode == InputDeliveryMode::Prompt {
                 history.apply(&mut session, DriverEvent::PromptSubmitted {
+                    display_content: None,
                     message: delivery.prompt.clone(), turn_id, message_id: Uuid::new_v4(),
                 });
             }
@@ -830,6 +841,7 @@ mod tests {
         reducer.apply(
             &mut restored,
             DriverEvent::PromptSubmitted {
+                display_content: None,
                 message: "new remote input".into(),
                 turn_id: Uuid::new_v4(),
                 message_id: Uuid::new_v4(),
@@ -1156,6 +1168,7 @@ mod tests {
         history.apply(
             &mut session,
             DriverEvent::PromptSubmitted {
+                display_content: None,
                 message: "inspect".into(),
                 turn_id: Uuid::new_v4(),
                 message_id: Uuid::new_v4(),
@@ -1191,6 +1204,29 @@ mod tests {
     }
 
     #[test]
+    fn submitted_prompt_presentation_repairs_echo_and_survives_legacy_replay() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let mut history = HistoryReducer::default();
+        let turn_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let legacy = crate::WireDriverEvent::new("promptSubmitted", serde_json::json!({
+            "message": "[Waku automatic decision notification] {question: context}",
+            "turnId": turn_id, "messageId": message_id,
+        }));
+        history.apply(&mut session, crate::event_from_wire(legacy.clone()).unwrap());
+        let mut presented = legacy.clone();
+        presented.payload["displayContent"] = serde_json::json!("子会话请求管家决定。");
+        history.apply(&mut session, crate::event_from_wire(presented.clone()).unwrap());
+        history.apply(&mut session, crate::event_from_wire(legacy).unwrap());
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].visible_content(), "子会话请求管家决定。");
+        let mut fresh = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        history.apply(&mut fresh, crate::event_from_wire(presented).unwrap());
+        assert_eq!(fresh.messages[0].visible_content(), "子会话请求管家决定。");
+        assert_eq!(fresh.auto_title.as_deref(), Some("子会话请求管家决定。"));
+    }
+
+    #[test]
     fn submitted_prompt_echo_and_text_form_one_turn() {
         let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
         let mut history = HistoryReducer::default();
@@ -1198,11 +1234,13 @@ mod tests {
         let message_id = Uuid::new_v4();
         for event in [
             DriverEvent::PromptSubmitted {
+                display_content: None,
                 message: "Inspect the repository".into(),
                 turn_id,
                 message_id,
             },
             DriverEvent::PromptSubmitted {
+                display_content: None,
                 message: "Inspect the repository".into(),
                 turn_id,
                 message_id,

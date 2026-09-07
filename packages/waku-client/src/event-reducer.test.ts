@@ -55,6 +55,20 @@ describe('promptSubmitted', () => {
     expect(replied.messages.at(-1)?.turn_id).toBe(SUBMISSION.turnId)
   })
 
+  test('callback presentation reaches a fresh follower and repairs an earlier raw echo', () => {
+    const submission = { ...SUBMISSION, message: '[Waku automatic decision notification] {"question":"private context"}', displayContent: '子会话请求管家决定。' }
+    const fresh = apply(idleSession(), 'promptSubmitted', submission)
+    expect(fresh.messages.at(-1)?.display_content).toBe('子会话请求管家决定。')
+    expect(fresh.messages.at(-1)?.content).toBe(submission.message)
+    const old = apply(idleSession(), 'promptSubmitted', { ...submission, displayContent: undefined })
+    expect(old.messages.at(-1)?.display_content).toBeUndefined()
+    const repaired = apply(old, 'promptSubmitted', submission)
+    expect(repaired.messages).toHaveLength(old.messages.length)
+    expect(repaired.messages.at(-1)?.display_content).toBe('子会话请求管家决定。')
+    const replay = apply(repaired, 'promptSubmitted', { ...submission, displayContent: undefined })
+    expect(replay.messages.at(-1)?.display_content).toBe('子会话请求管家决定。')
+  })
+
   test('the submitting client’s own echo changes nothing', () => {
     const session = runningSession()
     const result = reduceRuntimeEvent(
@@ -483,4 +497,26 @@ test('consultation input displays the instruction while retaining provider conte
     expect(message?.display_content).toBe(delivery.display_content)
     expect(session.input_deliveries?.[0]?.prompt).toBe(delivery.prompt)
   }
+})
+
+test('manager decision receipt and callback wait survive shared-client projection', () => {
+  const session = runningSession()
+  const turn = session.turns.at(-1)!.id
+  const request = { id: 'decision', parent_session_id: 'parent', child_session_id: session.id,
+    turn_id: turn, question: 'Format?', context: 'Output', recommendation: 'JSON', blocked_work: 'Write file',
+    instruction_message_id: 'instruction', instruction: 'Produce output', state: 'pendingReceipt' as const,
+    decision: 'Use JSON', authority_message_id: 'instruction', reason: null, notified: true }
+  session.decision_requests = [request]
+  session.input_deliveries = [{ id: 'decision', caller_session_id: 'parent', target_session_id: session.id,
+    prompt: 'Use JSON', display_content: 'Manager decision', turn_id: turn, mode: 'prompt', state: 'uncertain',
+    confirmation: null, reason: null, created_at: 1 }]
+  const received = apply(session, 'inputDeliveryOutcome', { id: 'decision', state: 'received', confirmation: 'transport', reason: null })
+  expect(received.decision_requests?.[0]?.state).toBe('resolved')
+  const cancelled = structuredClone(session)
+  cancelled.decision_requests![0]!.state = 'invalidated'
+  expect(apply(cancelled, 'inputDeliveryOutcome', { id: 'decision', state: 'received', confirmation: 'transport', reason: null }).decision_requests?.[0]?.state).toBe('invalidated')
+  expect(apply(idleSession(), 'historySnapshot', received).decision_requests?.[0]?.decision).toBe('Use JSON')
+  const wait = { id: 'results', parent_turn_id: turn, targets: [{ session_id: 'child', turn_id: 'child-turn' }] }
+  const callback = apply(session, 'stewardWaitChanged', wait)
+  expect(apply(callback, 'promptSubmitted', { message: 'Automatic decision notification', turnId: turn, messageId: 'callback' }).steward_wait).toEqual(wait)
 })

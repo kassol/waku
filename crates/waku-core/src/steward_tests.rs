@@ -166,7 +166,7 @@ fn mcp_stdio_creates_real_child_and_rejects_spoofed_arguments() {
             .collect();
         assert_eq!(replies.len(), 6);
         assert_eq!(replies[5]["error"]["code"], -32600);
-        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 11);
         assert_eq!(replies[2]["error"]["code"], -32602);
         assert_eq!(replies[3]["result"]["isError"], true);
         assert_eq!(replies[4]["result"]["isError"], false);
@@ -1219,6 +1219,7 @@ fn query_preserves_failed_turn_reason_across_storage_restart() {
             reducer.apply(
                 &mut next,
                 crate::model::DriverEvent::PromptSubmitted {
+                    display_content: None,
                     message: "retry".into(),
                     turn_id: Uuid::new_v4(),
                     message_id: Uuid::new_v4(),
@@ -2160,3 +2161,38 @@ mod task_workspace_delivery_tests;
 
 #[path = "steward_coordination_tests.rs"]
 mod steward_coordination_tests;
+
+#[test]
+fn decision_mcp_scope_binds_child_requests_and_revokes_access() {
+    use crate::model::StewardDecisionOperation as Operation;
+    with_creation_daemon_seed(|root, project_path| {
+        let (project, parent, mut children) = seed_query_sessions(root, project_path);
+        children[0].provider = ProviderKind::Claude;
+        let store = StateStore::daemon(root.join("app.db"));
+        let mut state = store.load().unwrap();
+        *state.sessions.iter_mut().find(|s| s.id == children[0].id).unwrap() = children[0].clone();
+        state.mark_session_dirty(children[0].id);
+        store.save(&mut state).unwrap();
+        (project, parent, children)
+    }, |client, _, root, project_path, address, (project, parent, children)| {
+        let (parent, _, parent_config, parent_runtime) = start_steward_saved(&client, root, project_path, parent, project.clone());
+        let mut child = children[0].clone();
+        std::fs::remove_file(project_path.join("mcp-config.json")).unwrap();
+        child.begin_turn("Ask manager about output format");
+        let (child, _, child_config, child_runtime) = start_steward_saved(&client, root, project_path, child, project);
+        let child_token = child_config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"].as_str().unwrap();
+        let parent_token = parent_config["mcpServers"]["waku"]["env"]["WAKU_MCP_TOKEN"].as_str().unwrap();
+        let id = Uuid::new_v4();
+        let result = mcp_tool(address, child_token, child.id, child_runtime, "waku_decision", json!({"operation":{"type":"request","request_id":id,"question":"Format?","context":"Output file","recommendation":"JSON","blocked_work":"Write file"}}));
+        assert_eq!(result["requests"][0]["state"], "waitingManager");
+        let listed = mcp_tool(address, parent_token, parent.id, parent_runtime, "waku_decision", json!({"operation":{"type":"list","session_id":child.id}}));
+        assert_eq!(listed["requests"][0]["id"], id.to_string());
+        let mut socket = scoped_socket(address, child_token);
+        let request = |operation| Request { request_id: Uuid::new_v4(), session_id: child.id, runtime_id: child_runtime, command: Command::StewardDecision { operation } };
+        assert!(matches!(scoped_request(&mut socket, request(Operation::List { session_id: Some(children[1].id) })), ResponseOutcome::Error { .. }));
+        assert!(matches!(scoped_request(&mut socket, request(Operation::Decide { session_id: child.id, request_id: id, decision: "Self approval".into(), authority_message_id: Some(parent.messages[0].id) })), ResponseOutcome::Error { .. }));
+        client.request(child.id, child_runtime, Command::CloseSession).unwrap();
+        assert!(matches!(scoped_request(&mut socket, request(Operation::List { session_id: Some(child.id) })), ResponseOutcome::Error { .. }));
+        client.request(parent.id, parent_runtime, Command::CloseSession).unwrap();
+    });
+}

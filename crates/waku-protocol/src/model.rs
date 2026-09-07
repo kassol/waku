@@ -959,6 +959,44 @@ pub struct StewardWait {
     pub targets: Vec<StewardWaitTarget>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum DecisionState {
+    WaitingManager,
+    WaitingUser,
+    PendingReceipt,
+    Resolved,
+    Failed,
+    Invalidated,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct DecisionRequest {
+    pub id: Uuid,
+    pub parent_session_id: Uuid,
+    pub child_session_id: Uuid,
+    pub turn_id: Uuid,
+    pub question: String,
+    pub context: String,
+    pub recommendation: String,
+    pub blocked_work: String,
+    pub instruction_message_id: Option<Uuid>,
+    pub instruction: Option<String>,
+    pub state: DecisionState,
+    pub decision: Option<String>,
+    pub authority_message_id: Option<Uuid>,
+    pub reason: Option<String>,
+    pub notified: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum StewardDecisionOperation {
+    Request { request_id: Uuid, question: String, context: String, recommendation: String, blocked_work: String },
+    List { session_id: Option<Uuid> },
+    Decide { session_id: Uuid, request_id: Uuid, decision: String, authority_message_id: Option<Uuid> },
+}
+
 /// Daemon-owned resources explicitly created for a code task. Legacy sessions have none.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct ManagedWorkspaceLocation {
@@ -1096,6 +1134,8 @@ pub struct AgentSession {
     pub steward_wait: Option<StewardWait>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_deliveries: Vec<InputDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_requests: Vec<DecisionRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_workspace: Option<ManagedWorkspace>,
     /// A title explicitly chosen by the user. [`Self::DEFAULT_TITLE`] means
@@ -1215,6 +1255,7 @@ impl AgentSession {
             parent_session_id: None,
             steward_wait: None,
             input_deliveries: Vec::new(),
+            decision_requests: Vec::new(),
             managed_workspace: None,
             title: Self::DEFAULT_TITLE.to_owned(),
             auto_title: None,
@@ -1262,11 +1303,12 @@ impl AgentSession {
             parent_session_id: self.parent_session_id,
             steward_wait: self.steward_wait.clone(),
             input_deliveries: self.input_deliveries.clone(),
+            decision_requests: self.decision_requests.clone(),
             managed_workspace: self.managed_workspace.clone(),
             title: self.title.clone(),
             auto_title: self.auto_title.clone(),
             project_id: self.project_id,
-            workspace: SessionWorkspace::Local,
+            workspace: self.workspace.clone(),
             provider: self.provider,
             model: self.model.clone(),
             runtime_mode: RuntimeMode::default(),
@@ -1578,7 +1620,7 @@ impl AgentSession {
     /// The submitting client already holds the turn and its user message, so
     /// a running turn that has a user message is left alone — that covers the
     /// submitter's own echo and a client that hydrated after the submission
-    /// was saved. A running turn without one is a provider-started turn this
+    /// was saved. A supplied presentation updates the matching message. A running turn without one is a provider-started turn this
     /// client was following; the submission becomes its prompt. With no
     /// running turn the submission opens one here exactly as it did on the
     /// submitting client, reusing that client's ids so the projections every
@@ -1588,14 +1630,23 @@ impl AgentSession {
         message: &str,
         turn_id: Uuid,
         message_id: Uuid,
+        display_content: Option<String>,
     ) -> bool {
-        self.steward_wait = None;
+        if self.steward_wait.as_ref().is_some_and(|wait| wait.parent_turn_id != turn_id) { self.steward_wait = None; }
         let now = unix_time();
-        let display_content = self.input_deliveries.iter().find(|delivery| {
+        let display_content = display_content.or_else(|| self.input_deliveries.iter().find(|delivery| {
             delivery.turn_id == turn_id
                 && delivery.mode == InputDeliveryMode::Prompt
                 && delivery.prompt == message
-        }).and_then(|delivery| delivery.display_content.clone());
+        }).and_then(|delivery| delivery.display_content.clone()));
+        if let Some(existing) = self.messages.iter_mut().find(|m| m.id == message_id && m.role == MessageRole::User) {
+            if display_content.is_some() && existing.display_content != display_content {
+                existing.display_content = display_content;
+                self.updated_at = now;
+                return true;
+            }
+            return false;
+        }
         if let Some(active) = self.active_turn_id() {
             let has_prompt = self.messages.iter().any(|candidate| {
                 candidate.turn_id == Some(active) && candidate.role == MessageRole::User
@@ -1610,7 +1661,7 @@ impl AgentSession {
             self.updated_at = now;
             return true;
         }
-        self.set_title_from_prompt(message);
+        self.set_title_from_prompt(display_content.as_deref().unwrap_or(message));
         self.turns.push(AgentTurn {
             id: turn_id,
             turn_count: self.turns.len() + 1,
@@ -2082,6 +2133,7 @@ pub enum DriverEvent {
     /// opens. The projections those clients save then describe the same
     /// transcript; see [`AgentSession::adopt_submitted_prompt`].
     PromptSubmitted {
+        display_content: Option<String>,
         message: String,
         turn_id: Uuid,
         message_id: Uuid,
@@ -4878,7 +4930,7 @@ mod tests {
         let turn_id = Uuid::new_v4();
         let message_id = Uuid::new_v4();
 
-        assert!(session.adopt_submitted_prompt("second", turn_id, message_id));
+        assert!(session.adopt_submitted_prompt("second", turn_id, message_id, None));
 
         assert_eq!(session.status, SessionStatus::Connecting);
         assert_eq!(session.active_turn_id(), Some(turn_id));
@@ -4899,7 +4951,7 @@ mod tests {
         session.status = SessionStatus::Connecting;
         let message_id = session.messages[0].id;
 
-        assert!(!session.adopt_submitted_prompt("first", turn_id, message_id));
+        assert!(!session.adopt_submitted_prompt("first", turn_id, message_id, None));
 
         assert_eq!(session.turns.len(), 1);
         assert_eq!(session.messages.len(), 1);
@@ -4914,7 +4966,7 @@ mod tests {
         session.status = SessionStatus::Working;
         let message_id = Uuid::new_v4();
 
-        assert!(session.adopt_submitted_prompt("continue", Uuid::new_v4(), message_id));
+        assert!(session.adopt_submitted_prompt("continue", Uuid::new_v4(), message_id, None));
 
         assert_eq!(session.turns.len(), 1);
         let prompt = session.messages.last().unwrap();

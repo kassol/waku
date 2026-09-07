@@ -1252,16 +1252,20 @@ impl StateStore {
         // Recover daemon-owned wait and workspace records without hydrating a transcript. This runs
         // once when opening the store; later catalogs use the in-memory projection.
         let mut waits = connection
-            .prepare("SELECT session_id, json_extract(data, '$.steward_wait'), json_extract(data, '$.input_deliveries'), json_extract(data, '$.managed_workspace') FROM session_details")
+            .prepare("SELECT session_id, json_extract(data, '$.steward_wait'), json_extract(data, '$.input_deliveries'), json_extract(data, '$.managed_workspace'), json_extract(data, '$.decision_requests'), json_extract(data, '$.workspace') FROM session_details")
             .map_err(to_io_error)?;
         let mut waits_by_session = HashMap::new();
         let mut inputs_by_session = HashMap::new();
         let mut workspaces_by_session = HashMap::new();
+        let mut decisions_by_session = HashMap::new();
+        let mut locations_by_session = HashMap::new();
         for row in waits
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?)))
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?)))
             .map_err(to_io_error)?
         {
-            let (id, wait, inputs, workspace) = row.map_err(to_io_error)?;
+            let (id, wait, inputs, workspace, decisions, location) = row.map_err(to_io_error)?;
+            if let Some(location) = location { locations_by_session.insert(id.clone(), serde_json::from_str(&location).map_err(to_io_error)?); }
+            if let Some(decisions) = decisions { decisions_by_session.insert(id.clone(), serde_json::from_str(&decisions).map_err(to_io_error)?); }
             if let Some(inputs) = inputs { inputs_by_session.insert(id.clone(), serde_json::from_str(&inputs).map_err(to_io_error)?); }
             if let Some(workspace) = workspace {
                 workspaces_by_session.insert(id.clone(), serde_json::from_str(&workspace).map_err(to_io_error)?);
@@ -1271,6 +1275,8 @@ impl StateStore {
             }
         }
         for session in &mut state.sessions {
+            session.workspace = locations_by_session.remove(&session.id.to_string()).unwrap_or_default();
+            session.decision_requests = decisions_by_session.remove(&session.id.to_string()).unwrap_or_default();
             session.steward_wait = waits_by_session.remove(&session.id.to_string());
             session.input_deliveries = inputs_by_session.remove(&session.id.to_string()).unwrap_or_default();
             session.managed_workspace = workspaces_by_session.remove(&session.id.to_string());
@@ -1370,6 +1376,7 @@ impl StateStore {
         session.history_save_error = stored.history_save_error;
         session.last_driver_error = stored.last_driver_error;
         session.cancellation_requested_turn_id = stored.cancellation_requested_turn_id;
+        session.decision_requests = stored.decision_requests;
         session.steward_wait = stored.steward_wait;
         session.input_deliveries = stored.input_deliveries;
         session.managed_workspace = stored.managed_workspace;
@@ -1824,6 +1831,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
     Some(AgentSession {
         id: Uuid::parse_str(&id).ok()?,
         parent_session_id: parent_session_id.and_then(|id| Uuid::parse_str(&id).ok()),
+        decision_requests: Vec::new(),
         steward_wait: None,
         input_deliveries: Vec::new(),
         managed_workspace: None,
@@ -2515,7 +2523,10 @@ mod tests {
         assert!(!session.detail_loaded);
         assert!(session.messages.is_empty());
         assert!(session.turns.is_empty());
-        assert_eq!(session.workspace, SessionWorkspace::Local);
+        assert_eq!(session.workspace, SessionWorkspace::Worktree {
+            path: PathBuf::from("/tmp/worktrees/investigate"),
+            branch: "waku/investigate".into(),
+        });
         // A skeleton still counts as started, since only started sessions
         // are stored at all.
         assert!(session.has_started());

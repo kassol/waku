@@ -1212,6 +1212,7 @@ pub struct Waku {
     commit_dialog: Option<commit_dialog::CommitDialogState>,
     goal_dialog: Option<goal_dialog::GoalDialogState>,
     consultation: Option<consultation::ConsultationDialog>,
+    decision_dialog: Option<decisions::DecisionDialog>,
     goal_dialog_request: Option<goal_dialog::GoalDialogRequest>,
     /// Goal operations accepted before the session's runtime exists. Goals
     /// attach to the provider thread, not to any turn, so `/goal` on a fresh
@@ -1612,6 +1613,7 @@ mod command_palette;
 mod commit_dialog;
 mod goal_dialog;
 mod consultation;
+mod decisions;
 mod components;
 mod composer;
 mod drafts;
@@ -2796,6 +2798,7 @@ impl Waku {
                 commit_dialog: None,
                 goal_dialog: None,
                 consultation: None,
+                decision_dialog: None,
                 goal_dialog_request: None,
                 pending_goal_operations: HashMap::new(),
                 goal_runtime_starts: HashSet::new(),

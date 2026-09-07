@@ -98,12 +98,13 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
             })?,
         ),
         DriverEvent::PromptSubmitted {
+            display_content,
             message,
             turn_id,
             message_id,
         } => (
             "promptSubmitted",
-            json!({ "message": message, "turnId": turn_id, "messageId": message_id }),
+            json!({ "message": message, "turnId": turn_id, "messageId": message_id, "displayContent": display_content }),
         ),
         DriverEvent::SteerAccepted { message } => ("steerAccepted", json!({ "message": message })),
         DriverEvent::SteerRejected { message, reason } => (
@@ -193,6 +194,7 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         "promptSubmitted" => {
             let submitted: SubmittedPromptWire = serde_json::from_value(payload)?;
             DriverEvent::PromptSubmitted {
+                display_content: submitted.display_content,
                 message: submitted.message,
                 turn_id: submitted.turn_id,
                 message_id: submitted.message_id,
@@ -243,6 +245,8 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SubmittedPromptWire {
+    #[serde(default)]
+    display_content: Option<String>,
     message: String,
     turn_id: Uuid,
     message_id: Uuid,

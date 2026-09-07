@@ -34,6 +34,8 @@ mod steward_input;
 mod steward_input_tests;
 #[path = "steward.rs"]
 mod steward;
+#[path = "steward_decision.rs"]
+mod steward_decision;
 #[path = "steward_wait.rs"]
 mod steward_wait;
 #[cfg(test)]
@@ -474,6 +476,9 @@ impl Backend for WakuBackend {
         ) {
             return self.consultation_command(request.command, &events);
         }
+        if let Command::StewardDecision { operation: operation @ crate::model::StewardDecisionOperation::List { .. } } = &request.command {
+            return self.steward_decision(request.session_id, operation.clone(), &events);
+        }
         if let Command::StewardQuery { query } = &request.command {
             return self.steward_query(request.session_id, query, &events);
         }
@@ -518,6 +523,7 @@ impl Backend for WakuBackend {
         let starts_work = matches!(
             request.command,
             Command::CreateSession { .. }
+                | Command::StewardDecision { .. }
                 | Command::StewardWait { .. }
                 | Command::StewardWorkspace { .. }
                 | Command::StewardPrompt { .. }
@@ -545,6 +551,7 @@ impl Backend for WakuBackend {
 
     fn resume_stewards(&self, events: EventSink) {
         self.resume_queued_inputs(&events);
+        self.resume_decisions(&events);
         self.resume_waiting_stewards(&events);
         self.cleanup_delivered_tasks(&events);
     }
@@ -649,6 +656,7 @@ impl WakuBackend {
         let session_id = request.session_id;
         let runtime_id = request.runtime_id;
         if matches!(&request.command, Command::Cancel) {
+            self.cancel_decisions(session_id)?;
             let cancelled_queue = self.cancel_queued_inputs(session_id, &events)?;
             let cancelled_wait = {
                 let mut state = self.task_state.lock();
@@ -689,6 +697,7 @@ impl WakuBackend {
         }
         match request.command {
             Command::StewardWorkspace { operation } => self.steward_workspace(session_id, operation, &events),
+            Command::StewardDecision { operation } => self.steward_decision(session_id, operation, &events),
             Command::StewardWait { session_ids } => {
                 self.register_steward_wait(session_id, session_ids, &events)
             }
@@ -902,6 +911,7 @@ impl WakuBackend {
                 for mut session in sessions {
                     session.steward_wait = None;
                     session.input_deliveries.clear();
+                    session.decision_requests.clear();
                     session.managed_workspace = None;
                     if let Some(existing) = state
                         .sessions
@@ -914,6 +924,7 @@ impl WakuBackend {
                         session.parent_session_id = existing.parent_session_id;
                         session.steward_wait = existing.steward_wait.clone();
                         session.input_deliveries = existing.input_deliveries.clone();
+                        session.decision_requests = existing.decision_requests.clone();
                         session.managed_workspace = existing.managed_workspace.clone();
                         if existing.managed_workspace.is_some() {
                             session.workspace = existing.workspace.clone();
@@ -1439,11 +1450,27 @@ impl WakuBackend {
                     // the only record of the prompt — a follower that only
                     // knew the provider's `turnStarted` used to persist a
                     // projection without it, erasing the message for everyone.
-                    events.send(event_to_wire(DriverEvent::PromptSubmitted {
+                    let (display_content, saved_wait) = if let Some(message_id) = message_id {
+                        let mut state = self.task_state.lock();
+                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == session_id) {
+                            self.task_store.hydrate(session)?;
+                            let display_content = session.messages.iter().find(|message| message.id == *message_id
+                                && message.role == crate::model::MessageRole::User
+                                && message.content == *prompt)
+                                .and_then(|message| message.display_content.clone());
+                            (display_content, session.steward_wait.clone().filter(|wait| Some(wait.parent_turn_id) == *turn_id))
+                        } else { (None, None) }
+                    } else { (None, None) };
+                    let mut submitted = vec![event_to_wire(DriverEvent::PromptSubmitted {
+                        display_content,
                         message: prompt.clone(),
                         turn_id: turn_id.unwrap_or_else(Uuid::new_v4),
                         message_id: message_id.unwrap_or_else(Uuid::new_v4),
-                    })?)?;
+                    })?];
+                    if saved_wait.is_some() {
+                        submitted.push(event_to_wire(DriverEvent::StewardWaitChanged(saved_wait))?);
+                    }
+                    events.send_batch(submitted)?;
                 }
                 let history_result = match &command {
                     Command::Cancel => events.send(event_to_wire(DriverEvent::CancelRequested)?),
@@ -2497,6 +2524,7 @@ fn handle_driver_command(
         Command::StewardInputStatus { .. }
         | Command::StewardWorkspace { .. }
         | Command::StewardQuery { .. }
+        | Command::StewardDecision { .. }
         | Command::StewardWait { .. }
         | Command::StewardPrompt { .. }
         | Command::StewardCancel { .. }
@@ -2645,12 +2673,13 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
             })?,
         ),
         DriverEvent::PromptSubmitted {
+            display_content,
             message,
             turn_id,
             message_id,
         } => (
             "promptSubmitted",
-            json!({ "message": message, "turnId": turn_id, "messageId": message_id }),
+            json!({ "message": message, "turnId": turn_id, "messageId": message_id, "displayContent": display_content }),
         ),
         DriverEvent::SteerAccepted { message } => ("steerAccepted", json!({ "message": message })),
         DriverEvent::SteerRejected { message, reason } => (
@@ -2740,6 +2769,7 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         "promptSubmitted" => {
             let submitted: SubmittedPromptWire = serde_json::from_value(payload)?;
             DriverEvent::PromptSubmitted {
+                display_content: submitted.display_content,
                 message: submitted.message,
                 turn_id: submitted.turn_id,
                 message_id: submitted.message_id,
@@ -2790,6 +2820,8 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SubmittedPromptWire {
+    #[serde(default)]
+    display_content: Option<String>,
     message: String,
     turn_id: Uuid,
     message_id: Uuid,
@@ -3028,6 +3060,7 @@ mod tests {
             let (sender, receiver) = driver::test_event_channel();
             sender
                 .send(DriverEvent::PromptSubmitted {
+                    display_content: None,
                     message: "inspect".into(),
                     turn_id: Uuid::new_v4(),
                     message_id: Uuid::new_v4(),
@@ -3134,6 +3167,7 @@ mod tests {
             .unwrap();
         sink.send(
             event_to_wire(DriverEvent::PromptSubmitted {
+                display_content: None,
                 message: "inspect".into(),
                 turn_id: Uuid::new_v4(),
                 message_id: Uuid::new_v4(),
@@ -3306,6 +3340,7 @@ mod tests {
         );
         sink.send(
             event_to_wire(DriverEvent::PromptSubmitted {
+                display_content: None,
                 message: "saved input".into(),
                 turn_id: Uuid::new_v4(),
                 message_id: Uuid::new_v4(),
@@ -3698,6 +3733,7 @@ mod tests {
         let turn_id = Uuid::new_v4();
         let message_id = Uuid::new_v4();
         let wire = event_to_wire(DriverEvent::PromptSubmitted {
+            display_content: None,
             message: "ship it".into(),
             turn_id,
             message_id,
@@ -3709,7 +3745,8 @@ mod tests {
         assert_eq!(wire.payload["messageId"], message_id.to_string());
         assert!(matches!(
             event_from_wire(wire).unwrap(),
-            DriverEvent::PromptSubmitted { message, turn_id: decoded_turn, message_id: decoded_message }
+            DriverEvent::PromptSubmitted {
+                    display_content: None, message, turn_id: decoded_turn, message_id: decoded_message }
                 if message == "ship it" && decoded_turn == turn_id && decoded_message == message_id
         ));
     }

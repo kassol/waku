@@ -130,6 +130,11 @@ export function reduceRuntimeEvent(
         delivery.state = outcome.state
         delivery.confirmation = outcome.confirmation
         delivery.reason = outcome.reason
+        const request = session.decision_requests?.find((entry) => entry.id === delivery.id)
+        if (request && !['invalidated', 'failed', 'resolved'].includes(request.state)) {
+          request.state = delivery.state === 'received' ? 'resolved' : delivery.state === 'failed' ? 'failed' : 'pendingReceipt'
+          request.reason = delivery.reason
+        }
         if (delivery.state === 'received' && delivery.mode === 'steer') {
           if (session.steward_wait?.parent_turn_id === delivery.turn_id) delete session.steward_wait
           session.messages.push({ id: clock.randomUUID(), role: 'user', content: delivery.prompt,
@@ -202,13 +207,14 @@ export function reduceRuntimeEvent(
       // submitter's ids so every client's projection names the same rows.
       const value = asRecord(payload)
       if (!value || typeof value.message !== 'string') break
-      delete session.steward_wait
+      if (session.steward_wait?.parent_turn_id !== value.turnId) delete session.steward_wait
       delete session.last_driver_error
       adoptSubmittedPrompt(
         session,
         value.message,
         typeof value.turnId === 'string' ? value.turnId : clock.randomUUID(),
         typeof value.messageId === 'string' ? value.messageId : clock.randomUUID(),
+        typeof value.displayContent === 'string' ? value.displayContent : undefined,
         clock,
       )
       break
@@ -481,7 +487,7 @@ function asUserInputQuestion(value: unknown): PendingUserInput['questions'][numb
 }
 
 /** A running turn that already has a user message is the submitter's own
- * turn, or one hydrated after the submission was saved: leave it. A running
+ * turn, or one hydrated after the submission was saved: keep it and update its supplied presentation. A running
  * turn without one is a provider-started turn this client was following, and
  * the submission is its prompt. Otherwise open the turn here as the submitter
  * did, under the submitter's ids. */
@@ -490,12 +496,18 @@ function adoptSubmittedPrompt(
   message: string,
   turnId: string,
   messageId: string,
+  presentation: string | undefined,
   clock: ReducerClock,
 ) {
   const now = clock.nowSeconds()
-  const displayContent = session.input_deliveries?.find(delivery =>
+  const displayContent = presentation ?? session.input_deliveries?.find(delivery =>
     delivery.turn_id === turnId && delivery.mode === 'prompt' && delivery.prompt === message,
   )?.display_content
+  const existing = session.messages.find(candidate => candidate.id === messageId && candidate.role === 'user')
+  if (existing) {
+    if (displayContent !== undefined) existing.display_content = displayContent
+    return
+  }
   const active = activeTurn(session)
   if (active) {
     const hasPrompt = session.messages.some(
@@ -513,7 +525,7 @@ function adoptSubmittedPrompt(
     })
     return
   }
-  setTitleFromPrompt(session, message)
+  setTitleFromPrompt(session, displayContent ?? message)
   session.turns.push({
     id: turnId,
     turn_count: session.turns.length + 1,

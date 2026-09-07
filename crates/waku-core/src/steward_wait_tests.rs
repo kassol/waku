@@ -208,6 +208,7 @@ fn steward_wait_cancel_failure_and_new_input_revoke_callback() {
             summary: Some("failed".into()),
         },
         DriverEvent::PromptSubmitted {
+            display_content: None,
             message: "A new user instruction".into(),
             turn_id: Uuid::new_v4(),
             message_id: Uuid::new_v4(),

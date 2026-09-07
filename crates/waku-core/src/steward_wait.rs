@@ -40,9 +40,10 @@ impl WakuBackend {
                     .turns
                     .last()
                     .ok_or_else(|| anyhow!("child has no turn to wait for"))?;
-                ready |= turn.status != TurnStatus::Running
+                let blocked = child.decision_requests.iter().any(|r| matches!(super::steward_decision::decision_projection(&child, r).state, crate::model::DecisionState::WaitingManager | crate::model::DecisionState::WaitingUser | crate::model::DecisionState::PendingReceipt));
+                ready |= !blocked && (turn.status != TurnStatus::Running
                     || child.pending_permission.is_some()
-                    || child.pending_user_input.is_some();
+                    || child.pending_user_input.is_some());
                 targets.push(StewardWaitTarget {
                     session_id: id,
                     turn_id: turn.id,
@@ -178,13 +179,17 @@ impl WakuBackend {
             for target in &wait.targets {
                 let (child, _) =
                     self.authorized_child(&mut state, parent_id, target.session_id, events)?;
+                if child.decision_requests.iter().any(|r| matches!(super::steward_decision::decision_projection(&child, r).state, crate::model::DecisionState::WaitingManager | crate::model::DecisionState::WaitingUser | crate::model::DecisionState::PendingReceipt)) { continue; }
+                // A decision resumes the same logical task in a new provider turn.
+                let resumed = child.decision_requests.iter().any(|r| r.turn_id == target.turn_id);
+                let expected_turn = if resumed { child.turns.last().map(|t| t.id).unwrap_or(target.turn_id) } else { target.turn_id };
                 let turn = child
                     .turns
                     .iter()
-                    .find(|turn| turn.id == target.turn_id)
+                    .find(|turn| turn.id == expected_turn)
                     .ok_or_else(|| anyhow!("watched child turn is unavailable"))?;
                 if turn.status != TurnStatus::Running
-                    || (child.active_turn_id() == Some(target.turn_id)
+                    || (child.active_turn_id() == Some(expected_turn)
                         && (child.pending_permission.is_some()
                             || child.pending_user_input.is_some()))
                 {

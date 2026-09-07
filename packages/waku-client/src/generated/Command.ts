@@ -12,6 +12,7 @@ import type { ProviderResumeCursor } from "./ProviderResumeCursor";
 import type { ProviderSessionForkRequest } from "./ProviderSessionForkRequest";
 import type { ReplayCursor } from "./ReplayCursor";
 import type { RuntimeMode } from "./RuntimeMode";
+import type { StewardDecisionOperation } from "./StewardDecisionOperation";
 import type { StewardQuery } from "./StewardQuery";
 import type { StewardWorkspaceOperation } from "./StewardWorkspaceOperation";
 import type { UsageWindow } from "./UsageWindow";
@@ -23,7 +24,7 @@ import type { WorkspaceDependency } from "./WorkspaceDependency";
 import type { WorkspaceOperation } from "./WorkspaceOperation";
 import type { JsonValue } from "./serde_json/JsonValue";
 
-export type Command = { "type": "stewardWorkspace", operation: StewardWorkspaceOperation, } | { "type": "consult", sourceSessionId: string, question: string, } | { "type": "loadConsultation", sourceSessionId: string, } | { "type": "executeConsultation", sourceSessionId: string, deliveryId: string, instruction: string, } | { "type": "stewardWait", sessionIds: Array<string>, } | { "type": "stewardPrompt", childSessionId: string, prompt: string, deliveryId: string | null, } | { "type": "stewardInputStatus", childSessionId: string, deliveryId: string, } | { "type": "stewardCancel", childSessionId: string, } | { "type": "stewardQuery", query: StewardQuery, } | { "type": "createSession", provider: ProviderKind, prompt: string, model: string | null, title: string | null, runtimeMode: RuntimeMode | null, idempotencyKey: string | null, workspace: CreationWorkspace, dependencies: Array<WorkspaceDependency>, } | { "type": "prepareShutdown" } | { "type": "shutdownDaemon" } | { "type": "attachSession" } | { "type": "start", options: WireDriverStartOptions, } | { "type": "prompt", prompt: string,
+export type Command = { "type": "stewardDecision", operation: StewardDecisionOperation, } | { "type": "stewardWorkspace", operation: StewardWorkspaceOperation, } | { "type": "consult", sourceSessionId: string, question: string, } | { "type": "loadConsultation", sourceSessionId: string, } | { "type": "executeConsultation", sourceSessionId: string, deliveryId: string, instruction: string, } | { "type": "stewardWait", sessionIds: Array<string>, } | { "type": "stewardPrompt", childSessionId: string, prompt: string, deliveryId: string | null, } | { "type": "stewardInputStatus", childSessionId: string, deliveryId: string, } | { "type": "stewardCancel", childSessionId: string, } | { "type": "stewardQuery", query: StewardQuery, } | { "type": "createSession", provider: ProviderKind, prompt: string, model: string | null, title: string | null, runtimeMode: RuntimeMode | null, idempotencyKey: string | null, workspace: CreationWorkspace, dependencies: Array<WorkspaceDependency>, } | { "type": "prepareShutdown" } | { "type": "shutdownDaemon" } | { "type": "attachSession" } | { "type": "start", options: WireDriverStartOptions, } | { "type": "prompt", prompt: string,
 /**
  * The ids the submitting client already gave this turn and its user
  * message. The daemon republishes them with the submission so every

@@ -157,6 +157,25 @@ fn task_catalog_keeps_newer_workspace_evidence_and_execution_location() {
 }
 
 #[test]
+fn task_catalog_refreshes_decisions_while_a_runtime_is_attached() {
+    let local = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+    let mut remote = local.list_projection();
+    remote.decision_requests.push(serde_json::from_value(serde_json::json!({
+        "id": Uuid::new_v4(), "parent_session_id": Uuid::new_v4(),
+        "child_session_id": local.id, "turn_id": Uuid::new_v4(),
+        "question": "Which file?", "context": "Result naming",
+        "recommendation": "accepted.txt", "blocked_work": "Write result",
+        "state": "waitingManager", "notified": false
+    })).unwrap());
+    let mut catalog = vec![local];
+    merge_remote_session_catalog(&mut catalog, vec![remote.clone()], |_| true);
+    assert_eq!(catalog[0].decision_requests, remote.decision_requests);
+    remote.decision_requests[0].state = waku_protocol::model::DecisionState::Resolved;
+    merge_remote_session_catalog(&mut catalog, vec![remote.clone()], |_| true);
+    assert_eq!(catalog[0].decision_requests, remote.decision_requests);
+}
+
+#[test]
 fn composer_only_offers_stop_after_submission_preparation() {
     assert_eq!(
         composer_submit_action(Some(SessionStatus::Idle), false),

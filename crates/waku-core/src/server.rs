@@ -805,7 +805,7 @@ impl RequestDispatcher {
         outgoing: Sender<ServerMessage>,
         source_subscriber_id: u64,
     ) {
-        if !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. })
+        if !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. })
             && !self.hub.reserve_request(request.request_id, &outgoing)
         {
             return;
@@ -1250,6 +1250,7 @@ fn dispatch_steward(
                 | Command::StewardQuery { .. }
                 | Command::StewardPrompt { .. }
                 | Command::StewardCancel { .. }
+                | Command::StewardDecision { .. }
                 | Command::StewardWait { .. }
                 | Command::StewardWorkspace { .. }
         )
@@ -1268,7 +1269,7 @@ fn dispatch_steward(
         });
         return;
     }
-    let cacheable = !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. });
+    let cacheable = !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. });
     if cacheable && !hub.reserve_request_as(scope.principal, request.request_id, &outgoing) {
         return;
     }
@@ -1523,7 +1524,7 @@ fn handle_request_as(
     let principal = scope.as_ref().map_or(Uuid::nil(), |scope| scope.principal);
     let request_id = request.request_id;
     let notification = request_id.is_nil();
-    let cacheable = !notification && !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. });
+    let cacheable = !notification && !matches!(request.command, Command::StewardQuery { .. } | Command::StewardInputStatus { .. } | Command::StewardDecision { .. });
     let session_id = request.session_id;
     let runtime_id = request.runtime_id;
     let task_catalog_action = task_catalog_action(&request.command);

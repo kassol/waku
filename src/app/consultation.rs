@@ -5,6 +5,7 @@ use waku_client::consultation::Consultation;
 
 actions!(waku_consultation, [SendConsultation, CloseConsultation]);
 pub fn init(cx: &mut App) {
+    super::decisions::init(cx);
     cx.bind_keys([
         KeyBinding::new("secondary-enter", SendConsultation, Some("Consultation")),
         KeyBinding::new("escape", CloseConsultation, Some("Consultation")),
@@ -393,7 +394,7 @@ impl Waku {
             dialog.close_focus.clone(),
             dialog.send_focus.clone(),
         ]);
-        let card = consultation_card(focus_order)
+        let card = consultation_card(focus_order, "consultation-card")
             .on_action(cx.listener(|this, _: &SendConsultation, _, cx| this.send_consultation(cx)))
             .on_action(cx.listener(|this, _: &CloseConsultation, window, cx| {
                 this.close_consultation(window, cx)
@@ -591,9 +592,9 @@ impl Waku {
     }
 }
 
-fn consultation_card(focus_order: Vec<FocusHandle>) -> Stateful<Div> {
+pub(super) fn consultation_card(focus_order: Vec<FocusHandle>, id: &'static str) -> Stateful<Div> {
     div()
-        .id("consultation-card")
+        .id(id)
         .key_context("Consultation")
         .tab_group()
         .tab_stop(false)
@@ -618,7 +619,7 @@ fn consultation_card(focus_order: Vec<FocusHandle>) -> Stateful<Div> {
         })
 }
 
-fn consultation_history<T: 'static>(
+pub(super) fn consultation_history<T: 'static>(
     scroll_rows: ListState,
     focus: &FocusHandle,
     count: usize,
@@ -673,7 +674,7 @@ mod history_keyboard_tests {
                 .on_key_down(crate::ui::navigate_tab)
                 .child(div().track_focus(&self.background).size(px(20.0)))
                 .child(
-                    consultation_card(self.controls.clone())
+                    consultation_card(self.controls.clone(), "consultation-card")
                         .children(self.controls.iter().enumerate().map(|(index, focus)| {
                             div()
                                 .id(index)

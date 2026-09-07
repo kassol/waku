@@ -3675,6 +3675,7 @@ impl Waku {
         } else { None };
 
         let task_details = self.render_managed_task_details(cx);
+        let decision_entry = self.render_decision_entry(cx);
 
         let usage_meter = self.render_usage_meter(cx);
         let steward_wait = self
@@ -3736,6 +3737,7 @@ impl Waku {
                     .children(begin_task)
                     .children(retry_cleanup)
                     .children(task_details)
+                    .children(decision_entry)
                     .child(div().flex_1())
                     .children(usage_meter)
                     .children(steward_wait)

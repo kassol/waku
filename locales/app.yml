@@ -2299,3 +2299,38 @@ task_workspace.invalid_cleanup:
   en: "The daemon returned an invalid cleanup response."
 task_workspace.invalid_response:
   en: "The daemon returned an invalid task workspace response."
+
+decisions.open:
+  en: "Decisions"
+decisions.invalid_response:
+  en: "The daemon returned an invalid decision response."
+decisions.waiting_manager:
+  en: "Waiting for manager"
+decisions.waiting_user:
+  en: "Waiting for user"
+decisions.pending_receipt:
+  en: "Awaiting receipt"
+decisions.resolved:
+  en: "Resolved"
+decisions.failed:
+  en: "Failed"
+decisions.invalidated:
+  en: "Invalidated"
+decisions.context:
+  en: "Context: %{value}"
+decisions.recommendation:
+  en: "Recommendation: %{value}"
+decisions.blocked_work:
+  en: "Blocked work: %{value}"
+decisions.decision:
+  en: "Decision: %{value}"
+decisions.reason:
+  en: "Reason: %{value}"
+decisions.loading:
+  en: "Loading…"
+decisions.empty:
+  en: "No decision requests."
+decisions.snapshot:
+  en: "Saved records. Refresh to check for updates."
+decisions.refresh_failed:
+  en: "Refresh failed. The displayed records may be outdated."

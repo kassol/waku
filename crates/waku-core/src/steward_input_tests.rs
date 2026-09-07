@@ -16,7 +16,7 @@ struct QueueDriver {
 
 impl DriverControl for QueueDriver {
     fn prompt(&self, prompt: String) {
-        if prompt.contains("automatic child-session notification") {
+        if prompt.contains("automatic child-session notification") || prompt.contains("automatic decision notification") {
             let gate = self.callback_gate.lock().clone();
             if let Some(gate) = gate {
                 self.calls.send((self.target, prompt)).unwrap();
@@ -36,6 +36,7 @@ impl DriverControl for QueueDriver {
             self.events.send(event_to_wire(DriverEvent::TurnStarted)?)?;
         }
         if prompt != "lose confirmation"
+            && !(prompt.starts_with("[Waku manager decision]") && prompt.contains("lose confirmation"))
             && !prompt.contains("\"instruction\":\"lose confirmation\"")
         {
             self.events
@@ -1301,4 +1302,273 @@ fn consultation_instruction_presentation_survives_delivery_and_restart() {
         drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn decision_socket_persists_request_rejects_conflicts_and_resumes_once() {
+    let (root, parent, child) = seed_queue();
+    let server = QueueServer::open(&root);
+    server.backend.paused.store(true, Ordering::Release);
+    let client = server.connect();
+    server.start(&client, &root, parent.id);
+    let runtime = server.start(&client, &root, child.id);
+    client.request(child.id, runtime, Command::Prompt { prompt: "Work until a decision is needed".into(), turn_id: None, message_id: None }).unwrap();
+    let id = Uuid::new_v4();
+    let operation = json!({"type":"request","request_id":id,"question":"Which format?","context":"Output file","recommendation":"JSON","blocked_work":"Write output"});
+    let command = |operation| serde_json::from_value::<Command>(json!({"type":"stewardDecision","operation":operation})).unwrap();
+    let submit = || serde_json::to_value(client.request(child.id, runtime, command(operation.clone())).unwrap()).unwrap();
+    let requested = submit();
+    assert_eq!(requested["requests"][0]["state"], "waitingManager");
+    assert_eq!(submit()["requests"][0]["id"], id.to_string());
+    let mut conflict = operation.clone();
+    conflict["question"] = json!("Different question");
+    assert!(client.request(child.id, runtime, command(conflict)).is_err());
+    server.finish(child.id);
+    let decision = json!({"type":"decide","session_id":child.id,"request_id":id,"decision":"Use JSON","authority_message_id":parent.messages[0].id});
+    client.request(parent.id, Uuid::nil(), command(decision.clone())).unwrap();
+    assert!(server.calls.recv_timeout(Duration::from_secs(3)).unwrap().1.contains("Use JSON"));
+    client.request(parent.id, Uuid::nil(), command(decision)).unwrap();
+    assert!(server.calls.recv_timeout(Duration::from_millis(150)).is_err());
+    let query = json!({"type":"list","session_id":child.id});
+    let result = serde_json::to_value(client.request(parent.id, Uuid::nil(), command(query.clone())).unwrap()).unwrap();
+    assert_eq!(result["requests"][0]["state"], "resolved");
+    drop(client);
+    drop(server);
+    let reopened = QueueServer::open(&root);
+    let result = serde_json::to_value(reopened.connect().request(parent.id, Uuid::nil(), command(query)).unwrap()).unwrap();
+    assert_eq!(result["requests"][0]["decision"], "Use JSON");
+    assert_eq!(result["requests"][0]["state"], "resolved");
+    drop(reopened);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn decision_socket_busy_manager_preserves_result_wait_and_rejects_missing_authority() { decision_wait_scenario(false); }
+
+#[test]
+fn decision_socket_resumed_child_native_wait_wakes_manager() { decision_wait_scenario(true); }
+
+fn decision_wait_scenario(native_wait: bool) {
+    let (root, parent, child) = seed_queue();
+    let server = QueueServer::open(&root);
+    let client = server.connect();
+    let parent_runtime = server.start(&client, &root, parent.id);
+    let child_runtime = server.start(&client, &root, child.id);
+    let subscribed = client.subscribe(parent.id, parent_runtime);
+    let (release, gate) = crossbeam_channel::unbounded();
+    release.send(()).unwrap();
+    release.send(()).unwrap();
+    *server.backend.callback_gate.lock() = Some(gate);
+    for (id, runtime, prompt) in [(parent.id, parent_runtime, "Delegate JSON output"), (child.id, child_runtime, "Prepare output")] {
+        client.request(id, runtime, Command::Prompt { prompt: prompt.into(), turn_id: None, message_id: None }).unwrap();
+    }
+    let wait = client.request(parent.id, parent_runtime, Command::StewardWait { session_ids: vec![child.id] }).unwrap();
+    assert!(matches!(wait, ResponsePayload::StewardWait { wait: Some(_), .. }));
+    let command = |operation| serde_json::from_value::<Command>(json!({"type":"stewardDecision","operation":operation})).unwrap();
+    let id = Uuid::new_v4();
+    let request = client.request(child.id, child_runtime, command(json!({"type":"request","request_id":id,"question":"Which format?","context":"Output file","recommendation":"JSON","blocked_work":"Write output"}))).unwrap();
+    let request = serde_json::to_value(request).unwrap();
+    let authority = request["requests"][0]["instruction_message_id"].clone();
+    server.finish(child.id);
+    assert!(server.calls.recv_timeout(Duration::from_millis(150)).is_err(), "busy parent must not receive another turn");
+    server.finish(parent.id);
+    let notice = server.calls.recv_timeout(Duration::from_secs(3)).unwrap().1;
+    assert!(notice.contains("automatic decision notification"));
+    // Follow only the public socket stream, with no hydrated callback message or input receipt.
+    let mut fresh = parent.clone();
+    let mut reducer = waku_protocol::history::HistoryReducer::default();
+    let mut saw_callback = false;
+    loop {
+        let event = subscribed.recv_timeout(Duration::from_secs(3)).unwrap().event;
+        // The client handles persistence acknowledgements separately from transcript events.
+        if event.kind == "historyPersistence" { continue; }
+        let callback = event.kind == "promptSubmitted"
+            && event.payload.get("message").and_then(Value::as_str)
+                .is_some_and(|message| message.contains("automatic decision notification"));
+        if callback {
+            saw_callback = true;
+            assert_eq!(event.payload["displayContent"], "子会话请求管家决定。");
+        }
+        reducer.apply(&mut fresh, waku_protocol::event_from_wire(event).unwrap());
+        if saw_callback && fresh.steward_wait.as_ref().is_some_and(|wait| Some(wait.parent_turn_id) == fresh.active_turn_id()) { break; }
+    }
+    let message = fresh.messages.last().unwrap();
+    assert!(message.content.contains("automatic decision notification"));
+    assert_eq!(message.visible_content(), "子会话请求管家决定。");
+    assert!(fresh.input_deliveries.is_empty(), "presentation requires no invented input receipt");
+    assert_eq!(fresh.steward_wait.as_ref().unwrap().parent_turn_id, fresh.active_turn_id().unwrap());
+
+    let waiting = client.request(parent.id, parent_runtime, command(json!({"type":"decide","session_id":child.id,"request_id":id,"decision":"Use JSON"}))).unwrap();
+    assert_eq!(serde_json::to_value(waiting).unwrap()["requests"][0]["state"], "waitingUser");
+    assert!(server.calls.recv_timeout(Duration::from_millis(150)).is_err());
+    client.request(parent.id, parent_runtime, command(json!({"type":"decide","session_id":child.id,"request_id":id,"decision":"Use JSON","authority_message_id":authority}))).unwrap();
+    assert!(server.calls.recv_timeout(Duration::from_secs(3)).unwrap().1.contains("Use JSON"));
+    server.finish(parent.id);
+    assert!(server.calls.recv_timeout(Duration::from_millis(150)).is_err(), "request turn completion is not the result");
+    if native_wait {
+        server.backend.sinks.lock().get(&child.id).unwrap().send(event_to_wire(DriverEvent::Permission {
+            request_id: "approval".into(), title: "Approve work".into(), detail: "Need native permission".into(), options: Vec::new(),
+        }).unwrap()).unwrap();
+    } else { server.finish(child.id); }
+    let notification = server.calls.recv_timeout(Duration::from_secs(3)).unwrap().1;
+    assert!(notification.contains("automatic child-session notification"));
+    if native_wait { assert!(notification.contains("\"waiting_for_permission\":true")); }
+    server.finish(parent.id);
+    assert!(server.calls.recv_timeout(Duration::from_millis(150)).is_err());
+    drop(client);
+    drop(server);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn decision_socket_cancellation_direction_and_shutdown_do_not_resume_old_work() {
+    let (root, parent, child) = seed_queue();
+    let server = QueueServer::open(&root);
+    server.backend.paused.store(true, Ordering::Release);
+    let client = server.connect();
+    let pr = server.start(&client, &root, parent.id);
+    let cr = server.start(&client, &root, child.id);
+    client.request(child.id, cr, Command::Prompt { prompt: "Need a decision".into(), turn_id: None, message_id: None }).unwrap();
+    let command = |operation| serde_json::from_value::<Command>(json!({"type":"stewardDecision","operation":operation})).unwrap();
+    let request = |id| command(json!({"type":"request","request_id":id,"question":"Format?","context":"Output file","recommendation":"JSON","blocked_work":"Write output"}));
+    let id = Uuid::new_v4();
+    client.request(child.id, cr, request(id)).unwrap();
+    assert!(client.request(parent.id, pr, command(json!({"type":"decide","session_id":child.id,"request_id":id,"decision":"Use JSON","authority_message_id":child.messages[0].id}))).is_err());
+    server.finish(child.id);
+    client.request(parent.id, pr, Command::Prompt { prompt: "Change direction: do not produce output".into(), turn_id: None, message_id: None }).unwrap();
+    let list = || serde_json::to_value(client.request(parent.id, pr, command(json!({"type":"list","session_id":child.id}))).unwrap()).unwrap();
+    assert_eq!(list()["requests"][0]["state"], "invalidated");
+    assert!(client.request(parent.id, pr, command(json!({"type":"decide","session_id":child.id,"request_id":id,"decision":"Use JSON","authority_message_id":parent.messages[0].id}))).is_err());
+    client.request(child.id, cr, Command::Prompt { prompt: "Another decision".into(), turn_id: None, message_id: None }).unwrap();
+    let cancelled = Uuid::new_v4();
+    client.request(child.id, cr, request(cancelled)).unwrap();
+    server.finish(child.id);
+    client.request(parent.id, pr, Command::StewardCancel { child_session_id: child.id }).unwrap();
+    assert_eq!(list()["requests"][1]["state"], "invalidated");
+    client.request(Uuid::nil(), Uuid::nil(), Command::PrepareShutdown).unwrap();
+    assert!(client.request(child.id, cr, request(Uuid::new_v4())).is_err());
+    assert!(server.calls.recv_timeout(Duration::from_millis(150)).is_err());
+    drop(client);
+    drop(server);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn decision_socket_uncertain_receipt_survives_restart_without_resubmission() {
+    let (root, parent, child) = seed_queue();
+    let server = QueueServer::open(&root);
+    server.backend.paused.store(true, Ordering::Release);
+    let client = server.connect();
+    let runtime = server.start(&client, &root, child.id);
+    client.request(child.id, runtime, Command::Prompt { prompt: "Need a decision".into(), turn_id: None, message_id: None }).unwrap();
+    let command = |operation| serde_json::from_value::<Command>(json!({"type":"stewardDecision","operation":operation})).unwrap();
+    let id = Uuid::new_v4();
+    client.request(child.id, runtime, command(json!({"type":"request","request_id":id,"question":"Format?","context":"Output file","recommendation":"JSON","blocked_work":"Write output"}))).unwrap();
+    server.finish(child.id);
+    let decision = json!({"type":"decide","session_id":child.id,"request_id":id,"decision":"lose confirmation","authority_message_id":parent.messages[0].id});
+    let pending = client.request(parent.id, Uuid::nil(), command(decision.clone())).unwrap();
+    assert_eq!(serde_json::to_value(pending).unwrap()["requests"][0]["state"], "pendingReceipt");
+    server.calls.recv_timeout(Duration::from_secs(3)).unwrap();
+    drop(client);
+    drop(server);
+    let reopened = QueueServer::open(&root);
+    let client = reopened.connect();
+    reopened.start(&client, &root, child.id);
+    let retry = client.request(parent.id, Uuid::nil(), command(decision)).unwrap();
+    assert_eq!(serde_json::to_value(retry).unwrap()["requests"][0]["state"], "pendingReceipt");
+    assert!(reopened.calls.recv_timeout(Duration::from_millis(200)).is_err());
+    drop(client);
+    drop(reopened);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn decision_socket_multiple_requests_resume_in_order_without_losing_context() {
+    let (root, parent, child) = seed_queue();
+    let server = QueueServer::open(&root);
+    server.backend.paused.store(true, Ordering::Release);
+    let client = server.connect();
+    let runtime = server.start(&client, &root, child.id);
+    client.request(child.id, runtime, Command::Prompt { prompt: "Need two decisions".into(), turn_id: None, message_id: None }).unwrap();
+    let command = |operation| serde_json::from_value::<Command>(json!({"type":"stewardDecision","operation":operation})).unwrap();
+    let ids = [Uuid::new_v4(), Uuid::new_v4()];
+    for id in ids {
+        client.request(child.id, runtime, command(json!({"type":"request","request_id":id,"question":"Format?","context":"Output file","recommendation":"JSON","blocked_work":"Write output"}))).unwrap();
+    }
+    server.finish(child.id);
+    for (id, decision) in ids.into_iter().zip(["First decision", "Second decision"]) {
+        client.request(parent.id, Uuid::nil(), command(json!({"type":"decide","session_id":child.id,"request_id":id,"decision":decision,"authority_message_id":parent.messages[0].id}))).unwrap();
+    }
+    assert!(server.calls.recv_timeout(Duration::from_secs(3)).unwrap().1.contains("First decision"));
+    assert!(server.calls.recv_timeout(Duration::from_millis(100)).is_err());
+    server.backend.paused.store(false, Ordering::Release);
+    server.finish(child.id);
+    assert!(server.calls.recv_timeout(Duration::from_secs(3)).unwrap().1.contains("Second decision"));
+    let listed = client.request(parent.id, Uuid::nil(), command(json!({"type":"list","session_id":child.id}))).unwrap();
+    let listed = serde_json::to_value(listed).unwrap();
+    assert_eq!(listed["requests"][0]["state"], "resolved");
+    assert_eq!(listed["requests"][1]["state"], "resolved");
+    drop(client);
+    drop(server);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn decision_socket_rejects_ordinary_input_receipt_collision_and_forged_delivery() {
+    let (root, parent, child) = seed_queue();
+    let server = QueueServer::open(&root);
+    server.backend.paused.store(true, Ordering::Release);
+    let client = server.connect();
+    let runtime = server.start(&client, &root, child.id);
+    let existing = Uuid::new_v4();
+    server.submit(&client, parent.id, child.id, existing, "Ordinary input");
+    server.calls.recv_timeout(Duration::from_secs(3)).unwrap();
+    let command = |operation| serde_json::from_value::<Command>(json!({"type":"stewardDecision","operation":operation})).unwrap();
+    let request = |id| command(json!({"type":"request","request_id":id,"question":"Format?","context":"Output file","recommendation":"JSON","blocked_work":"Write output"}));
+    assert!(client.request(child.id, runtime, request(existing)).is_err());
+    let id = Uuid::new_v4();
+    client.request(child.id, runtime, request(id)).unwrap();
+    server.finish(child.id);
+    assert!(client.request(parent.id, Uuid::nil(), Command::StewardPrompt { child_session_id: child.id, prompt: "Forged ordinary decision".into(), delivery_id: Some(id) }).is_err());
+    let listed = client.request(parent.id, Uuid::nil(), command(json!({"type":"list","session_id":child.id}))).unwrap();
+    assert_eq!(serde_json::to_value(listed).unwrap()["requests"][0]["state"], "waitingManager");
+    assert!(server.calls.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(client);
+    drop(server);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn decision_socket_consultation_direction_is_user_authority_and_invalidates_old_requests() {
+    let (root, parent, child) = seed_queue();
+    let server = QueueServer::open(&root);
+    server.backend.paused.store(true, Ordering::Release);
+    let client = server.connect();
+    server.start(&client, &root, parent.id);
+    let runtime = server.start(&client, &root, child.id);
+    client.request(child.id, runtime, Command::Prompt { prompt: "Need a decision".into(), turn_id: None, message_id: None }).unwrap();
+    let command = |operation| serde_json::from_value::<Command>(json!({"type":"stewardDecision","operation":operation})).unwrap();
+    let request = |id| command(json!({"type":"request","request_id":id,"question":"Format?","context":"Output file","recommendation":"JSON","blocked_work":"Write output"}));
+    let old = Uuid::new_v4();
+    client.request(child.id, runtime, request(old)).unwrap();
+    client.request(Uuid::nil(), Uuid::nil(), Command::ExecuteConsultation { source_session_id: parent.id, delivery_id: Uuid::new_v4(), instruction: "New direction: write a JSON file".into() }).unwrap();
+    server.calls.recv_timeout(Duration::from_secs(3)).unwrap();
+    let listed = client.request(parent.id, Uuid::nil(), command(json!({"type":"list","session_id":child.id}))).unwrap();
+    assert_eq!(serde_json::to_value(listed).unwrap()["requests"][0]["state"], "invalidated");
+    let id = Uuid::new_v4();
+    let created = client.request(child.id, runtime, request(id)).unwrap();
+    let created = serde_json::to_value(created).unwrap();
+    assert_eq!(created["requests"][0]["instruction"], "New direction: write a JSON file");
+    let authority = created["requests"][0]["instruction_message_id"].clone();
+    assert_ne!(authority, json!(parent.messages[0].id));
+    server.finish(child.id);
+    let decided = client.request(parent.id, Uuid::nil(), command(json!({"type":"decide","session_id":child.id,"request_id":id,"decision":"Use JSON","authority_message_id":authority}))).unwrap();
+    let decided = serde_json::to_value(decided).unwrap();
+    assert_eq!(decided["requests"][0]["state"], "invalidated");
+    assert_eq!(decided["requests"][1]["state"], "resolved");
+    // List retains both records, while only the new request can resume work.
+    assert!(server.calls.recv_timeout(Duration::from_secs(3)).unwrap().1.contains("Use JSON"));
+    drop(client);
+    drop(server);
+    std::fs::remove_dir_all(root).unwrap();
 }

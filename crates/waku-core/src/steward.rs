@@ -169,6 +169,9 @@ impl WakuBackend {
             completed_at: turn.completed_at,
         });
         let mut waiting_for = Vec::new();
+        if session.decision_requests.iter().any(|r| matches!(super::steward_decision::decision_projection(session, r).state, crate::model::DecisionState::WaitingManager | crate::model::DecisionState::WaitingUser | crate::model::DecisionState::PendingReceipt)) {
+            waiting_for.push(ChildWaitingReason::ManagerDecision);
+        }
         if session.pending_permission.is_some() {
             waiting_for.push(ChildWaitingReason::Permission);
         }
@@ -398,8 +401,10 @@ impl WakuBackend {
             if let Some(id) = delivery_id {
                 let delivery = child.input_deliveries.iter().find(|d| d.id == id).cloned()
                     .ok_or_else(|| anyhow!("saved input is unavailable"))?;
+                let display_content = delivery.display_content.clone();
                 child_events.send(event_to_wire(DriverEvent::InputDeliveryChanged(delivery))?)?;
                 child_events.send(event_to_wire(DriverEvent::PromptSubmitted {
+                    display_content,
                     message: prompt.clone(), turn_id, message_id,
                 })?)?;
                 child_events.send(event_to_wire(DriverEvent::InputDeliveryOutcome(crate::model::InputDeliveryOutcome {
@@ -457,6 +462,7 @@ impl WakuBackend {
         let child = self
             .authorized_child(&mut self.task_state.lock(), parent_id, child_id, events)?
             .0;
+        self.cancel_decisions(child_id)?;
         let accepted = child.active_turn_id().is_some();
         if accepted && child.cancellation_requested_turn_id != child.active_turn_id() {
             let (runtime_id, driver) = self

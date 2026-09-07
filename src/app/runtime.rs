@@ -133,6 +133,7 @@ pub(super) fn merge_remote_session_catalog(
             local.auto_title = remote.auto_title;
             local.project_id = remote.project_id;
             local.parent_session_id = remote.parent_session_id;
+            local.decision_requests = remote.decision_requests;
             if local.apply_managed_workspace(remote.managed_workspace)
                 && local.managed_workspace.is_some()
             {

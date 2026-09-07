@@ -113,6 +113,22 @@ impl WakuBackend {
                     delivery: Some(existing.clone()),
                 });
             }
+            // Recheck decision authority while the same target lock and state transaction
+            // that save its delivery are held. A cancellation or new user instruction
+            // between scheduling and submission must not restart obsolete work.
+            if let Some(request) = session.decision_requests.iter().find(|r| r.id == id) {
+                if request.parent_session_id != caller
+                    || super::steward_decision::decision_projection(&session, request).state != crate::model::DecisionState::PendingReceipt
+                    || prompt != super::steward_decision::decision_prompt(request)
+                { bail!("Decision request is not eligible for delivery"); }
+                let parent = state.sessions.iter_mut().find(|s| s.id == caller).ok_or_else(|| anyhow!("Manager unavailable"))?;
+                self.task_store.hydrate(parent)?;
+                if parent.cancellation_requested_turn_id.is_some()
+                    || super::steward_decision::manager_instruction_pending(parent)
+                    || request.authority_message_id.is_none()
+                    || super::steward_decision::manager_instruction(parent).map(|m| m.id) != request.authority_message_id
+                { bail!("Decision authority changed before delivery"); }
+            }
             if session.cancellation_requested_turn_id.is_some() {
                 bail!("session cancellation has not settled");
             }
