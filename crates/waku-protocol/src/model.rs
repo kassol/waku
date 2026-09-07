@@ -971,6 +971,20 @@ pub enum DecisionState {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionOption {
+    pub label: String,
+    pub impact: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct DecisionEscalation {
+    pub reason: String,
+    pub options: Vec<DecisionOption>,
+    pub impact: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct DecisionRequest {
     pub id: Uuid,
     pub parent_session_id: Uuid,
@@ -987,11 +1001,18 @@ pub struct DecisionRequest {
     pub authority_message_id: Option<Uuid>,
     pub reason: Option<String>,
     pub notified: bool,
+    #[serde(default)]
+    pub escalation: Option<DecisionEscalation>,
+    #[serde(default)]
+    pub upstream_request_id: Option<Uuid>,
+    #[serde(default)]
+    pub user_answer: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum StewardDecisionOperation {
+    Escalate { session_id: Uuid, request_id: Uuid, reason: String, options: Vec<DecisionOption>, impact: String },
     Request { request_id: Uuid, question: String, context: String, recommendation: String, blocked_work: String },
     List { session_id: Option<Uuid> },
     Decide { session_id: Uuid, request_id: Uuid, decision: String, authority_message_id: Option<Uuid> },

@@ -40,7 +40,7 @@ impl WakuBackend {
                     .turns
                     .last()
                     .ok_or_else(|| anyhow!("child has no turn to wait for"))?;
-                let blocked = child.decision_requests.iter().any(|r| matches!(super::steward_decision::decision_projection(&child, r).state, crate::model::DecisionState::WaitingManager | crate::model::DecisionState::WaitingUser | crate::model::DecisionState::PendingReceipt));
+                let blocked = child.steward_wait.is_some() || child.decision_requests.iter().any(|r| matches!(super::steward_decision::decision_projection(&child, r).state, crate::model::DecisionState::WaitingManager | crate::model::DecisionState::WaitingUser | crate::model::DecisionState::PendingReceipt));
                 ready |= !blocked && (turn.status != TurnStatus::Running
                     || child.pending_permission.is_some()
                     || child.pending_user_input.is_some());
@@ -179,7 +179,7 @@ impl WakuBackend {
             for target in &wait.targets {
                 let (child, _) =
                     self.authorized_child(&mut state, parent_id, target.session_id, events)?;
-                if child.decision_requests.iter().any(|r| matches!(super::steward_decision::decision_projection(&child, r).state, crate::model::DecisionState::WaitingManager | crate::model::DecisionState::WaitingUser | crate::model::DecisionState::PendingReceipt)) { continue; }
+                if child.steward_wait.is_some() || child.decision_requests.iter().any(|r| matches!(super::steward_decision::decision_projection(&child, r).state, crate::model::DecisionState::WaitingManager | crate::model::DecisionState::WaitingUser | crate::model::DecisionState::PendingReceipt)) { continue; }
                 // A decision resumes the same logical task in a new provider turn.
                 let resumed = child.decision_requests.iter().any(|r| r.turn_id == target.turn_id);
                 let expected_turn = if resumed { child.turns.last().map(|t| t.id).unwrap_or(target.turn_id) } else { target.turn_id };

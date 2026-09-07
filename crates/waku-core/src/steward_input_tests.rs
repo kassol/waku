@@ -1572,3 +1572,147 @@ fn decision_socket_consultation_direction_is_user_authority_and_invalidates_old_
     drop(server);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn decision_user_answer_socket_is_saved_and_resumes_only_its_request() { decision_user_answer_scenario(false); }
+
+#[test]
+fn decision_user_answer_socket_uncertain_receipt_is_not_replayed_on_restart() { decision_user_answer_scenario(true); }
+
+fn decision_user_answer_scenario(uncertain: bool) {
+    let answer_text = if uncertain { "lose confirmation" } else { "Add the report" };
+    let expected_state = if uncertain { "pendingReceipt" } else { "resolved" };
+    let (root, parent, child) = seed_queue();
+    let server = QueueServer::open(&root);
+    server.backend.paused.store(true, Ordering::Release);
+    let client = server.connect();
+    let runtime = server.start(&client, &root, child.id);
+    client.request(child.id, runtime, Command::Prompt { prompt: "Need user decisions".into(), turn_id: None, message_id: None }).unwrap();
+    let command = |value| serde_json::from_value::<Command>(value).unwrap();
+    let operation = |value| command(json!({"type":"stewardDecision","operation":value}));
+    let ids = [Uuid::new_v4(), Uuid::new_v4()];
+    for id in ids {
+        client.request(child.id, runtime, operation(json!({"type":"request","request_id":id,"question":"Expand scope?","context":"Original task excludes a report","recommendation":"Add report","blocked_work":"Report generation"}))).unwrap();
+        client.request(parent.id, Uuid::nil(), operation(json!({"type":"escalate","session_id":child.id,"request_id":id,"reason":"Additional scope requires approval","options":[{"label":"Add report","impact":"Additional file"},{"label":"Keep scope","impact":"No report"}],"impact":"Changes output scope"}))).unwrap();
+    }
+    server.finish(child.id);
+    let answer = json!({"type":"answerDecision","childSessionId":child.id,"requestId":ids[0],"answer":answer_text});
+    let answered = client.request(parent.id, Uuid::nil(), command(answer.clone())).unwrap();
+    let answered = serde_json::to_value(answered).unwrap();
+    assert_eq!(answered["requests"][0]["user_answer"], answer_text);
+    assert_eq!(answered["requests"][0]["state"], expected_state);
+    assert_eq!(answered["requests"][1]["state"], "waitingUser");
+    assert!(server.calls.recv_timeout(Duration::from_secs(3)).unwrap().1.contains(answer_text));
+    client.request(parent.id, Uuid::nil(), command(answer)).unwrap();
+    assert!(server.calls.recv_timeout(Duration::from_millis(100)).is_err());
+    assert!(client.request(parent.id, Uuid::nil(), command(json!({"type":"answerDecision","childSessionId":child.id,"requestId":ids[0],"answer":"Different answer"}))).is_err());
+    client.request(Uuid::nil(), Uuid::nil(), Command::SaveTaskState { projects: Vec::new(), live_session_ids: Vec::new(), sessions: vec![parent.clone()] }).unwrap();
+    let history = client.request(Uuid::nil(), Uuid::nil(), Command::HydrateSession { session_id: parent.id }).unwrap();
+    let history = serde_json::to_value(history).unwrap();
+    assert!(history["session"]["messages"].as_array().unwrap().iter().any(|m| m["role"] == "user" && m["content"] == answer_text));
+    drop(client);
+    drop(server);
+    let reopened = QueueServer::open(&root);
+    let listed = reopened.connect().request(parent.id, Uuid::nil(), operation(json!({"type":"list","session_id":child.id}))).unwrap();
+    let listed = serde_json::to_value(listed).unwrap();
+    assert_eq!(listed["requests"][0]["user_answer"], answer_text);
+    assert_eq!(listed["requests"][1]["state"], "waitingUser");
+    drop(reopened);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn decision_user_answer_socket_follows_two_managers_and_preserves_final_results() { decision_escalation_scenario(false); }
+
+#[test]
+fn decision_user_answer_socket_root_cancellation_invalidates_the_entire_chain() { decision_escalation_scenario(true); }
+
+fn decision_escalation_scenario(cancel: bool) {
+    let (root, parent, manager) = seed_queue();
+    let mut leaf = AgentSession::new(parent.project_id, ProviderKind::Codex);
+    leaf.parent_session_id = Some(manager.id);
+    leaf.runtime_mode = RuntimeMode::FullAccess;
+    leaf.begin_turn("Leaf task");
+    leaf.finish_active_turn(crate::model::TurnStatus::Completed);
+    let store = StateStore::daemon(root.join("state.db"));
+    let mut state = store.load().unwrap();
+    state.sessions.push(leaf.clone()); state.mark_session_dirty(leaf.id); store.save(&mut state).unwrap();
+    let server = QueueServer::open(&root);
+    let client = server.connect();
+    let (release, gate) = crossbeam_channel::unbounded();
+    for _ in 0..3 { release.send(()).unwrap(); }
+    *server.backend.callback_gate.lock() = Some(gate);
+    let pr = server.start(&client, &root, parent.id);
+    let mr = server.start(&client, &root, manager.id);
+    let lr = server.start(&client, &root, leaf.id);
+    for (id, runtime, prompt) in [(parent.id,pr,"Delegate task"),(manager.id,mr,"Delegate leaf work"),(leaf.id,lr,"Prepare work")] {
+        client.request(id, runtime, Command::Prompt { prompt: prompt.into(), turn_id: None, message_id: None }).unwrap();
+    }
+    let operation = |value| serde_json::from_value::<Command>(json!({"type":"stewardDecision","operation":value})).unwrap();
+    let id = Uuid::new_v4();
+    client.request(leaf.id, lr, operation(json!({"type":"request","request_id":id,"question":"Expand scope?","context":"Report excluded","recommendation":"Add report","blocked_work":"Write report"}))).unwrap();
+    let escalation = |child,id| operation(json!({"type":"escalate","session_id":child,"request_id":id,"reason":"New scope","options":[{"label":"Add","impact":"Extra file"},{"label":"Skip","impact":"Keep scope"}],"impact":"Additional output"}));
+    let forwarded = client.request(manager.id, mr, escalation(leaf.id,id)).unwrap();
+    let upstream: Uuid = serde_json::from_value(serde_json::to_value(forwarded).unwrap()["requests"][0]["upstream_request_id"].clone()).unwrap();
+    assert!(client.request(parent.id,pr,escalation(leaf.id,id)).is_err(), "manager cannot skip a layer");
+    client.request(parent.id,pr,escalation(manager.id,upstream)).unwrap();
+    server.finish(leaf.id); server.finish(manager.id);
+    if cancel {
+        client.request(parent.id,pr,Command::Cancel).unwrap();
+        assert!(client.request(parent.id, pr, Command::AnswerDecision { child_session_id: manager.id, request_id: upstream, answer: "Add the report".into() }).is_err());
+        let listed = client.request(manager.id, mr, operation(json!({"type":"list","session_id":leaf.id}))).unwrap();
+        assert_eq!(serde_json::to_value(listed).unwrap()["requests"][0]["state"], "invalidated");
+        assert!(server.calls.recv_timeout(Duration::from_millis(150)).is_err());
+        // Historical invalidation must not erase a fresh wait on the same child.
+        client.request(manager.id, mr, Command::Prompt { prompt: "New assignment".into(), turn_id: None, message_id: None }).unwrap();
+        client.request(leaf.id, lr, Command::Prompt { prompt: "New work".into(), turn_id: None, message_id: None }).unwrap();
+        client.request(manager.id, mr, Command::StewardWait { session_ids: vec![leaf.id] }).unwrap();
+        client.request(manager.id, mr, operation(json!({"type":"list","session_id":leaf.id}))).unwrap();
+        let ResponsePayload::Session { session: Some(session) } = client.request(manager.id, mr, Command::HydrateSession { session_id: manager.id }).unwrap() else { panic!("history") };
+        assert!(session.steward_wait.is_some(), "old invalidation must preserve the new result wait");
+        drop(client); drop(server); std::fs::remove_dir_all(root).unwrap();
+        return;
+    }
+    let answered = client.request(parent.id, pr, Command::AnswerDecision { child_session_id: manager.id, request_id: upstream, answer: "Add the report".into() }).unwrap();
+    assert_eq!(serde_json::to_value(answered).unwrap()["requests"][0]["state"], "resolved");
+    let delivered = server.calls.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(delivered.0, leaf.id); assert!(delivered.1.contains("Add the report"));
+    server.finish(parent.id);
+    assert!(server.calls.recv_timeout(Duration::from_millis(150)).is_err(), "intermediate question completion must not consume the root's result wait");
+    server.finish(leaf.id);
+    let manager_notice = server.calls.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(manager_notice.0, manager.id);
+    server.finish(manager.id);
+    let root_notice = server.calls.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(root_notice.0, parent.id);
+    assert!(root_notice.1.contains("automatic child-session notification"));
+    drop(client); drop(server); std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn decision_nested_manager_reuses_only_confirmed_user_authority() {
+    let (root, parent, manager) = seed_queue();
+    let mut leaf = AgentSession::new(parent.project_id, ProviderKind::Codex);
+    leaf.parent_session_id = Some(manager.id); leaf.runtime_mode = RuntimeMode::FullAccess;
+    leaf.begin_turn("Leaf task"); leaf.finish_active_turn(crate::model::TurnStatus::Completed);
+    let store = StateStore::daemon(root.join("state.db"));
+    let mut state = store.load().unwrap(); state.sessions.push(leaf.clone()); state.mark_session_dirty(leaf.id); store.save(&mut state).unwrap();
+    let server = QueueServer::open(&root); server.backend.paused.store(true, Ordering::Release);
+    let client = server.connect();
+    let mr = server.start(&client,&root,manager.id); let lr = server.start(&client,&root,leaf.id);
+    for (id,runtime) in [(manager.id,mr),(leaf.id,lr)] { client.request(id,runtime,Command::Prompt {prompt:"Need clarification".into(),turn_id:None,message_id:None}).unwrap(); }
+    let operation = |value| serde_json::from_value::<Command>(json!({"type":"stewardDecision","operation":value})).unwrap();
+    let source = Uuid::new_v4(); let target = Uuid::new_v4();
+    for (session,runtime,id) in [(manager.id,mr,source),(leaf.id,lr,target)] { client.request(session,runtime,operation(json!({"type":"request","request_id":id,"question":"Format?","context":"Original deliverable","recommendation":"JSON","blocked_work":"Write output"}))).unwrap(); }
+    server.finish(leaf.id);
+    let delegated = client.request(manager.id,mr,operation(json!({"type":"list","session_id":leaf.id}))).unwrap();
+    let fake_authority = serde_json::to_value(delegated).unwrap()["requests"][0]["instruction_message_id"].clone();
+    assert!(client.request(manager.id,mr,operation(json!({"type":"decide","session_id":leaf.id,"request_id":target,"decision":"Use JSON","authority_message_id":fake_authority}))).is_err());
+    server.finish(manager.id);
+    client.request(parent.id,Uuid::nil(),operation(json!({"type":"decide","session_id":manager.id,"request_id":source,"decision":"Use JSON within the delegated task","authority_message_id":parent.messages[0].id}))).unwrap();
+    assert_eq!(server.calls.recv_timeout(Duration::from_secs(3)).unwrap().0,manager.id);
+    let decided = client.request(manager.id,mr,operation(json!({"type":"decide","session_id":leaf.id,"request_id":target,"decision":"Use JSON","authority_message_id":parent.messages[0].id}))).unwrap();
+    assert_eq!(serde_json::to_value(decided).unwrap()["requests"][0]["state"],"resolved");
+    assert_eq!(server.calls.recv_timeout(Duration::from_secs(3)).unwrap().0,leaf.id);
+    drop(client); drop(server); std::fs::remove_dir_all(root).unwrap();
+}

@@ -41,6 +41,8 @@ export type { CreationWorkspace } from "./CreationWorkspace";
 export type { DaemonReady } from "./DaemonReady";
 export type { DaemonSettings } from "./DaemonSettings";
 export type { DaySlice } from "./DaySlice";
+export type { DecisionEscalation } from "./DecisionEscalation";
+export type { DecisionOption } from "./DecisionOption";
 export type { DecisionRequest } from "./DecisionRequest";
 export type { DecisionState } from "./DecisionState";
 export type { FileEntry } from "./FileEntry";

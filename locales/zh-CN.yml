@@ -1142,3 +1142,31 @@ task_workspace.parent: "管家：%{parent}"
 task_workspace.goal: "目标：%{goal}"
 task_workspace.original_branch: "原分支：%{branch}"
 decisions.refresh_failed: "刷新失败，当前显示的记录可能已过期。"
+
+decisions.answer_placeholder: "填写当前问题的答复。"
+
+decisions.escalation_reason: "需要您决定的原因：%{value}"
+
+decisions.option_impact: "%{option} · 影响：%{impact}"
+
+decisions.escalation_impact: "整体影响：%{value}"
+
+decisions.saved_answer: "已保存的用户答复：%{value}"
+
+decisions.previous: "上一项"
+
+decisions.next: "下一项"
+
+decisions.answering: "当前问题：%{question}"
+
+decisions.answer_unconfirmed: "答复接收尚未确认。可刷新状态或重试原答复。"
+
+decisions.answer_saved: "答复已保存，接收状态见上方记录。"
+
+decisions.answer_hint: "答复仅对应当前问题，其他未答问题继续等待。"
+
+decisions.answer_read_only: "此问题当前无需用户答复，可刷新查看状态。"
+
+decisions.retry_answer: "重试原答复"
+
+decisions.send_answer: "提交答复"

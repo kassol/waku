@@ -505,7 +505,9 @@ test('manager decision receipt and callback wait survive shared-client projectio
   const request = { id: 'decision', parent_session_id: 'parent', child_session_id: session.id,
     turn_id: turn, question: 'Format?', context: 'Output', recommendation: 'JSON', blocked_work: 'Write file',
     instruction_message_id: 'instruction', instruction: 'Produce output', state: 'pendingReceipt' as const,
-    decision: 'Use JSON', authority_message_id: 'instruction', reason: null, notified: true }
+    decision: 'Use JSON', authority_message_id: 'instruction', reason: null, notified: true,
+    escalation: { reason: 'Scope expansion', options: [{ label: 'JSON', impact: 'Add file' }], impact: 'Extra work' },
+    upstream_request_id: 'upper-request', user_answer: 'Use JSON' }
   session.decision_requests = [request]
   session.input_deliveries = [{ id: 'decision', caller_session_id: 'parent', target_session_id: session.id,
     prompt: 'Use JSON', display_content: 'Manager decision', turn_id: turn, mode: 'prompt', state: 'uncertain',
@@ -515,7 +517,7 @@ test('manager decision receipt and callback wait survive shared-client projectio
   const cancelled = structuredClone(session)
   cancelled.decision_requests![0]!.state = 'invalidated'
   expect(apply(cancelled, 'inputDeliveryOutcome', { id: 'decision', state: 'received', confirmation: 'transport', reason: null }).decision_requests?.[0]?.state).toBe('invalidated')
-  expect(apply(idleSession(), 'historySnapshot', received).decision_requests?.[0]?.decision).toBe('Use JSON')
+  expect(apply(idleSession(), 'historySnapshot', received).decision_requests?.[0]).toEqual({ ...request, state: 'resolved' })
   const wait = { id: 'results', parent_turn_id: turn, targets: [{ session_id: 'child', turn_id: 'child-turn' }] }
   const callback = apply(session, 'stewardWaitChanged', wait)
   expect(apply(callback, 'promptSubmitted', { message: 'Automatic decision notification', turnId: turn, messageId: 'callback' }).steward_wait).toEqual(wait)

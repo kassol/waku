@@ -121,13 +121,7 @@ impl WakuBackend {
                     || super::steward_decision::decision_projection(&session, request).state != crate::model::DecisionState::PendingReceipt
                     || prompt != super::steward_decision::decision_prompt(request)
                 { bail!("Decision request is not eligible for delivery"); }
-                let parent = state.sessions.iter_mut().find(|s| s.id == caller).ok_or_else(|| anyhow!("Manager unavailable"))?;
-                self.task_store.hydrate(parent)?;
-                if parent.cancellation_requested_turn_id.is_some()
-                    || super::steward_decision::manager_instruction_pending(parent)
-                    || request.authority_message_id.is_none()
-                    || super::steward_decision::manager_instruction(parent).map(|m| m.id) != request.authority_message_id
-                { bail!("Decision authority changed before delivery"); }
+                self.validate_decision_authority(&mut state, request)?;
             }
             if session.cancellation_requested_turn_id.is_some() {
                 bail!("session cancellation has not settled");

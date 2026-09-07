@@ -34,6 +34,8 @@ mod steward_input;
 mod steward_input_tests;
 #[path = "steward.rs"]
 mod steward;
+#[path = "steward_escalation.rs"]
+mod steward_escalation;
 #[path = "steward_decision.rs"]
 mod steward_decision;
 #[path = "steward_wait.rs"]
@@ -523,6 +525,7 @@ impl Backend for WakuBackend {
         let starts_work = matches!(
             request.command,
             Command::CreateSession { .. }
+                | Command::AnswerDecision { .. }
                 | Command::StewardDecision { .. }
                 | Command::StewardWait { .. }
                 | Command::StewardWorkspace { .. }
@@ -697,6 +700,7 @@ impl WakuBackend {
         }
         match request.command {
             Command::StewardWorkspace { operation } => self.steward_workspace(session_id, operation, &events),
+            Command::AnswerDecision { child_session_id, request_id, answer } => self.answer_decision(child_session_id, request_id, answer, &events),
             Command::StewardDecision { operation } => self.steward_decision(session_id, operation, &events),
             Command::StewardWait { session_ids } => {
                 self.register_steward_wait(session_id, session_ids, &events)
@@ -908,6 +912,8 @@ impl WakuBackend {
                     .iter()
                     .map(|session| session.id)
                     .collect::<Vec<_>>();
+                let answer_message_ids = state.sessions.iter().flat_map(|session| &session.decision_requests)
+                    .filter(|request| request.user_answer.is_some()).filter_map(|request| request.authority_message_id).collect::<HashSet<_>>();
                 for mut session in sessions {
                     session.steward_wait = None;
                     session.input_deliveries.clear();
@@ -964,6 +970,12 @@ impl WakuBackend {
                             merge_stale_session_metadata(existing, session);
                         } else {
                             preserve_daemon_checkpoints(existing, &mut session);
+                            // Saved user answers are authority records owned by the daemon.
+                            // A late desktop snapshot cannot replace or discard their message.
+                            for answer in existing.messages.iter().filter(|message| answer_message_ids.contains(&message.id)) {
+                                if let Some(message) = session.messages.iter_mut().find(|message| message.id == answer.id) { *message = answer.clone(); }
+                                else { session.messages.push(answer.clone()); }
+                            }
                             *existing = session;
                         }
                     } else {
@@ -2524,6 +2536,7 @@ fn handle_driver_command(
         Command::StewardInputStatus { .. }
         | Command::StewardWorkspace { .. }
         | Command::StewardQuery { .. }
+        | Command::AnswerDecision { .. }
         | Command::StewardDecision { .. }
         | Command::StewardWait { .. }
         | Command::StewardPrompt { .. }

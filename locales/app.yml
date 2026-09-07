@@ -2343,3 +2343,45 @@ task_workspace.original_branch:
   en: "Original branch: %{branch}"
 decisions.refresh_failed:
   en: "Refresh failed. The displayed records may be outdated."
+
+decisions.answer_placeholder:
+  en: "Write the answer for the selected question."
+
+decisions.escalation_reason:
+  en: "Reason for asking you: %{value}"
+
+decisions.option_impact:
+  en: "%{option} — impact: %{impact}"
+
+decisions.escalation_impact:
+  en: "Overall impact: %{value}"
+
+decisions.saved_answer:
+  en: "Your saved answer: %{value}"
+
+decisions.previous:
+  en: "Previous"
+
+decisions.next:
+  en: "Next"
+
+decisions.answering:
+  en: "Selected question: %{question}"
+
+decisions.answer_unconfirmed:
+  en: "Answer receipt is not confirmed. Refresh or retry the same answer."
+
+decisions.answer_saved:
+  en: "Your answer is saved. The receipt state is shown above."
+
+decisions.answer_hint:
+  en: "This answer applies only to the selected question. Other questions keep waiting."
+
+decisions.answer_read_only:
+  en: "This question is not waiting for your answer. Refresh to check its state."
+
+decisions.retry_answer:
+  en: "Retry answer"
+
+decisions.send_answer:
+  en: "Send answer"

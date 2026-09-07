@@ -2187,6 +2187,9 @@ fn decision_mcp_scope_binds_child_requests_and_revokes_access() {
         assert_eq!(result["requests"][0]["state"], "waitingManager");
         let listed = mcp_tool(address, parent_token, parent.id, parent_runtime, "waku_decision", json!({"operation":{"type":"list","session_id":child.id}}));
         assert_eq!(listed["requests"][0]["id"], id.to_string());
+        let mut parent_socket = scoped_socket(address, parent_token);
+        assert!(matches!(scoped_request(&mut parent_socket, Request { request_id: Uuid::new_v4(), session_id: parent.id, runtime_id: parent_runtime,
+            command: Command::AnswerDecision { child_session_id: child.id, request_id: id, answer: "Model self approval".into() } }), ResponseOutcome::Error { .. }));
         let mut socket = scoped_socket(address, child_token);
         let request = |operation| Request { request_id: Uuid::new_v4(), session_id: child.id, runtime_id: child_runtime, command: Command::StewardDecision { operation } };
         assert!(matches!(scoped_request(&mut socket, request(Operation::List { session_id: Some(children[1].id) })), ResponseOutcome::Error { .. }));

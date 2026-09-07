@@ -15,6 +15,23 @@ impl WakuBackend {
         events.ensure_steward_active()?;
         self.refresh_decisions()?;
         match operation {
+            StewardDecisionOperation::Escalate {
+                session_id,
+                request_id,
+                reason,
+                options,
+                impact,
+            } => self.escalate_decision(
+                caller,
+                session_id,
+                request_id,
+                crate::model::DecisionEscalation {
+                    reason,
+                    options,
+                    impact,
+                },
+                events,
+            ),
             StewardDecisionOperation::Request {
                 request_id,
                 question,
@@ -75,11 +92,7 @@ impl WakuBackend {
                     .unwrap();
                 self.task_store.hydrate(parent)?;
                 // Delegated model prompts and daemon presentation messages are not user authority.
-                let instruction = parent
-                    .parent_session_id
-                    .is_none()
-                    .then(|| manager_instruction(parent))
-                    .flatten();
+                let instruction = manager_instruction(parent);
                 let instruction_message_id = instruction.map(|m| m.id);
                 let instruction =
                     instruction.map(|m| m.display_content.as_ref().unwrap_or(&m.content).clone());
@@ -99,6 +112,9 @@ impl WakuBackend {
                     authority_message_id: None,
                     reason: None,
                     notified: false,
+                    escalation: None,
+                    upstream_request_id: None,
+                    user_answer: None,
                 };
                 state
                     .sessions
@@ -178,6 +194,9 @@ impl WakuBackend {
                         .iter()
                         .find(|r| r.id == request_id)
                         .ok_or_else(|| anyhow!("Decision request unavailable"))?;
+                    if existing.escalation.is_some() {
+                        bail!("Escalated requests require the user's answer in the main session");
+                    }
                     if let Some(saved) = &existing.decision {
                         if saved != &decision
                             || existing.authority_message_id != authority_message_id
@@ -191,19 +210,14 @@ impl WakuBackend {
                     if decision_projection(&child, existing).state == DecisionState::Invalidated {
                         bail!("Decision request context is no longer active");
                     }
-                    let parent = state.sessions.iter_mut().find(|s| s.id == caller).unwrap();
-                    self.task_store.hydrate(parent)?;
-                    let latest_instruction = manager_instruction(parent);
-                    let authorized = parent.parent_session_id.is_none()
-                        && authority_message_id.is_some_and(|id| {
-                            existing.instruction_message_id == Some(id)
-                                && latest_instruction.is_some_and(|m| m.id == id)
-                        });
-                    if authority_message_id.is_some() && !authorized {
-                        bail!(
-                            "Authority must reference an existing user instruction in the manager session"
-                        );
-                    }
+                    let mut proposed = existing.clone();
+                    proposed.authority_message_id = authority_message_id;
+                    let authorized = if authority_message_id.is_some() {
+                        self.validate_decision_authority(&mut state, &proposed)?;
+                        true
+                    } else {
+                        false
+                    };
                     let session = state
                         .sessions
                         .iter_mut()
@@ -241,7 +255,7 @@ impl WakuBackend {
         }
     }
 
-    fn deliver_decision(
+    pub(super) fn deliver_decision(
         &self,
         child_id: Uuid,
         request_id: Uuid,
@@ -249,6 +263,15 @@ impl WakuBackend {
     ) -> anyhow::Result<()> {
         let request = {
             let mut state = self.task_state.lock();
+            if state
+                .sessions
+                .iter()
+                .flat_map(|s| &s.decision_requests)
+                .any(|r| r.upstream_request_id == Some(request_id))
+            {
+                return Ok(());
+            }
+
             let Some(child) = state.sessions.iter_mut().find(|s| s.id == child_id) else {
                 return Ok(());
             };
@@ -411,7 +434,7 @@ impl WakuBackend {
         Ok(())
     }
 
-    fn refresh_decisions(&self) -> anyhow::Result<()> {
+    pub(super) fn refresh_decisions(&self) -> anyhow::Result<()> {
         let mut state = self.task_state.lock();
         let ids = state
             .sessions
@@ -470,6 +493,7 @@ impl WakuBackend {
                 self.save_steward_wait(&mut state, id)?;
             }
         }
+        self.refresh_escalations(&mut state)?;
         Ok(())
     }
 
@@ -619,7 +643,8 @@ pub(super) fn decision_projection(
         result.reason = delivery.reason.clone();
     } else if child.cancellation_requested_turn_id.is_some()
         || child.turns.last().is_none_or(|t| {
-            matches!(t.status, TurnStatus::Failed | TurnStatus::Interrupted)
+            (t.id == request.turn_id
+                && matches!(t.status, TurnStatus::Failed | TurnStatus::Interrupted))
                 || (t.id != request.turn_id
                     && !child.input_deliveries.iter().any(|d| {
                         d.turn_id == t.id
@@ -638,10 +663,14 @@ pub(super) fn decision_projection(
 
 pub(super) fn decision_prompt(request: &DecisionRequest) -> String {
     format!(
-        "[Waku manager decision]\nRequest: {}\nQuestion: {}\nDecision: {}\nResume only the blocked work within the original task and existing permissions. This message does not approve native permission requests.",
+        "[Waku manager decision]\nRequest: {}\nQuestion: {}\nDecision: {}\nAuthority user message: {}\nResume only the blocked work within the original task and existing permissions. This message does not approve native permission requests.",
         request.id,
         request.question,
-        request.decision.as_deref().unwrap_or_default()
+        request.decision.as_deref().unwrap_or_default(),
+        request
+            .authority_message_id
+            .map(|id| id.to_string())
+            .unwrap_or_default()
     )
 }
 
