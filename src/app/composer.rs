@@ -3,6 +3,63 @@ use super::*;
 use anyhow::Context as _;
 use base64::Engine as _;
 
+fn task_detail_link(id: Uuid, label: String, focus: &FocusHandle, theme: Theme) -> Stateful<Div> {
+    div().id(SharedString::from(format!("task-detail-session-{id}"))).w_full().py(px(6.0))
+        .track_focus(focus).tab_index(0).tab_stop(true)
+        .focus_visible(|style| style.bg(theme.overlay).border_1().border_color(theme.accent))
+        .hover(|style| style.bg(theme.overlay))
+        .text_size(sp(12.0)).text_color(theme.text).child(label)
+}
+
+fn task_detail_status(session: &AgentSession) -> String {
+    use waku_protocol::model::DecisionState;
+    for (state, label) in [
+        (DecisionState::WaitingUser, "decisions.waiting_user"),
+        (DecisionState::PendingReceipt, "decisions.pending_receipt"),
+        (DecisionState::WaitingManager, "decisions.waiting_manager"),
+    ] {
+        if session
+            .decision_requests
+            .iter()
+            .any(|request| request.state == state)
+        {
+            return tr!(label);
+        }
+    }
+    if session.is_waiting_for_children() {
+        tr!("session.waiting_for_children")
+    } else {
+        match session.status {
+            SessionStatus::Connecting | SessionStatus::Working => tr!("task_workspace.executing"),
+            SessionStatus::Waiting => tr!("sidebar.status_waiting"),
+            SessionStatus::Background => tr!("sidebar.status_background"),
+            SessionStatus::Failed => tr!("sidebar.status_failed"),
+            SessionStatus::Idle => {
+                if session
+                    .managed_workspace
+                    .as_ref()
+                    .is_some_and(|task| task.deliveries.iter().any(|delivery| delivery.completed))
+                {
+                    tr!("task_workspace.delivered")
+                } else {
+                    tr!("task_workspace.awaiting_acceptance")
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn managed_workspace_label(session: &AgentSession) -> Option<String> {
+    let task = session.managed_workspace.as_ref()?;
+    let (path, branch) = task.coordination.as_ref()
+        .map_or((&task.path, &task.branch), |location| (&location.path, &location.branch));
+    let removed = task.cleanup.iter().any(|item| item.path == *path
+        && item.status == waku_protocol::model::WorkspaceCleanupStatus::Removed);
+    Some(if removed {
+        format!("{branch} · {}", tr!("task_workspace.cleanup_removed"))
+    } else { branch.clone() })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ComposerSubmitAction {
     Send,
@@ -2857,7 +2914,11 @@ impl Waku {
     }
 
     fn render_managed_task_details(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        self.selected_session()?.managed_workspace.as_ref()?;
+        let selected = self.selected_session()?;
+        if selected.managed_workspace.is_none() && !self.state.sessions.iter()
+            .any(|session| session.parent_session_id == Some(selected.id)) {
+            return None;
+        }
         let theme = Theme::current(cx);
         let weak = cx.entity().downgrade();
         let focus = self.transcript_control_focus("managed-task-details-content", cx);
@@ -2871,14 +2932,25 @@ impl Waku {
                     return;
                 };
                 let owner = selected.id;
+                let sessions = this.state.sessions.iter().filter(|session|
+                    session.project_id == selected.project_id).collect::<Vec<_>>();
+                let tree = super::sidebar::SidebarTree::new(&sessions);
+                let by_id = sessions.iter().map(|session| (session.id, *session)).collect::<HashMap<_, _>>();
                 let mut rows = vec![tr!("task_workspace.snapshot")];
-                for session in this.state.sessions.iter().filter(|session| {
-                    session.id == owner || session.parent_session_id == Some(owner)
-                }) {
+                let mut links = HashMap::new();
+                for id in tree.visible(&[owner], &HashSet::new()) {
+                    let session = by_id[&id];
+                    links.insert(rows.len(), session.id);
+                    let status = task_detail_status(session);
+                    rows.push(format!("{} · {}", tr!("task_workspace.owner", title = session.display_title(), owner = session.id), status));
+                    if let Some(parent) = session.parent_session_id {
+                        rows.push(tr!("task_workspace.parent", parent = parent));
+                    }
                     let Some(task) = &session.managed_workspace else {
                         continue;
                     };
-                    rows.push(tr!("task_workspace.owner", title = session.display_title(), owner = session.id));
+                    rows.push(tr!("task_workspace.goal", goal = &task.name));
+                    rows.push(tr!("task_workspace.original_branch", branch = &task.branch));
                     rows.push(tr!("task_workspace.base", commit = &task.base_commit));
                     rows.push(tr!(
                         "task_workspace.execution",
@@ -2933,7 +3005,10 @@ impl Waku {
                     }
                 }
                 this.task_workspace_details_list.reset(rows.len());
-                this.task_workspace_details = Rc::new(rows);
+                this.task_workspace_details = Rc::new(rows.into_iter().enumerate().map(|(index, text)| {
+                    let link = links.get(&index).map(|id| (*id, cx.focus_handle().tab_stop(true)));
+                    (text, link)
+                }).collect());
                 open_focus.focus(window, cx);
                 cx.notify();
             });
@@ -2941,6 +3016,8 @@ impl Waku {
         let rows = self.task_workspace_details.clone();
         let state = self.task_workspace_details_list.clone();
         let scroll_view = cx.entity().downgrade();
+        let navigation = scroll_view.clone();
+        let close_handle = handle.clone();
         Some(popover(
             MenuChip::new("managed-task-details-trigger")
                 .label(tr!("task_workspace.results"))
@@ -2951,6 +3028,8 @@ impl Waku {
                 let rows = rows.clone();
                 let scroll = state.clone();
                 let scroll_view = scroll_view.clone();
+                let navigation = navigation.clone();
+                let close_handle = close_handle.clone();
                 div()
                     .w(px(600.0))
                     .h(px(420.0))
@@ -2983,13 +3062,20 @@ impl Waku {
                     })
                     .child(
                         list(state.clone(), move |index, _, _| {
-                            div()
-                                .w_full()
-                                .py(px(6.0))
-                                .text_size(sp(12.0))
-                                .text_color(theme.text)
-                                .child(rows[index].clone())
-                                .into_any_element()
+                            let (text, link) = &rows[index];
+                            if let Some((id, focus)) = link {
+                                let id = *id;
+                                let navigation = navigation.clone();
+                                let close_handle = close_handle.clone();
+                                task_detail_link(id, text.clone(), focus, theme)
+                                    .on_click(move |_, window, cx| {
+                                        close_handle.close(window, cx);
+                                        let _ = navigation.update(cx, |this, cx| this.select_session(id, cx));
+                                    }).into_any_element()
+                            } else {
+                                div().w_full().py(px(6.0)).text_size(sp(12.0))
+                                    .text_color(theme.text).child(text.clone()).into_any_element()
+                            }
                         })
                         .size_full(),
                     )
@@ -3000,6 +3086,11 @@ impl Waku {
     fn render_branch_selector(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::current(cx);
         let session = self.selected_session()?;
+        if let Some(label) = managed_workspace_label(session) {
+            return Some(MenuChip::new("managed-workspace-branch")
+                .icon("icons/git-branch.svg", theme.text_tertiary)
+                .label(label).disabled(true).caret(false).into_any_element());
+        }
         let workspace = session.workspace.clone();
         let workspace_path = self.workspace_path_for_session(session)?.to_path_buf();
         self.selected_project()
@@ -4288,6 +4379,59 @@ mod user_input_focus_tests {
                 cx.read_entity(&view, |view, _| (view.selected, view.activations)),
                 (index == 0, index + 1),
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod task_detail_navigation_tests {
+    use super::*;
+
+    struct DetailLink { focus: FocusHandle, background: FocusHandle, opened: usize }
+    impl Render for DetailLink {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().track_focus(&self.background).on_key_down(crate::ui::navigate_tab).child(
+                task_detail_link(Uuid::nil(), "Child history".into(), &self.focus, Theme::dark())
+                    .on_click(cx.listener(|this, _, _, _| this.opened += 1)))
+        }
+    }
+    #[test]
+    fn task_detail_keeps_finished_question_waiting_until_decision_receipt() {
+        use waku_protocol::model::DecisionState;
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let turn = session.begin_turn("Choose the output format");
+        session.finish_active_turn(TurnStatus::Completed);
+        session.decision_requests.push(serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(), "parent_session_id": Uuid::new_v4(),
+            "child_session_id": session.id, "turn_id": turn,
+            "question": "Which format?", "context": "Output file",
+            "recommendation": "JSON", "blocked_work": "Write output",
+            "state": "waitingManager", "notified": false
+        })).unwrap());
+        assert_eq!(task_detail_status(&session), tr!("decisions.waiting_manager"));
+        session.decision_requests[0].state = DecisionState::WaitingUser;
+        assert_eq!(task_detail_status(&session), tr!("decisions.waiting_user"));
+        session.decision_requests[0].state = DecisionState::PendingReceipt;
+        assert_eq!(task_detail_status(&session), tr!("decisions.pending_receipt"));
+        session.decision_requests[0].state = DecisionState::Resolved;
+        assert_eq!(task_detail_status(&session), tr!("task_workspace.awaiting_acceptance"));
+    }
+
+    #[gpui::test]
+    fn task_detail_history_opens_once_from_keyboard(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| DetailLink {
+            focus: cx.focus_handle().tab_stop(true), background: cx.focus_handle(), opened: 0,
+        });
+        let background = cx.read_entity(&view, |view, _| view.background.clone());
+        cx.update(|window, cx| window.focus(&background, cx));
+        cx.simulate_keystrokes("tab");
+        let focus = cx.read_entity(&view, |view, _| view.focus.clone());
+        assert!(cx.update(|window, _| focus.is_focused(window)));
+        for (index, key) in ["enter", "space"].into_iter().enumerate() {
+            let keystroke = gpui::Keystroke::parse(key).unwrap();
+            cx.simulate_event(KeyDownEvent { keystroke: keystroke.clone(), is_held: false, prefer_character_input: false });
+            cx.simulate_event(gpui::KeyUpEvent { keystroke });
+            assert_eq!(cx.read_entity(&view, |view, _| view.opened), index + 1);
         }
     }
 }

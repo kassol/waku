@@ -326,7 +326,7 @@ struct SidebarTreeNode {
 }
 
 impl SidebarTree {
-    fn new(sessions: &[&AgentSession]) -> Self {
+    pub(super) fn new(sessions: &[&AgentSession]) -> Self {
         let mut tree = Self::default();
         for session in sessions {
             tree.nodes.insert(
@@ -394,7 +394,7 @@ impl SidebarTree {
         tree
     }
 
-    fn visible(&self, roots: &[Uuid], collapsed: &HashSet<Uuid>) -> Vec<Uuid> {
+    pub(super) fn visible(&self, roots: &[Uuid], collapsed: &HashSet<Uuid>) -> Vec<Uuid> {
         let mut visible = Vec::new();
         let mut pending = roots.iter().rev().copied().collect::<Vec<_>>();
         while let Some(id) = pending.pop() {
@@ -1507,6 +1507,18 @@ impl Waku {
             };
             rows.push(SidebarRow::Header(group));
         }
+        // New families start collapsed. Explicit expansion and history navigation
+        // keep their existing behavior; no session record is changed.
+        {
+            let previous = self.sidebar_tree.borrow();
+            let mut collapsed = self.sidebar_collapsed_sessions.borrow_mut();
+            for (id, node) in &tree.nodes {
+                if !node.children.is_empty() && previous.nodes.get(id)
+                    .is_none_or(|node| node.children.is_empty()) {
+                    collapsed.insert(*id);
+                }
+            }
+        }
         let collapsed = self.sidebar_collapsed_sessions.borrow();
         let mut expanded_rows = Vec::with_capacity(rows.len());
         for row in rows {
@@ -2118,8 +2130,9 @@ impl Waku {
             8.0
         }) + depth.min(8) as f32 * 12.0;
         let detail_label = if grouped_by_project {
-            persisted_sidebar_branch_label(&session.workspace)
-                .map(|branch| SharedString::from(branch.to_owned()))
+            super::composer::managed_workspace_label(session).map(SharedString::from)
+                .or_else(|| persisted_sidebar_branch_label(&session.workspace)
+                    .map(|branch| SharedString::from(branch.to_owned())))
                 .or_else(|| {
                     if !matches!(&session.workspace, SessionWorkspace::Local) {
                         return None;

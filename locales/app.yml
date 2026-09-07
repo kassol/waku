@@ -2276,7 +2276,7 @@ task_workspace.cleanup_retained:
 task_workspace.cleanup_removed:
   en: "Removed"
 task_workspace.results:
-  en: "Task results"
+  en: "Work and results"
 task_workspace.delivered:
   en: "Delivered locally"
 task_workspace.integrated:
@@ -2332,5 +2332,14 @@ decisions.empty:
   en: "No decision requests."
 decisions.snapshot:
   en: "Saved records. Refresh to check for updates."
+
+task_workspace.awaiting_acceptance:
+  en: "Idle · acceptance not confirmed"
+task_workspace.parent:
+  en: "Manager: %{parent}"
+task_workspace.goal:
+  en: "Goal: %{goal}"
+task_workspace.original_branch:
+  en: "Original branch: %{branch}"
 decisions.refresh_failed:
   en: "Refresh failed. The displayed records may be outdated."

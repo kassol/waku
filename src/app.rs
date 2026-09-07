@@ -1197,7 +1197,7 @@ pub struct Waku {
     /// rows remain visible but never enter this index.
     branch_picker_highlight: Option<usize>,
     branch_picker_list_state: ListState,
-    task_workspace_details: Rc<Vec<String>>,
+    task_workspace_details: Rc<Vec<(String, Option<(Uuid, FocusHandle)>)>>,
     task_workspace_details_list: ListState,
     branch_picker_row_cache: RefCell<Vec<crate::git_branch::BranchEntry>>,
     /// Git subprocess results per concrete workspace path. Render only reads
