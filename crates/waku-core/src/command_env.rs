@@ -128,6 +128,70 @@ pub fn output(command: &mut Command) -> io::Result<Output> {
     spawn(command)?.wait_with_output()
 }
 
+/// Collect a short-lived CLI probe without letting it hold daemon shutdown.
+/// Keep the leader waitable until both streams close, so timeout cleanup can
+/// never signal a recycled process group after a descendant inherits a pipe.
+pub fn probe_output(command: &mut Command) -> io::Result<Output> {
+    use std::io::Read as _;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = spawn_probe(command)?;
+    let stdout = child.stdout.take().expect("probe stdout is piped");
+    let stderr = child.stderr.take().expect("probe stderr is piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (index, mut pipe) in [
+        Box::new(stdout) as Box<dyn io::Read + Send>,
+        Box::new(stderr) as Box<dyn io::Read + Send>,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+            let _ = tx.send((index, result));
+        });
+    }
+    drop(tx);
+    let result = (|| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut streams = [None, None];
+        loop {
+            while let Ok((index, bytes)) = rx.try_recv() {
+                streams[index] = Some(bytes?);
+            }
+            if streams.iter().all(Option::is_some)
+                && let Some(status) = child.try_wait()?
+            {
+                let [stdout, stderr] = streams;
+                return Ok(Output {
+                    status,
+                    stdout: stdout.unwrap(),
+                    stderr: stderr.unwrap(),
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "CLI probe timed out"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    if result.is_err() {
+        terminate_probe(&mut child);
+    }
+    result
+}
+
+pub(crate) fn spawn_probe(command: &mut Command) -> io::Result<Child> {
+    #[cfg(unix)]
+    command.process_group(0);
+    spawn(command)
+}
+
 /// Normalize a Waku-owned provider thread before a dependency spawns the child
 /// internally. The ACP SDK owns its `async_process::Command`, so its dedicated
 /// connection thread uses this once at startup instead of [`spawn`].
@@ -802,14 +866,14 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> bool {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) | Err(_) => {
-                terminate_shell_capture(child);
+                terminate_probe(child);
                 return false;
             }
         }
     }
 }
 
-fn terminate_shell_capture(child: &mut Child) {
+pub(crate) fn terminate_probe(child: &mut Child) {
     #[cfg(unix)]
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
@@ -905,6 +969,47 @@ mod tests {
 
         assert_eq!(output.stdout, b"stdout");
         assert_eq!(output.stderr, b"stderr");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_output_preserves_large_streams_and_exit_status() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "dd if=/dev/zero bs=65536 count=32 2>/dev/null; { dd if=/dev/zero bs=65536 count=32 2>/dev/null; } >&2; exit 7",
+        ]);
+
+        let output = probe_output(&mut command).expect("large probe should finish");
+
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, vec![0; 2 * 1024 * 1024]);
+        assert_eq!(output.stderr, vec![0; 2 * 1024 * 1024]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_output_times_out_and_reaps_with_inherited_pipes() {
+        for script in ["sleep 30 & wait", "sleep 30 & exit 0"] {
+            let capture = ShellEnvironmentCapture::create().expect("PID capture");
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", &format!("echo $$ > \"$PID_FILE\"; {script}")])
+                .env("PID_FILE", capture.path());
+            let started = Instant::now();
+
+            let error = probe_output(&mut command).expect_err("probe should time out");
+
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(started.elapsed() < Duration::from_secs(8));
+            let pid: i32 = fs::read_to_string(capture.path())
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "leader was not reaped");
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
     }
 
     #[cfg(target_os = "macos")]

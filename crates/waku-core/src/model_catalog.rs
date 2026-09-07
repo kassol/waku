@@ -277,7 +277,7 @@ fn parse_claude_models(value: &Value) -> Vec<ProviderModel> {
 fn discover_cursor_models(binary: &Path) -> Vec<ProviderModel> {
     let mut command = crate::command_env::command(binary);
     let command = command.arg("models");
-    let Ok(output) = crate::command_env::output(command) else {
+    let Ok(output) = crate::command_env::probe_output(command) else {
         return Vec::new();
     };
     let combined = format!(
@@ -342,7 +342,7 @@ fn parse_cursor_models(output: &str) -> Vec<ProviderModel> {
 fn discover_opencode_models(binary: &Path) -> Vec<ProviderModel> {
     let mut command = crate::command_env::command(binary);
     let command = command.arg("models");
-    let Ok(output) = crate::command_env::output(command) else {
+    let Ok(output) = crate::command_env::probe_output(command) else {
         return Vec::new();
     };
     parse_opencode_models(&String::from_utf8_lossy(&output.stdout))
@@ -473,7 +473,7 @@ fn parse_deepseek_model_catalog(catalog: &Value) -> Vec<ProviderModel> {
 fn discover_fx_models(binary: &Path) -> Vec<ProviderModel> {
     let mut command = crate::command_env::command(binary);
     let command = command.args(["models", "--json"]);
-    let Ok(output) = crate::command_env::output(command) else {
+    let Ok(output) = crate::command_env::probe_output(command) else {
         return Vec::new();
     };
     let Ok(catalog) = serde_json::from_slice::<Value>(&output.stdout) else {
@@ -485,7 +485,7 @@ fn discover_fx_models(binary: &Path) -> Vec<ProviderModel> {
 fn discover_fx_default_model(binary: &Path) -> Option<String> {
     let mut command = crate::command_env::command(binary);
     let command = command.args(["status", "--json"]);
-    let output = crate::command_env::output(command).ok()?;
+    let output = crate::command_env::probe_output(command).ok()?;
     let status = serde_json::from_slice::<Value>(&output.stdout).ok()?;
     status
         .get("model")
@@ -541,7 +541,7 @@ fn parse_opencode_models(output: &str) -> Vec<ProviderModel> {
 fn discover_grok_models(binary: &Path) -> Vec<ProviderModel> {
     let mut command = crate::command_env::command(binary);
     let command = command.arg("models");
-    let Ok(output) = crate::command_env::output(command) else {
+    let Ok(output) = crate::command_env::probe_output(command) else {
         return Vec::new();
     };
     let combined = format!(
@@ -598,7 +598,7 @@ fn parse_grok_models(output: &str) -> Vec<ProviderModel> {
 fn discover_kimi_models(binary: &Path) -> Vec<ProviderModel> {
     let mut command = crate::command_env::command(binary);
     let command = command.args(["provider", "list", "--json"]);
-    let Ok(output) = crate::command_env::output(command) else {
+    let Ok(output) = crate::command_env::probe_output(command) else {
         return Vec::new();
     };
     let Ok(catalog) = serde_json::from_slice::<Value>(&output.stdout) else {
@@ -610,7 +610,7 @@ fn discover_kimi_models(binary: &Path) -> Vec<ProviderModel> {
 fn discover_kimi_default_model(binary: &Path) -> Option<String> {
     let mut command = crate::command_env::command(binary);
     let command = command.args(["provider", "list"]);
-    let output = crate::command_env::output(command).ok()?;
+    let output = crate::command_env::probe_output(command).ok()?;
     parse_kimi_default_model(&String::from_utf8_lossy(&output.stdout))
 }
 
@@ -733,15 +733,15 @@ fn discover_pi_models(binary: &Path, dialect: PiDialect) -> Vec<ProviderModel> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let Ok(mut child) = crate::command_env::spawn(command) else {
+    let Ok(mut child) = crate::command_env::spawn_probe(command) else {
         return Vec::new();
     };
     let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
+        crate::command_env::terminate_probe(&mut child);
         return Vec::new();
     };
     let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
+        crate::command_env::terminate_probe(&mut child);
         return Vec::new();
     };
     let (tx, rx) = mpsc::channel();
@@ -770,8 +770,7 @@ fn discover_pi_models(binary: &Path, dialect: PiDialect) -> Vec<ProviderModel> {
     } else {
         Vec::new()
     };
-    let _ = child.kill();
-    let _ = child.wait();
+    crate::command_env::terminate_probe(&mut child);
     result
 }
 
@@ -889,15 +888,15 @@ fn discover_codex_models(binary: &Path) -> Vec<ProviderModel> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let Ok(mut child) = crate::command_env::spawn(command) else {
+    let Ok(mut child) = crate::command_env::spawn_probe(command) else {
         return Vec::new();
     };
     let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
+        crate::command_env::terminate_probe(&mut child);
         return Vec::new();
     };
     let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
+        crate::command_env::terminate_probe(&mut child);
         return Vec::new();
     };
     let (tx, rx) = mpsc::channel();
@@ -927,7 +926,7 @@ fn discover_codex_models(binary: &Path) -> Vec<ProviderModel> {
         || recv_rpc_response(&rx, 0, CODEX_RPC_TIMEOUT).is_none()
         || write_json_line(&mut stdin, &json!({"method": "initialized", "params": {}})).is_err()
     {
-        let _ = child.kill();
+        crate::command_env::terminate_probe(&mut child);
         return Vec::new();
     }
 
@@ -957,8 +956,7 @@ fn discover_codex_models(binary: &Path) -> Vec<ProviderModel> {
             break;
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    crate::command_env::terminate_probe(&mut child);
     models
 }
 

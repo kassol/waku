@@ -154,3 +154,90 @@ os._exit(0)
 "#,
     );
 }
+
+#[test]
+fn prepare_shutdown_finishes_while_cursor_model_probe_hangs() {
+    let root = std::env::temp_dir().join(format!("waku-probe-exit-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let binary = root.join("cursor-fixture");
+    std::fs::write(
+        &binary,
+        r#"#!/usr/bin/env python3
+import pathlib, time
+root = pathlib.Path(__file__).parent
+root.joinpath('started').touch()
+deadline = time.monotonic() + 15
+while not root.joinpath('release').exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let backend = Arc::new(
+        WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("state.db")),
+        )
+        .unwrap(),
+    );
+    let erased: Arc<dyn Backend> = backend.clone();
+    let sink = EventSink::for_test(&erased, Uuid::nil(), Uuid::nil());
+    let probing = backend.clone();
+    let probe_sink = sink.clone();
+    let probe = std::thread::spawn(move || {
+        probing.handle(
+            Request {
+                request_id: Uuid::new_v4(),
+                session_id: Uuid::nil(),
+                runtime_id: Uuid::nil(),
+                command: Command::ProbeProvider {
+                    provider: ProviderKind::Cursor,
+                    binary_override: Some(binary.to_string_lossy().into_owned()),
+                    discover_models: true,
+                    probe_version: false,
+                },
+            },
+            probe_sink,
+        )
+    });
+    let started = std::time::Instant::now();
+    while !root.join("started").exists() && started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let saw_start = root.join("started").exists();
+    let closing = backend.clone();
+    let (done, completed) = crossbeam_channel::bounded(1);
+    let shutdown = std::thread::spawn(move || {
+        let _ = done.send(closing.handle(
+            Request {
+                request_id: Uuid::new_v4(),
+                session_id: Uuid::nil(),
+                runtime_id: Uuid::nil(),
+                command: Command::PrepareShutdown,
+            },
+            sink,
+        ));
+    });
+    let within_deadline = completed.recv_timeout(Duration::from_secs(8)).ok();
+    std::fs::write(root.join("release"), "").unwrap();
+    let bounded = within_deadline.is_some();
+    let result =
+        within_deadline.unwrap_or_else(|| completed.recv_timeout(Duration::from_secs(10)).unwrap());
+    shutdown.join().unwrap();
+    assert!(probe.join().unwrap().is_ok());
+    drop(erased);
+    drop(backend);
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        saw_start,
+        "must enter the real Cursor model discovery command"
+    );
+    assert!(
+        result.is_ok(),
+        "shutdown must confirm persisted history: {result:?}"
+    );
+    assert!(
+        bounded,
+        "Cursor model discovery held the work gate until the fixture was released"
+    );
+}
